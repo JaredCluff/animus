@@ -1,6 +1,9 @@
-use animus_core::sensorium::*;
-use parking_lot::Mutex;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use animus_core::sensorium::*;
+use animus_core::EmbeddingService;
+use parking_lot::{Mutex, RwLock};
 
 use crate::attention::{AttentionFilter, AttentionRule};
 use crate::audit::AuditTrail;
@@ -18,7 +21,9 @@ pub struct SensoriumOrchestrator {
     consent: ConsentEngine,
     attention: AttentionFilter,
     audit: Mutex<AuditTrail>,
-    _attention_threshold: f32,
+    attention_threshold: f32,
+    embedder: Arc<dyn EmbeddingService>,
+    goal_embeddings: RwLock<Vec<Vec<f32>>>,
 }
 
 impl SensoriumOrchestrator {
@@ -27,14 +32,23 @@ impl SensoriumOrchestrator {
         attention_rules: Vec<AttentionRule>,
         audit_path: PathBuf,
         attention_threshold: f32,
+        embedder: Arc<dyn EmbeddingService>,
     ) -> animus_core::Result<Self> {
         let audit = AuditTrail::open(&audit_path)?;
         Ok(Self {
             consent: ConsentEngine::new(policies),
             attention: AttentionFilter::new(attention_rules),
             audit: Mutex::new(audit),
-            _attention_threshold: attention_threshold,
+            attention_threshold,
+            embedder,
+            goal_embeddings: RwLock::new(Vec::new()),
         })
+    }
+
+    /// Update the cached goal embeddings used by tier 2 attention.
+    /// Call this when goals are added, removed, or changed.
+    pub fn set_goal_embeddings(&self, embeddings: Vec<Vec<f32>>) {
+        *self.goal_embeddings.write() = embeddings;
     }
 
     pub async fn process_event(&self, event: SensorEvent) -> animus_core::Result<ProcessOutcome> {
@@ -61,26 +75,58 @@ impl SensoriumOrchestrator {
             tracing::warn!("AllowAnonymized consent not yet implemented — treating as Allow");
         }
 
-        // Step 2: Tier 1 attention filter
-        let attention_decision = self.attention.tier1_evaluate(&event);
-        let (passed, action) = match &attention_decision {
+        // Step 2: Tier 1 attention filter (microsecond, rule-based)
+        let tier1_decision = self.attention.tier1_evaluate(&event);
+        let (mut passed, mut action, mut tier_reached) = match &tier1_decision {
             AttentionDecision::Pass { promoted } => {
                 let action = if *promoted {
                     AuditAction::Promoted
                 } else {
                     AuditAction::Logged
                 };
-                (true, action)
+                (true, action, 1u8)
             }
-            AttentionDecision::Drop { .. } => (false, AuditAction::Ignored),
+            AttentionDecision::Drop { .. } => (false, AuditAction::Ignored, 1u8),
         };
 
-        // Step 3: Audit
+        // Step 3: Tier 2 attention filter (embedding similarity)
+        // Only runs when tier 1 passed without promoting (needs deeper evaluation)
+        // and when we have goal embeddings to compare against.
+        // Clone goal embeddings before async boundary (parking_lot guards are !Send).
+        let goals_snapshot: Vec<Vec<f32>> = self.goal_embeddings.read().clone();
+        if passed && action == AuditAction::Logged && !goals_snapshot.is_empty() {
+            let event_text = serde_json::to_string(&event.data).unwrap_or_default();
+            match self.embedder.embed_text(&event_text).await {
+                Ok(event_embedding) => {
+                    let tier2_decision = self.attention.tier2_evaluate(
+                        &event_embedding,
+                        &goals_snapshot,
+                        self.attention_threshold,
+                    );
+                    tier_reached = 2;
+                    match tier2_decision {
+                        AttentionDecision::Pass { .. } => {
+                            action = AuditAction::Promoted;
+                        }
+                        AttentionDecision::Drop { .. } => {
+                            passed = false;
+                            action = AuditAction::Ignored;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Tier 2 attention: embedding failed: {e}");
+                    // Fall through with tier 1 decision
+                }
+            }
+        }
+
+        // Step 4: Audit
         let entry = AuditEntry {
             timestamp: chrono::Utc::now(),
             event_id: event.id,
             consent_policy: consent_result.policy_id,
-            attention_tier_reached: 1,
+            attention_tier_reached: tier_reached,
             action_taken: action,
             segment_created: None,
         };

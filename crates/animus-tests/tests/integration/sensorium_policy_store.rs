@@ -19,6 +19,7 @@ fn save_and_load_policies() {
         }],
         active: true,
         created: chrono::Utc::now(),
+        created_by: None,
     }];
 
     PolicyStore::save(&path, &policies).unwrap();
@@ -62,6 +63,7 @@ fn policy_roundtrip_preserves_rules() {
         ],
         active: true,
         created: chrono::Utc::now(),
+        created_by: None,
     }];
 
     PolicyStore::save(&path, &policies).unwrap();

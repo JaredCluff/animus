@@ -128,7 +128,7 @@ impl<S: VectorStore + Send + Sync + 'static> FederationOrchestrator<S> {
 
         // Set up discovery
         let (event_tx, event_rx) = mpsc::channel::<DiscoveryEvent>(64);
-        let discovery = DiscoveryService::new(
+        let mut discovery = DiscoveryService::new(
             self.identity.instance_id,
             self.config.static_peers.clone(),
             event_tx,

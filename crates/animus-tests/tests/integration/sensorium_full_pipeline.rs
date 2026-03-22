@@ -32,11 +32,19 @@ async fn full_pipeline_file_change_to_segment() {
         }],
         active: true,
         created: chrono::Utc::now(),
+        created_by: None,
     }];
 
     let audit_path = dir.path().join("audit.jsonl");
     let orchestrator = Arc::new(
-        SensoriumOrchestrator::new(policies, vec![], audit_path.clone(), 0.5).unwrap(),
+        SensoriumOrchestrator::new(
+            policies,
+            vec![],
+            audit_path.clone(),
+            0.5,
+            Arc::new(animus_embed::SyntheticEmbedding::new(dim)),
+        )
+        .unwrap(),
     );
 
     // Start background processing

@@ -21,6 +21,8 @@ pub struct DiscoveryService {
     own_instance_id: InstanceId,
     static_peers: Vec<String>,
     event_tx: mpsc::Sender<DiscoveryEvent>,
+    /// Held to keep the mDNS registration alive; dropped on shutdown.
+    _registration_daemon: Option<mdns_sd::ServiceDaemon>,
 }
 
 const SERVICE_TYPE: &str = "_animus._tcp.local.";
@@ -35,6 +37,7 @@ impl DiscoveryService {
             own_instance_id,
             static_peers,
             event_tx,
+            _registration_daemon: None,
         }
     }
 
@@ -92,7 +95,7 @@ impl DiscoveryService {
     /// - `instance_id`: the full UUID of this instance
     /// - `vk`: the Ed25519 verifying key in hex
     /// - `proto`: protocol version (currently "1")
-    pub fn register_service(&self, port: u16, vk_hex: &str) -> Result<()> {
+    pub fn register_service(&mut self, port: u16, vk_hex: &str) -> Result<()> {
         let daemon = mdns_sd::ServiceDaemon::new().map_err(|e| {
             AnimusError::Federation(format!("failed to create mDNS daemon: {e}"))
         })?;
@@ -123,9 +126,9 @@ impl DiscoveryService {
             AnimusError::Federation(format!("failed to register mDNS service: {e}"))
         })?;
 
-        // Leak the daemon so it stays alive and keeps the service registered.
-        // In a production system, we would store this handle and shut it down gracefully.
-        std::mem::forget(daemon);
+        // Store the daemon handle so it stays alive and keeps the service registered.
+        // When DiscoveryService is dropped, the daemon is cleanly shut down.
+        self._registration_daemon = Some(daemon);
 
         tracing::info!("mDNS: registered {SERVICE_TYPE} on port {port}");
         Ok(())

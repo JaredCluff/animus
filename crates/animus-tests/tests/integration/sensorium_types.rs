@@ -23,6 +23,7 @@ fn consent_policy_default_deny() {
         rules: vec![],
         active: true,
         created: chrono::Utc::now(),
+        created_by: None,
     };
     assert!(policy.rules.is_empty());
     assert!(policy.active);

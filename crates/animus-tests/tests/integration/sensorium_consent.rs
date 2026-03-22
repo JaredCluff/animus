@@ -34,6 +34,7 @@ fn allow_matching_path() {
         }],
         active: true,
         created: chrono::Utc::now(),
+        created_by: None,
     };
     let engine = ConsentEngine::new(vec![policy]);
     let event = make_file_event("/home/user/projects/animus/src/main.rs");
@@ -54,6 +55,7 @@ fn deny_non_matching_path() {
         }],
         active: true,
         created: chrono::Utc::now(),
+        created_by: None,
     };
     let engine = ConsentEngine::new(vec![policy]);
     let event = make_file_event("/etc/passwd");
@@ -82,6 +84,7 @@ fn explicit_deny_overrides_allow() {
         ],
         active: true,
         created: chrono::Utc::now(),
+        created_by: None,
     };
     let engine = ConsentEngine::new(vec![policy]);
     let event = make_file_event("/home/user/projects/.env");
@@ -102,6 +105,7 @@ fn inactive_policy_is_skipped() {
         }],
         active: false,
         created: chrono::Utc::now(),
+        created_by: None,
     };
     let engine = ConsentEngine::new(vec![policy]);
     let event = make_file_event("/tmp/anything.txt");
@@ -122,6 +126,7 @@ fn process_event_scope_matching() {
         }],
         active: true,
         created: chrono::Utc::now(),
+        created_by: None,
     };
     let engine = ConsentEngine::new(vec![policy]);
 
