@@ -112,6 +112,28 @@ impl<S: VectorStore> ReasoningThread<S> {
         // Call the LLM
         let output = engine.reason(&enriched_system, &self.conversation).await?;
 
+        // Implicit Bayesian feedback: retrieved segments that made it into context
+        // get a small positive signal. This makes frequently-used knowledge
+        // gradually accumulate confidence over time.
+        let anchor_set: std::collections::HashSet<_> =
+            self.stored_turn_ids.iter().copied().collect();
+        for seg in &context.segments {
+            if !anchor_set.contains(&seg.id) {
+                // Small implicit boost (0.1) vs explicit feedback (1.0)
+                let new_alpha = seg.alpha + 0.1;
+                if let Err(e) = self.store.update_meta(
+                    seg.id,
+                    animus_vectorfs::SegmentUpdate {
+                        alpha: Some(new_alpha),
+                        confidence: Some(new_alpha / (new_alpha + seg.beta)),
+                        ..Default::default()
+                    },
+                ) {
+                    tracing::debug!("implicit feedback update failed for {}: {e}", seg.id);
+                }
+            }
+        }
+
         // Store assistant response as a segment
         let response_embedding = embedder.embed_text(&output.content).await?;
         let mut response_segment = Segment::new(

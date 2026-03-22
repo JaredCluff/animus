@@ -522,6 +522,42 @@ async fn handle_command(
             ctx.interface.display_status(&format!(
                 "Segments: {total} total ({hot} hot, {warm} warm, {cold} cold)"
             ));
+
+            // Aggregate quality metrics
+            if total > 0 {
+                let all_ids = ctx.store.segment_ids(None);
+                let mut sum_health = 0.0_f32;
+                let mut sum_confidence = 0.0_f32;
+                let mut decay_counts = [0usize; 5]; // Factual, Procedural, Episodic, Opinion, General
+                let mut count = 0usize;
+                for id in &all_ids {
+                    if let Ok(Some(seg)) = ctx.store.get_raw(*id) {
+                        sum_health += seg.health_score();
+                        sum_confidence += seg.bayesian_confidence();
+                        match seg.decay_class {
+                            animus_core::DecayClass::Factual => decay_counts[0] += 1,
+                            animus_core::DecayClass::Procedural => decay_counts[1] += 1,
+                            animus_core::DecayClass::Episodic => decay_counts[2] += 1,
+                            animus_core::DecayClass::Opinion => decay_counts[3] += 1,
+                            animus_core::DecayClass::General => decay_counts[4] += 1,
+                        }
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    let avg_health = sum_health / count as f32;
+                    let avg_conf = sum_confidence / count as f32;
+                    ctx.interface.display_status(&format!(
+                        "Quality: avg health {avg_health:.2}, avg confidence {avg_conf:.2}"
+                    ));
+                    ctx.interface.display_status(&format!(
+                        "Knowledge: {} factual, {} procedural, {} episodic, {} opinion, {} general",
+                        decay_counts[0], decay_counts[1], decay_counts[2],
+                        decay_counts[3], decay_counts[4]
+                    ));
+                }
+            }
+
             ctx.interface.display_status(&format!("Goals: {} active", ctx.goals.active_goals().len()));
             if *ctx.is_sleeping {
                 let since = ctx.sleep_started.map(|t| {
