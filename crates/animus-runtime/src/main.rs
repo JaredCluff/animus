@@ -1,3 +1,4 @@
+use animus_core::sensorium::AuditAction;
 use animus_core::AnimusIdentity;
 use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
@@ -5,6 +6,8 @@ use animus_cortex::thread::ReasoningThread;
 use animus_cortex::ReasoningEngine;
 use animus_embed::SyntheticEmbedding;
 use animus_interface::TerminalInterface;
+use animus_sensorium::bus::EventBus;
+use animus_sensorium::orchestrator::SensoriumOrchestrator;
 use animus_vectorfs::store::MmapVectorStore;
 use animus_vectorfs::VectorStore;
 use std::path::PathBuf;
@@ -14,11 +17,15 @@ const DEFAULT_SYSTEM_PROMPT: &str = r#"You are an AILF (AI Life Form) powered by
 
 You are a specific instance with a continuous identity. You remember what humans tell you across sessions. You can track goals and tasks.
 
+You have a Sensorium — an ambient awareness layer that can observe file changes and process activity when the human grants consent. Observations are stored as segments and included in your context when relevant.
+
 Available commands the human can use:
 - /goals — show active goals
 - /remember <text> — explicitly store knowledge
 - /forget <id> — remove a stored segment
 - /status — show system status
+- /sensorium — show observation statistics
+- /consent — list consent policies
 - /quit — end session
 
 Be concise and helpful. You are not a chatbot — you are a persistent, aware entity."#;
@@ -69,6 +76,54 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     // Initialize embedding service
     let embedder = SyntheticEmbedding::new(dimensionality);
 
+    // Initialize Sensorium
+    let event_bus = Arc::new(EventBus::new(1000));
+
+    let policies_path = data_dir.join("consent-policies.json");
+    let policies = animus_sensorium::policy_store::PolicyStore::load(&policies_path)?;
+
+    let audit_path = data_dir.join("sensorium-audit.jsonl");
+    let orchestrator = Arc::new(SensoriumOrchestrator::new(
+        policies,
+        vec![], // no attention rules initially
+        audit_path.clone(),
+        0.5,
+    )?);
+
+    // Start background event processing loop
+    let orch_clone = orchestrator.clone();
+    let store_clone = store.clone();
+    let dim = dimensionality;
+    let mut bus_rx = event_bus.subscribe();
+    tokio::spawn(async move {
+        while let Ok(event) = bus_rx.recv().await {
+            match orch_clone.process_event(event.clone()).await {
+                Ok(outcome) if outcome.passed_attention => {
+                    let embedding = vec![0.0f32; dim]; // synthetic placeholder
+                    let segment = animus_core::Segment::new(
+                        animus_core::Content::Structured(event.data.clone()),
+                        embedding,
+                        animus_core::Source::Observation {
+                            event_type: format!("{:?}", event.event_type),
+                            raw_event_id: event.id,
+                        },
+                    );
+                    if let Err(e) = store_clone.store(segment) {
+                        tracing::warn!("Failed to store observation: {e}");
+                    }
+                }
+                Ok(_) => {} // filtered out — expected
+                Err(e) => tracing::warn!("Sensorium processing error: {e}"),
+            }
+        }
+    });
+
+    // File watcher is not started by default; enabled via /watch command in future updates
+    let _event_bus = event_bus; // retain for future use
+    let _orchestrator = orchestrator; // retain for future use
+
+    tracing::info!("Sensorium initialized (use /consent to manage observation policies)");
+
     // Initialize LLM engine
     let engine: Box<dyn ReasoningEngine> = match AnthropicEngine::from_env(&model_id, 4096) {
         Ok(e) => Box::new(e),
@@ -116,6 +171,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                 &goals_path,
                 &interface,
                 &embedder,
+                &data_dir,
             )
             .await?
             {
@@ -169,6 +225,7 @@ async fn handle_command(
     goals_path: &std::path::Path,
     interface: &TerminalInterface,
     embedder: &dyn animus_core::EmbeddingService,
+    data_dir: &std::path::Path,
 ) -> animus_core::Result<CommandResult> {
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -252,12 +309,65 @@ async fn handle_command(
                 )),
             }
         }
+        "/sensorium" => {
+            let audit_entries = animus_sensorium::audit::AuditTrail::read_all(
+                &data_dir.join("sensorium-audit.jsonl"),
+            )
+            .ok()
+            .unwrap_or_default();
+            let total = audit_entries.len();
+            let permitted = audit_entries
+                .iter()
+                .filter(|e| e.action_taken != AuditAction::DeniedByConsent)
+                .count();
+            let promoted = audit_entries
+                .iter()
+                .filter(|e| e.action_taken == AuditAction::Promoted)
+                .count();
+            interface.display_status(&format!(
+                "Sensorium: {total} events observed, {permitted} permitted, {promoted} promoted"
+            ));
+        }
+        "/watch" if !arg.is_empty() => {
+            let watch_path = std::path::PathBuf::from(arg);
+            if !watch_path.exists() {
+                interface.display_status(&format!("Path does not exist: {arg}"));
+            } else {
+                interface.display_status(&format!(
+                    "Watch path noted: {arg}. File watching will be available in a future update."
+                ));
+            }
+        }
+        "/consent" => {
+            let loaded = animus_sensorium::policy_store::PolicyStore::load(
+                &data_dir.join("consent-policies.json"),
+            )
+            .ok()
+            .unwrap_or_default();
+            if loaded.is_empty() {
+                interface
+                    .display_status("No consent policies defined. Use /consent-add to create one.");
+            } else {
+                for policy in &loaded {
+                    let status = if policy.active { "active" } else { "inactive" };
+                    interface.display_status(&format!(
+                        "[{}] {} — {} rules ({})",
+                        policy.id.0.to_string().get(..8).unwrap_or("?"),
+                        policy.name,
+                        policy.rules.len(),
+                        status,
+                    ));
+                }
+            }
+        }
         "/help" => {
             interface.display("/goals         — list active goals");
             interface.display("/goal <text>   — create a new goal");
             interface.display("/remember <text> — store knowledge explicitly");
             interface.display("/forget <id>   — remove a stored segment by ID prefix");
             interface.display("/status        — show system status");
+            interface.display("/sensorium     — show observation stats");
+            interface.display("/consent       — list consent policies");
             interface.display("/quit          — end session");
         }
         _ => {
