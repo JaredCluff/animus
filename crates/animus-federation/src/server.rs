@@ -1,0 +1,482 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use animus_core::{AnimusError, InstanceId, Result, SegmentId};
+use animus_vectorfs::VectorStore;
+use axum::extract::{Extension, Path as AxumPath, State};
+use axum::http::StatusCode;
+use axum::middleware;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use chrono::Utc;
+use ed25519_dalek::VerifyingKey;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+use crate::auth::FederationAuth;
+use crate::knowledge::KnowledgeSharing;
+use crate::peers::{Peer, PeerInfo, PeerRegistry, TrustLevel};
+use crate::protocol::{HandshakeConfirm, HandshakeRequest};
+
+/// Verified peer identity, inserted into request extensions by auth middleware.
+#[derive(Clone)]
+struct AuthenticatedPeer {
+    instance_id: InstanceId,
+}
+
+/// Data stored for a pending handshake (between handshake and confirm steps).
+struct PendingHandshake {
+    counter_nonce: [u8; 32],
+    initiator_vk_hex: String,
+}
+
+/// Shared state accessible by all axum handlers.
+struct ServerState<S: VectorStore> {
+    auth: FederationAuth,
+    peers: Arc<RwLock<PeerRegistry>>,
+    store: Arc<S>,
+    knowledge: KnowledgeSharing,
+    pending_handshakes: Mutex<HashMap<InstanceId, PendingHandshake>>,
+    #[allow(dead_code)]
+    max_rpm: u32,
+}
+
+/// Lightweight axum HTTP server for inbound federation requests.
+pub struct FederationServer<S: VectorStore> {
+    state: Arc<ServerState<S>>,
+}
+
+impl<S: VectorStore + 'static> FederationServer<S> {
+    /// Create a new federation server.
+    ///
+    /// - `auth`: the federation auth identity for this instance
+    /// - `peers`: shared peer registry (same Arc used by orchestrator — H4 fix)
+    /// - `store`: the vector store for segment retrieval
+    /// - `knowledge`: knowledge sharing policies for privacy enforcement
+    /// - `max_rpm`: maximum requests per minute (stored for future rate limiting)
+    pub fn new(
+        auth: FederationAuth,
+        peers: Arc<RwLock<PeerRegistry>>,
+        store: Arc<S>,
+        knowledge: KnowledgeSharing,
+        max_rpm: u32,
+    ) -> Self {
+        let state = Arc::new(ServerState {
+            auth,
+            peers,
+            store,
+            knowledge,
+            pending_handshakes: Mutex::new(HashMap::new()),
+            max_rpm,
+        });
+        Self { state }
+    }
+
+    /// Start the HTTP server, binding to the given address.
+    ///
+    /// Spawns the server as a background tokio task and returns the actual
+    /// bound address (useful when binding to port 0 for tests).
+    pub async fn start(&self, bind_addr: SocketAddr) -> Result<SocketAddr> {
+        // Unauthenticated routes — handshake IS the authentication ceremony
+        let public_routes = Router::new()
+            .route("/federation/handshake", post(handle_handshake::<S>))
+            .route(
+                "/federation/handshake/confirm",
+                post(handle_handshake_confirm::<S>),
+            );
+
+        // Authenticated routes — require completed handshake + signed request (H1)
+        let protected_routes = Router::new()
+            .route("/federation/segments/{id}", get(handle_get_segment::<S>))
+            .route("/federation/peers", get(handle_list_peers::<S>))
+            .layer(middleware::from_fn_with_state(
+                self.state.clone(),
+                auth_middleware::<S>,
+            ));
+
+        let app = public_routes
+            .merge(protected_routes)
+            .with_state(self.state.clone());
+
+        let listener = tokio::net::TcpListener::bind(bind_addr).await.map_err(|e| {
+            AnimusError::Federation(format!("failed to bind to {bind_addr}: {e}"))
+        })?;
+
+        let actual_addr = listener.local_addr().map_err(|e| {
+            AnimusError::Federation(format!("failed to get local address: {e}"))
+        })?;
+
+        tracing::info!("Federation HTTP server listening on {actual_addr}");
+
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!("Federation HTTP server error: {e}");
+            }
+        });
+
+        Ok(actual_addr)
+    }
+
+    /// Get the shared peer registry.
+    pub fn peers(&self) -> Arc<RwLock<PeerRegistry>> {
+        self.state.peers.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth middleware (H1 + H2)
+// ---------------------------------------------------------------------------
+
+/// Middleware that verifies signed requests on protected endpoints.
+///
+/// Expects these headers:
+/// - `X-Animus-Instance-Id`: the requesting peer's InstanceId (UUID)
+/// - `X-Animus-Timestamp`: Unix timestamp (seconds)
+/// - `X-Animus-Signature`: hex-encoded Ed25519 signature
+///
+/// The signature is verified against the peer's registered verifying key.
+/// Blocked peers are rejected (H2). Unknown/unverified peers are rejected.
+async fn auth_middleware<S: VectorStore + 'static>(
+    State(state): State<Arc<ServerState<S>>>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let headers = request.headers();
+
+    let instance_id_str = match headers
+        .get("x-animus-instance-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(s) => s.to_string(),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing X-Animus-Instance-Id header"),
+    };
+
+    let timestamp_str = match headers
+        .get("x-animus-timestamp")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(s) => s.to_string(),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing X-Animus-Timestamp header"),
+    };
+
+    let signature_hex = match headers
+        .get("x-animus-signature")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(s) => s.to_string(),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing X-Animus-Signature header"),
+    };
+
+    // Parse instance ID
+    let uuid = match Uuid::parse_str(&instance_id_str) {
+        Ok(u) => u,
+        Err(_) => return error_response(StatusCode::UNAUTHORIZED, "invalid X-Animus-Instance-Id"),
+    };
+    let instance_id = InstanceId(uuid);
+
+    // Parse timestamp
+    let timestamp: i64 = match timestamp_str.parse() {
+        Ok(t) => t,
+        Err(_) => return error_response(StatusCode::UNAUTHORIZED, "invalid X-Animus-Timestamp"),
+    };
+
+    // Look up peer, check blocked status (H2), get verifying key.
+    // The RwLock guard is scoped so it drops before any .await.
+    let peer_vk = {
+        let peers = state.peers.read();
+        match peers.get_peer(&instance_id) {
+            Some(peer) => {
+                if peer.trust == TrustLevel::Blocked {
+                    return error_response(StatusCode::FORBIDDEN, "peer is blocked");
+                }
+                if peer.trust == TrustLevel::Unknown {
+                    return error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "peer has not completed handshake",
+                    );
+                }
+                peer.info.to_peer_info().map(|info| info.verifying_key)
+            }
+            None => None,
+        }
+    };
+
+    let peer_vk = match peer_vk {
+        Some(vk) => vk,
+        None => return error_response(StatusCode::UNAUTHORIZED, "unknown or invalid peer"),
+    };
+
+    // Verify request signature (H1).
+    // For GET requests, body is empty — clients sign with b"".
+    let path = request.uri().path().to_string();
+    if let Err(e) =
+        FederationAuth::verify_signed_request(timestamp, &path, b"", &signature_hex, &peer_vk)
+    {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            &format!("signature verification failed: {e}"),
+        );
+    }
+
+    // Inject authenticated peer identity for downstream handlers
+    request.extensions_mut().insert(AuthenticatedPeer { instance_id });
+
+    next.run(request).await
+}
+
+// ---------------------------------------------------------------------------
+// Axum handlers
+// ---------------------------------------------------------------------------
+
+/// Error response body returned as JSON.
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+/// Build a JSON error response.
+fn error_response(status: StatusCode, msg: &str) -> Response {
+    (
+        status,
+        Json(serde_json::to_value(&ErrorResponse {
+            error: msg.to_string(),
+        })
+        .unwrap()),
+    )
+        .into_response()
+}
+
+/// POST /federation/handshake
+///
+/// Receives a handshake request from an initiating peer, signs the challenge
+/// nonce, and returns a response with a counter-nonce challenge.
+/// Rejects handshakes from blocked peers (H2).
+async fn handle_handshake<S: VectorStore + 'static>(
+    State(state): State<Arc<ServerState<S>>>,
+    Json(request): Json<HandshakeRequest>,
+) -> Response {
+    tracing::info!(
+        peer = %request.instance_id,
+        "Received federation handshake request"
+    );
+
+    // H2: reject handshakes from blocked peers
+    {
+        let peers = state.peers.read();
+        if let Some(peer) = peers.get_peer(&request.instance_id) {
+            if peer.trust == TrustLevel::Blocked {
+                tracing::warn!(peer = %request.instance_id, "Rejecting handshake from blocked peer");
+                return error_response(StatusCode::FORBIDDEN, "peer is blocked");
+            }
+        }
+    }
+
+    match state.auth.respond_to_handshake(&request) {
+        Ok((response, counter_nonce)) => {
+            let pending = PendingHandshake {
+                counter_nonce,
+                initiator_vk_hex: request.verifying_key_hex.clone(),
+            };
+            state
+                .pending_handshakes
+                .lock()
+                .await
+                .insert(request.instance_id, pending);
+
+            (StatusCode::OK, Json(serde_json::to_value(&response).unwrap())).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(peer = %request.instance_id, error = %e, "Handshake failed");
+            error_response(StatusCode::BAD_REQUEST, &e.to_string())
+        }
+    }
+}
+
+/// Request body for the handshake confirm endpoint.
+#[derive(Deserialize)]
+struct HandshakeConfirmRequest {
+    instance_id: InstanceId,
+    #[serde(flatten)]
+    confirm: HandshakeConfirm,
+}
+
+/// POST /federation/handshake/confirm
+///
+/// Receives the initiator's counter-nonce signature, verifying mutual authentication.
+/// On success, registers or upgrades the peer to Verified trust level (M6).
+async fn handle_handshake_confirm<S: VectorStore + 'static>(
+    State(state): State<Arc<ServerState<S>>>,
+    Json(request): Json<HandshakeConfirmRequest>,
+) -> Response {
+    tracing::info!(
+        peer = %request.instance_id,
+        "Received federation handshake confirm"
+    );
+
+    let pending = state
+        .pending_handshakes
+        .lock()
+        .await
+        .remove(&request.instance_id);
+
+    let pending = match pending {
+        Some(p) => p,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "no pending handshake for this instance",
+            );
+        }
+    };
+
+    match state.auth.verify_confirm(
+        &request.confirm,
+        &pending.counter_nonce,
+        &pending.initiator_vk_hex,
+    ) {
+        Ok(()) => {
+            tracing::info!(peer = %request.instance_id, "Handshake confirmed successfully");
+
+            // M6: Register peer as Verified after successful mutual authentication
+            let vk_bytes = hex::decode(&pending.initiator_vk_hex).ok();
+            {
+                let mut peers = state.peers.write();
+                if peers.get_peer(&request.instance_id).is_some() {
+                    // Peer already known — upgrade trust and record handshake time
+                    peers.set_trust(&request.instance_id, TrustLevel::Verified);
+                    if let Some(peer) = peers.get_peer_mut(&request.instance_id) {
+                        peer.last_handshake = Some(Utc::now());
+                        if let Some(ref vk) = vk_bytes {
+                            if let Ok(vk_arr) = <[u8; 32]>::try_from(vk.as_slice()) {
+                                peer.info.verifying_key_bytes = vk_arr;
+                            }
+                        }
+                    }
+                } else if let Some(ref vk) = vk_bytes {
+                    // New peer — register with Verified trust
+                    if let Ok(vk_arr) = <[u8; 32]>::try_from(vk.as_slice()) {
+                        if let Ok(vk) = VerifyingKey::from_bytes(&vk_arr) {
+                            let info = PeerInfo {
+                                instance_id: request.instance_id,
+                                verifying_key: vk,
+                                address: "0.0.0.0:0".parse().unwrap(),
+                            };
+                            peers.add_peer(info);
+                            peers.set_trust(&request.instance_id, TrustLevel::Verified);
+                            if let Some(peer) = peers.get_peer_mut(&request.instance_id) {
+                                peer.last_handshake = Some(Utc::now());
+                            }
+                        }
+                    }
+                }
+            }
+
+            #[derive(Serialize)]
+            struct ConfirmResponse {
+                status: String,
+            }
+
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(&ConfirmResponse {
+                        status: "confirmed".to_string(),
+                    })
+                    .unwrap(),
+                ),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(peer = %request.instance_id, error = %e, "Handshake confirm failed");
+            error_response(StatusCode::UNAUTHORIZED, &e.to_string())
+        }
+    }
+}
+
+/// GET /federation/segments/{id}
+///
+/// Returns a segment by its UUID. Requires authentication (H1) and checks
+/// privacy policies before returning data (H3).
+async fn handle_get_segment<S: VectorStore + 'static>(
+    State(state): State<Arc<ServerState<S>>>,
+    Extension(auth_peer): Extension<AuthenticatedPeer>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let uuid = match Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &format!("invalid segment ID: {e}"));
+        }
+    };
+
+    let segment_id = SegmentId(uuid);
+
+    match state.store.get(segment_id) {
+        Ok(Some(segment)) => {
+            // H3: Check privacy/federation policies before returning segment
+            if !state.knowledge.can_publish(&segment, &auth_peer.instance_id) {
+                tracing::warn!(
+                    peer = %auth_peer.instance_id,
+                    segment = %id,
+                    "Denied segment access — privacy policy"
+                );
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "segment not available for federation",
+                );
+            }
+
+            (StatusCode::OK, Json(serde_json::to_value(&segment).unwrap())).into_response()
+        }
+        Ok(None) => error_response(StatusCode::NOT_FOUND, &format!("segment {id} not found")),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to retrieve segment: {e}"),
+        ),
+    }
+}
+
+/// A JSON-friendly peer summary for the debug endpoint.
+#[derive(Serialize)]
+struct PeerSummary {
+    instance_id: InstanceId,
+    trust: String,
+    last_seen: String,
+    segments_received: u64,
+    segments_sent: u64,
+}
+
+impl From<&Peer> for PeerSummary {
+    fn from(peer: &Peer) -> Self {
+        Self {
+            instance_id: peer.info.instance_id,
+            trust: format!("{:?}", peer.trust),
+            last_seen: peer.last_seen.to_rfc3339(),
+            segments_received: peer.segments_received,
+            segments_sent: peer.segments_sent,
+        }
+    }
+}
+
+/// GET /federation/peers
+///
+/// Returns a list of all known peers as JSON. Protected endpoint —
+/// only authenticated (Verified+) peers can enumerate peers.
+async fn handle_list_peers<S: VectorStore + 'static>(
+    State(state): State<Arc<ServerState<S>>>,
+    Extension(_auth_peer): Extension<AuthenticatedPeer>,
+) -> Response {
+    let peers = state.peers.read();
+    let summaries: Vec<PeerSummary> = peers
+        .all_peers()
+        .iter()
+        .map(|p| PeerSummary::from(*p))
+        .collect();
+
+    (StatusCode::OK, Json(serde_json::to_value(&summaries).unwrap())).into_response()
+}

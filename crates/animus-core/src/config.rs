@@ -28,6 +28,9 @@ pub struct AnimusConfig {
 
     /// Sensorium perception layer configuration.
     pub sensorium: SensoriumConfig,
+
+    /// Federation layer configuration.
+    pub federation: FederationConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +137,34 @@ impl Default for InterfaceConfig {
     }
 }
 
+/// Configuration for the Federation layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationConfig {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub port: u16,
+    pub static_peers: Vec<String>,
+    pub relevance_threshold: f32,
+    pub federated_confidence_trusted: f32,
+    pub federated_confidence_verified: f32,
+    pub max_requests_per_minute: u32,
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "0.0.0.0".to_string(),
+            port: 0,
+            static_peers: Vec::new(),
+            relevance_threshold: 0.5,
+            federated_confidence_trusted: 0.3,
+            federated_confidence_verified: 0.1,
+            max_requests_per_minute: 100,
+        }
+    }
+}
+
 impl Default for AnimusConfig {
     fn default() -> Self {
         Self {
@@ -155,6 +186,7 @@ impl Default for AnimusConfig {
             cortex: CortexConfig::default(),
             interface: InterfaceConfig::default(),
             sensorium: SensoriumConfig::default(),
+            federation: FederationConfig::default(),
         }
     }
 }

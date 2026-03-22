@@ -1,0 +1,27 @@
+[package]
+name = "animus-federation"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+animus-core = { workspace = true }
+animus-vectorfs = { workspace = true }
+animus-cortex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ed25519-dalek = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+mdns-sd = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -47,6 +47,9 @@ pub enum AnimusError {
     #[error("threading error: {0}")]
     Threading(String),
 
+    #[error("federation error: {0}")]
+    Federation(String),
+
     #[error("{0}")]
     Other(String),
 }
