@@ -1,4 +1,3 @@
-use animus_core::error::Result;
 use animus_core::identity::{GoalId, SegmentId, ThreadId};
 use animus_core::segment::{Content, DecayClass, Segment, Source};
 use animus_core::threading::{Signal, SignalPriority};
@@ -182,6 +181,160 @@ impl<S: VectorStore> ReflectionLoop<S> {
         self
     }
 
+    /// Gather segments created or accessed since last cycle.
+    fn gather_recent_segments(&self) -> Vec<Segment> {
+        let all_ids = self.store.segment_ids(None);
+        let mut recent = Vec::new();
+        for id in all_ids {
+            if let Ok(Some(seg)) = self.store.get_raw(id) {
+                if seg.created > self.last_cycle || seg.last_accessed > self.last_cycle {
+                    recent.push(seg);
+                }
+            }
+        }
+        recent.sort_by(|a, b| a.created.cmp(&b.created));
+        // Limit to avoid overwhelming the model
+        recent.truncate(50);
+        recent
+    }
+
+    /// Run one reflection cycle.
+    pub async fn run_cycle(&mut self) {
+        let recent = self.gather_recent_segments();
+        if recent.is_empty() {
+            self.last_segment_count = self.store.count(None);
+            return;
+        }
+
+        let goals_summary = self.goals.lock().goals_summary();
+        let user_msg = format_reflection_prompt(&recent, &goals_summary);
+        let messages = vec![Turn::text(Role::User, &user_msg)];
+
+        match self.engine.reason(REFLECTION_SYSTEM_PROMPT, &messages, None).await {
+            Ok(output) => {
+                match serde_json::from_str::<ReflectionOutput>(&output.content) {
+                    Ok(reflection) => {
+                        self.handle_reflection_output(reflection).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse reflection output: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Reflection engine error: {e}");
+            }
+        }
+
+        self.last_cycle = Utc::now();
+        self.last_segment_count = self.store.count(None);
+    }
+
+    /// Process the structured reflection output.
+    async fn handle_reflection_output(&mut self, output: ReflectionOutput) {
+        // Store syntheses as SelfDerived segments
+        for synthesis in output.syntheses {
+            match self.embedder.embed_text(&synthesis.content).await {
+                Ok(embedding) => {
+                    let mut segment = Segment::new(
+                        Content::Text(synthesis.content),
+                        embedding,
+                        Source::SelfDerived {
+                            reasoning_chain: "reflection-synthesis".to_string(),
+                        },
+                    );
+                    segment.decay_class = synthesis.decay_class;
+                    segment.lineage = synthesis.source_segment_ids;
+                    // Uniform prior — must earn trust through feedback
+                    segment.alpha = 1.0;
+                    segment.beta = 1.0;
+                    segment.confidence = 0.5;
+                    if let Err(e) = self.store.store(segment) {
+                        tracing::warn!("Failed to store synthesis: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Synthesis embedding failed: {e}");
+                }
+            }
+        }
+
+        // Handle contradictions with deduplication
+        for contradiction in output.contradictions {
+            let pair = if contradiction.segment_a < contradiction.segment_b {
+                (contradiction.segment_a, contradiction.segment_b)
+            } else {
+                (contradiction.segment_b, contradiction.segment_a)
+            };
+            if self.signaled_contradictions.contains(&pair) {
+                continue;
+            }
+            self.signaled_contradictions.insert(pair);
+
+            let sig = Signal {
+                source_thread: ThreadId::new(),
+                target_thread: ThreadId::new(),
+                priority: SignalPriority::Normal,
+                summary: format!(
+                    "Contradiction detected: {}. Suggested resolution: {}",
+                    contradiction.description, contradiction.suggested_resolution,
+                ),
+                segment_refs: vec![contradiction.segment_a, contradiction.segment_b],
+                created: Utc::now(),
+            };
+            if self.signal_tx.send(sig).await.is_err() {
+                tracing::warn!("Signal channel closed");
+            }
+        }
+
+        // Handle goal updates
+        for update in output.goal_updates {
+            if update.suggest_complete {
+                let sig = Signal {
+                    source_thread: ThreadId::new(),
+                    target_thread: ThreadId::new(),
+                    priority: SignalPriority::Normal,
+                    summary: format!(
+                        "Goal {} may be complete: {}",
+                        update.goal_id, update.progress_note
+                    ),
+                    segment_refs: vec![],
+                    created: Utc::now(),
+                };
+                if self.signal_tx.send(sig).await.is_err() {
+                    tracing::warn!("Signal channel closed");
+                }
+            }
+        }
+
+        // Handle signals from reflection
+        for signal in output.signals {
+            let sig = Signal {
+                source_thread: ThreadId::new(),
+                target_thread: ThreadId::new(),
+                priority: signal.priority,
+                summary: signal.insight,
+                segment_refs: signal.relevant_segments,
+                created: Utc::now(),
+            };
+            if self.signal_tx.send(sig).await.is_err() {
+                tracing::warn!("Signal channel closed");
+            }
+        }
+    }
+
+    /// Run the reflection loop. Checks every 60 seconds if a cycle is needed.
+    /// This method runs indefinitely — spawn it with `tokio::spawn`.
+    pub async fn run(mut self) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+
+            if self.should_cycle() {
+                self.run_cycle().await;
+            }
+        }
+    }
+
     /// Check if a reflection cycle should run based on segment count and time.
     pub fn should_cycle(&self) -> bool {
         let now = Utc::now();
@@ -303,5 +456,145 @@ mod tests {
         assert!(prompt.contains("test knowledge"));
         assert!(prompt.contains("Active Goals"));
         assert!(prompt.contains("Build the thing"));
+    }
+
+    #[tokio::test]
+    async fn test_reflection_run_cycle_stores_synthesis() {
+        use animus_vectorfs::store::MmapVectorStore;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(MmapVectorStore::open(dir.path(), 4).unwrap());
+        let embedder: Arc<dyn EmbeddingService> =
+            Arc::new(animus_embed::SyntheticEmbedding::new(4));
+        let goals = Arc::new(parking_lot::Mutex::new(GoalManager::new()));
+        let (signal_tx, _signal_rx) = mpsc::channel(100);
+
+        // Store some recent segments for reflection to find
+        let seg1 = Segment::new(
+            Content::Text("User prefers Rust".to_string()),
+            vec![1.0, 0.0, 0.0, 0.0],
+            Source::Conversation { thread_id: ThreadId::new(), turn: 0 },
+        );
+        let id1 = seg1.id;
+        store.store(seg1).unwrap();
+
+        let response = serde_json::json!({
+            "syntheses": [{
+                "content": "User is a Rust developer who values performance",
+                "source_segment_ids": [id1.to_string()],
+                "decay_class": "Procedural",
+                "confidence_rationale": "Direct observation"
+            }],
+            "contradictions": [],
+            "goal_updates": [],
+            "signals": []
+        });
+        let mock_engine = Box::new(crate::MockEngine::new(&response.to_string()));
+        let mut loop_ = ReflectionLoop::new(mock_engine, store.clone(), embedder, goals, signal_tx);
+        loop_.last_cycle = Utc::now() - chrono::Duration::hours(1);
+        loop_.last_segment_count = 0;
+
+        loop_.run_cycle().await;
+
+        // Should have stored the synthesis segment (1 original + 1 synthesis = 2)
+        assert_eq!(store.count(None), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reflection_deduplicates_contradictions() {
+        use animus_vectorfs::store::MmapVectorStore;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(MmapVectorStore::open(dir.path(), 4).unwrap());
+        let embedder: Arc<dyn EmbeddingService> =
+            Arc::new(animus_embed::SyntheticEmbedding::new(4));
+        let goals = Arc::new(parking_lot::Mutex::new(GoalManager::new()));
+        let (signal_tx, mut signal_rx) = mpsc::channel(100);
+
+        // Store segments for reflection to find
+        let seg = Segment::new(
+            Content::Text("test".to_string()),
+            vec![1.0, 0.0, 0.0, 0.0],
+            Source::Manual { description: "test".to_string() },
+        );
+        store.store(seg).unwrap();
+
+        let id_a = SegmentId::new();
+        let id_b = SegmentId::new();
+        let response = serde_json::json!({
+            "syntheses": [],
+            "contradictions": [{
+                "segment_a": id_a,
+                "segment_b": id_b,
+                "description": "Conflicting info",
+                "suggested_resolution": "Check"
+            }],
+            "goal_updates": [],
+            "signals": []
+        });
+        let mock_engine = Box::new(crate::MockEngine::new(&response.to_string()));
+        let mut loop_ = ReflectionLoop::new(mock_engine, store, embedder, goals, signal_tx);
+        loop_.last_cycle = Utc::now() - chrono::Duration::hours(1);
+        loop_.last_segment_count = 0;
+
+        // First cycle — should signal
+        loop_.run_cycle().await;
+        assert!(signal_rx.try_recv().is_ok());
+
+        // Second cycle with same contradiction — should NOT signal again
+        // Reset last_cycle so it gathers segments again
+        loop_.last_cycle = Utc::now() - chrono::Duration::hours(1);
+        loop_.run_cycle().await;
+        // No new signal for the same contradiction pair
+        let mut found_duplicate = false;
+        while let Ok(sig) = signal_rx.try_recv() {
+            if sig.summary.contains("Conflicting info") {
+                found_duplicate = true;
+            }
+        }
+        assert!(!found_duplicate, "should not re-signal same contradiction");
+    }
+
+    #[tokio::test]
+    async fn test_reflection_sends_insight_signal() {
+        use animus_vectorfs::store::MmapVectorStore;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(MmapVectorStore::open(dir.path(), 4).unwrap());
+        let embedder: Arc<dyn EmbeddingService> =
+            Arc::new(animus_embed::SyntheticEmbedding::new(4));
+        let goals = Arc::new(parking_lot::Mutex::new(GoalManager::new()));
+        let (signal_tx, mut signal_rx) = mpsc::channel(100);
+
+        let seg = Segment::new(
+            Content::Text("test".to_string()),
+            vec![1.0, 0.0, 0.0, 0.0],
+            Source::Manual { description: "test".to_string() },
+        );
+        store.store(seg).unwrap();
+
+        let response = serde_json::json!({
+            "syntheses": [],
+            "contradictions": [],
+            "goal_updates": [],
+            "signals": [{
+                "priority": "Normal",
+                "insight": "Build failures correlate with auth changes",
+                "relevant_segments": []
+            }]
+        });
+        let mock_engine = Box::new(crate::MockEngine::new(&response.to_string()));
+        let mut loop_ = ReflectionLoop::new(mock_engine, store, embedder, goals, signal_tx);
+        loop_.last_cycle = Utc::now() - chrono::Duration::hours(1);
+        loop_.last_segment_count = 0;
+
+        loop_.run_cycle().await;
+
+        let signal = signal_rx.try_recv().unwrap();
+        assert_eq!(signal.priority, SignalPriority::Normal);
+        assert!(signal.summary.contains("Build failures"));
     }
 }
