@@ -92,14 +92,16 @@ impl<S: VectorStore> Consolidator<S> {
                     merged_ids.insert(id);
                 }
 
+                let text_count = source_ids.len();
                 match self.store.merge(source_ids, merged) {
                     Ok(new_id) => {
                         tracing::debug!(
                             "consolidated {} segments into {}",
-                            cluster.len(),
+                            text_count,
                             new_id
                         );
-                        report.segments_merged += cluster.len();
+                        // Count only the text segments actually merged (non-text are preserved).
+                        report.segments_merged += text_count;
                         report.segments_created += 1;
                     }
                     Err(e) => {
@@ -114,21 +116,22 @@ impl<S: VectorStore> Consolidator<S> {
     }
 
     /// Merge a cluster of similar segments into one consolidated segment.
+    /// Only called when the cluster has at least one text-content segment (guaranteed by caller).
     fn merge_cluster(&self, segments: &[&Segment]) -> Segment {
         // Average only the embeddings of text-content segments so that the merged
         // embedding represents the text being stored, not a blend with non-text vectors.
+        // text_segs is non-empty: caller ensures has_text before calling merge_cluster.
         let text_segs: Vec<&&Segment> = segments.iter()
             .filter(|s| matches!(s.content, Content::Text(_)))
             .collect();
-        let embed_source = if text_segs.is_empty() { segments.iter().collect::<Vec<_>>() } else { text_segs };
         let dim = segments[0].embedding.len();
         let mut avg_embedding = vec![0.0f32; dim];
-        for seg in &embed_source {
+        for seg in &text_segs {
             for (i, v) in seg.embedding.iter().enumerate() {
                 avg_embedding[i] += v;
             }
         }
-        let n = embed_source.len() as f32;
+        let n = text_segs.len() as f32;
         for v in &mut avg_embedding {
             *v /= n;
         }
