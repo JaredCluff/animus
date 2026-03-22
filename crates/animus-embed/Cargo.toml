@@ -1,0 +1,11 @@
+[package]
+name = "animus-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+animus-core = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

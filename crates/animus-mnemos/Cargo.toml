@@ -1,0 +1,12 @@
+[package]
+name = "animus-mnemos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+animus-core = { workspace = true }
+animus-vectorfs = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }

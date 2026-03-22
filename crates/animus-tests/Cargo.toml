@@ -1,0 +1,20 @@
+[package]
+name = "animus-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+animus-core = { workspace = true }
+animus-vectorfs = { workspace = true }
+animus-mnemos = { workspace = true }
+animus-embed = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
