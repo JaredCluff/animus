@@ -23,6 +23,13 @@ impl Tool for RememberTool {
 
     async fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolResult, String> {
         let knowledge = params["knowledge"].as_str().ok_or("missing 'knowledge' parameter")?;
+        const MAX_KNOWLEDGE_BYTES: usize = 10 * 1024; // 10 KiB — keeps embeddings tractable
+        if knowledge.len() > MAX_KNOWLEDGE_BYTES {
+            return Ok(ToolResult {
+                content: format!("Knowledge too large: {} bytes (max {} bytes). Summarize before storing.", knowledge.len(), MAX_KNOWLEDGE_BYTES),
+                is_error: true,
+            });
+        }
         let decay_class_str = params["decay_class"].as_str().unwrap_or("general");
         let decay_class = match decay_class_str {
             "factual" => DecayClass::Factual,
