@@ -1,0 +1,81 @@
+services:
+  animus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: animus:latest
+    container_name: animus
+    restart: unless-stopped
+
+    ports:
+      # Health endpoint — expose on localhost only by default.
+      # Set ANIMUS_HEALTH_BIND=0.0.0.0:8080 and change to "8080:8080" for broader access.
+      - "127.0.0.1:8080:8080"
+
+    environment:
+      ANIMUS_DATA_DIR: /home/animus/.animus
+      ANIMUS_HEALTH_BIND: "0.0.0.0:8080"
+      ANIMUS_LOG_LEVEL: "animus=info"
+
+      # LLM provider (default: Anthropic via API key)
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+
+      # OpenAI (used if ANIMUS_LLM_PROVIDER=openai or ANIMUS_EMBED_PROVIDER=openai)
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+
+      # Embedding provider (default: ollama via service below)
+      ANIMUS_EMBED_PROVIDER: "${ANIMUS_EMBED_PROVIDER:-ollama}"
+      ANIMUS_OLLAMA_URL: "http://ollama:11434"
+      ANIMUS_EMBED_MODEL: "${ANIMUS_EMBED_MODEL:-mxbai-embed-large}"
+
+      # Federation (disabled by default)
+      ANIMUS_FEDERATION: "${ANIMUS_FEDERATION:-0}"
+
+    volumes:
+      - animus-data:/home/animus/.animus
+
+    depends_on:
+      ollama:
+        condition: service_started
+
+    # Healthcheck using the built-in HTTP endpoint
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Ollama (embedding + optional local LLM) ─────────────────────────────────
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    container_name: animus-ollama
+    restart: unless-stopped
+
+    ports:
+      # Expose on localhost only — animus connects via the internal network
+      - "127.0.0.1:11434:11434"
+
+    volumes:
+      - ollama-data:/root/.ollama
+
+    # Pull the default embedding model on startup if not already present
+    # Remove or change ANIMUS_EMBED_MODEL to use a different model.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "ollama serve & sleep 5 && ollama pull ${ANIMUS_EMBED_MODEL:-mxbai-embed-large} && wait"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  animus-data:
+  ollama-data:
+
+networks:
+  default:
+    name: animus-net
