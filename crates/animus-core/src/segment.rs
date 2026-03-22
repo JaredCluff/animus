@@ -107,12 +107,15 @@ impl Segment {
     /// Create a new segment with the given content and embedding.
     pub fn new(content: Content, embedding: Vec<f32>, source: Source) -> Self {
         let now = Utc::now();
+        let alpha = 1.0_f32;
+        let beta = 1.0_f32;
+        let confidence = alpha / (alpha + beta);
         Self {
             id: SegmentId::new(),
             embedding,
             content,
             source,
-            confidence: 0.5,
+            confidence,
             lineage: Vec::new(),
             tier: Tier::Warm,
             relevance_score: 0.5,
@@ -123,8 +126,8 @@ impl Segment {
             consent_policy: None,
             observable_by: Vec::new(),
             tags: HashMap::new(),
-            alpha: 1.0,
-            beta: 1.0,
+            alpha,
+            beta,
             decay_class: DecayClass::default(),
         }
     }

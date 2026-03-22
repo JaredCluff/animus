@@ -3,6 +3,19 @@ use super::{Tool, ToolResult, ToolContext};
 
 pub struct ReadFileTool;
 
+/// Reject paths that are relative or contain parent-directory traversal.
+fn validate_path(path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, Path};
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err("path must be absolute".to_string());
+    }
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("path traversal not allowed".to_string());
+    }
+    Ok(p.to_path_buf())
+}
+
 #[async_trait::async_trait]
 impl Tool for ReadFileTool {
     fn name(&self) -> &str { "read_file" }
@@ -19,8 +32,10 @@ impl Tool for ReadFileTool {
     fn required_autonomy(&self) -> Autonomy { Autonomy::Inform }
 
     async fn execute(&self, params: serde_json::Value, _ctx: &ToolContext) -> Result<ToolResult, String> {
-        let path = params["path"].as_str().ok_or("missing 'path' parameter")?;
-        match tokio::fs::read_to_string(path).await {
+        let path_str = params["path"].as_str().ok_or("missing 'path' parameter")?;
+        let path = validate_path(path_str)
+            .map_err(|e| format!("invalid path: {e}"))?;
+        match tokio::fs::read_to_string(&path).await {
             Ok(contents) => {
                 let truncated = if contents.len() > 50_000 {
                     let boundary = contents.floor_char_boundary(50_000);

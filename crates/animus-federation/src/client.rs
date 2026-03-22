@@ -47,7 +47,7 @@ impl FederationClient {
         let timestamp = chrono::Utc::now().timestamp();
         let signature = self.auth.sign_request(timestamp, path, &body);
 
-        let url = format!("http://{peer_addr}{path}");
+        let url = format!("https://{peer_addr}{path}");
         let resp = self
             .client
             .post(&url)
@@ -101,7 +101,7 @@ impl FederationClient {
         let timestamp = chrono::Utc::now().timestamp();
         let signature = self.auth.sign_request(timestamp, path, &body);
 
-        let url = format!("http://{peer_addr}{path}");
+        let url = format!("https://{peer_addr}{path}");
         let resp = self
             .client
             .post(&url)
@@ -135,7 +135,7 @@ impl FederationClient {
         let timestamp = chrono::Utc::now().timestamp();
         let signature = self.auth.sign_request(timestamp, &path, &[]);
 
-        let url = format!("http://{peer_addr}{path}");
+        let url = format!("https://{peer_addr}{path}");
         let resp = self
             .client
             .get(&url)
