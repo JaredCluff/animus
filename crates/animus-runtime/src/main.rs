@@ -157,6 +157,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                                     raw_event_id: event.id,
                                 },
                             );
+                            segment.infer_decay_class();
                             // During sleep, observations go to Cold tier only
                             if sleeping_bg.load(std::sync::atomic::Ordering::Relaxed) {
                                 segment.tier = animus_core::Tier::Cold;
@@ -558,16 +559,15 @@ async fn handle_command(
         }
         "/remember" if !arg.is_empty() => {
             use animus_core::segment::{Content, Segment, Source};
-            use animus_core::EventId;
             let embedding = ctx.embedder.embed_text(arg).await?;
-            let segment = Segment::new(
+            let mut segment = Segment::new(
                 Content::Text(arg.to_string()),
                 embedding,
-                Source::Observation {
-                    event_type: "user-remember".to_string(),
-                    raw_event_id: EventId::new(),
+                Source::Manual {
+                    description: "user-remember".to_string(),
                 },
             );
+            segment.infer_decay_class();
             let id = ctx.store.store(segment)?;
             ctx.interface.display_status(&format!(
                 "Remembered: {} (segment {})",

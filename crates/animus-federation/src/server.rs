@@ -560,7 +560,7 @@ async fn handle_publish<S: VectorStore + 'static>(
     );
 
     // Store a federation-sourced segment with the announced embedding
-    let segment = animus_core::Segment::new(
+    let mut segment = animus_core::Segment::new(
         animus_core::Content::Text(format!(
             "Federation segment from {} (kind: {:?})",
             auth_peer.instance_id, announcement.content_kind
@@ -571,6 +571,7 @@ async fn handle_publish<S: VectorStore + 'static>(
             original_id: announcement.segment_id,
         },
     );
+    segment.infer_decay_class();
 
     match state.store.store(segment) {
         Ok(id) => {

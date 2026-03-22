@@ -1,5 +1,5 @@
 use animus_core::segment::DecayClass;
-use animus_core::{Content, Segment, Source, Tier, TierConfig};
+use animus_core::{Content, EventId, InstanceId, Segment, SegmentId, Source, Tier, TierConfig, ThreadId};
 use animus_mnemos::QualityTracker;
 use animus_vectorfs::store::MmapVectorStore;
 use animus_vectorfs::tier_manager::TierManager;
@@ -273,4 +273,72 @@ fn test_update_meta_sets_decay_class() {
     assert_eq!(updated.decay_class, DecayClass::Factual);
     assert!((updated.alpha - 5.0).abs() < f32::EPSILON);
     assert!((updated.beta - 1.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn test_auto_classify_observation() {
+    let mut seg = Segment::new(
+        Content::Text("file changed".to_string()),
+        vec![1.0, 0.0, 0.0, 0.0],
+        Source::Observation {
+            event_type: "file_change".to_string(),
+            raw_event_id: EventId::new(),
+        },
+    );
+    seg.infer_decay_class();
+    assert_eq!(seg.decay_class, DecayClass::Episodic);
+}
+
+#[test]
+fn test_auto_classify_conversation() {
+    let mut seg = Segment::new(
+        Content::Text("hello".to_string()),
+        vec![1.0, 0.0, 0.0, 0.0],
+        Source::Conversation {
+            thread_id: ThreadId::new(),
+            turn: 0,
+        },
+    );
+    seg.infer_decay_class();
+    assert_eq!(seg.decay_class, DecayClass::General);
+}
+
+#[test]
+fn test_auto_classify_consolidation() {
+    let mut seg = Segment::new(
+        Content::Text("merged fact".to_string()),
+        vec![1.0, 0.0, 0.0, 0.0],
+        Source::Consolidation {
+            merged_from: vec![SegmentId::new(), SegmentId::new()],
+        },
+    );
+    seg.infer_decay_class();
+    assert_eq!(seg.decay_class, DecayClass::Factual);
+}
+
+#[test]
+fn test_auto_classify_federation() {
+    let mut seg = Segment::new(
+        Content::Text("from peer".to_string()),
+        vec![1.0, 0.0, 0.0, 0.0],
+        Source::Federation {
+            source_ailf: InstanceId::new(),
+            original_id: SegmentId::new(),
+        },
+    );
+    seg.infer_decay_class();
+    assert_eq!(seg.decay_class, DecayClass::General);
+}
+
+#[test]
+fn test_auto_classify_self_derived() {
+    let mut seg = Segment::new(
+        Content::Text("I reasoned this".to_string()),
+        vec![1.0, 0.0, 0.0, 0.0],
+        Source::SelfDerived {
+            reasoning_chain: "because X".to_string(),
+        },
+    );
+    seg.infer_decay_class();
+    assert_eq!(seg.decay_class, DecayClass::Procedural);
 }

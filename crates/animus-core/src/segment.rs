@@ -178,6 +178,25 @@ impl Segment {
         (0.5 * confidence * decay + 0.3 * self.relevance_score + 0.2 * access).clamp(0.0, 1.0)
     }
 
+    /// Infer the decay class from the segment's source type.
+    /// Call after creation to auto-classify knowledge.
+    pub fn infer_decay_class(&mut self) {
+        self.decay_class = match &self.source {
+            // Sensorium observations are events — they decay faster
+            Source::Observation { .. } => DecayClass::Episodic,
+            // Reasoning outputs are procedural knowledge
+            Source::SelfDerived { .. } => DecayClass::Procedural,
+            // Consolidated knowledge has already been validated — treat as factual
+            Source::Consolidation { .. } => DecayClass::Factual,
+            // Federated knowledge from other AILFs — default, unknown provenance
+            Source::Federation { .. } => DecayClass::General,
+            // Conversation-derived knowledge — moderate decay
+            Source::Conversation { .. } => DecayClass::General,
+            // Manual bootstrap or user-remembered — general
+            Source::Manual { .. } => DecayClass::General,
+        };
+    }
+
     /// Estimated token count for context budgeting.
     pub fn estimated_tokens(&self) -> usize {
         match &self.content {

@@ -66,7 +66,7 @@ impl<S: VectorStore> ReasoningThread<S> {
     ) -> Result<String> {
         // Store user input as a segment
         let user_embedding = embedder.embed_text(user_input).await?;
-        let user_segment = Segment::new(
+        let mut user_segment = Segment::new(
             Content::Text(user_input.to_string()),
             user_embedding.clone(),
             Source::Conversation {
@@ -74,6 +74,7 @@ impl<S: VectorStore> ReasoningThread<S> {
                 turn: self.conversation.len() as u64,
             },
         );
+        user_segment.infer_decay_class();
         let user_seg_id = self.store.store(user_segment)?;
         self.stored_turn_ids.push(user_seg_id);
 
@@ -113,7 +114,7 @@ impl<S: VectorStore> ReasoningThread<S> {
 
         // Store assistant response as a segment
         let response_embedding = embedder.embed_text(&output.content).await?;
-        let response_segment = Segment::new(
+        let mut response_segment = Segment::new(
             Content::Text(output.content.clone()),
             response_embedding,
             Source::Conversation {
@@ -121,6 +122,7 @@ impl<S: VectorStore> ReasoningThread<S> {
                 turn: self.conversation.len() as u64,
             },
         );
+        response_segment.infer_decay_class();
         let response_seg_id = self.store.store(response_segment)?;
         self.stored_turn_ids.push(response_seg_id);
 
