@@ -57,7 +57,7 @@ pub struct Goal {
 }
 
 /// Simple goal manager — tracks goals in memory with persistence.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalManager {
     goals: HashMap<GoalId, Goal>,
 }
