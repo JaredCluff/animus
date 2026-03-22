@@ -70,6 +70,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "animus-interface"
+version = "0.1.0"
+dependencies = [
+ "animus-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "animus-mnemos"
 version = "0.1.0"
 dependencies = [

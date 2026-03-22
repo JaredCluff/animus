@@ -6,6 +6,7 @@ members = [
     "crates/animus-mnemos",
     "crates/animus-embed",
     "crates/animus-cortex",
+    "crates/animus-interface",
     "crates/animus-tests",
 ]
 
