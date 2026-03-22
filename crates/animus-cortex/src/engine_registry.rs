@@ -54,13 +54,15 @@ pub enum Provider {
     Mock,
 }
 
-impl Provider {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for Provider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "anthropic" => Some(Self::Anthropic),
-            "ollama" => Some(Self::Ollama),
-            "mock" => Some(Self::Mock),
-            _ => None,
+            "anthropic" => Ok(Self::Anthropic),
+            "ollama" => Ok(Self::Ollama),
+            "mock" => Ok(Self::Mock),
+            _ => Err(format!("unknown provider: {s}")),
         }
     }
 }
@@ -102,9 +104,10 @@ mod tests {
 
     #[test]
     fn test_provider_from_str() {
-        assert_eq!(Provider::from_str("anthropic"), Some(Provider::Anthropic));
-        assert_eq!(Provider::from_str("ollama"), Some(Provider::Ollama));
-        assert_eq!(Provider::from_str("mock"), Some(Provider::Mock));
-        assert_eq!(Provider::from_str("unknown"), None);
+        use std::str::FromStr;
+        assert_eq!(Provider::from_str("anthropic"), Ok(Provider::Anthropic));
+        assert_eq!(Provider::from_str("ollama"), Ok(Provider::Ollama));
+        assert_eq!(Provider::from_str("mock"), Ok(Provider::Mock));
+        assert!(Provider::from_str("unknown").is_err());
     }
 }

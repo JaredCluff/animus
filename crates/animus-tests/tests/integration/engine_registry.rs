@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use animus_cortex::engine_registry::{CognitiveRole, EngineRegistry, Provider};
 use animus_cortex::MockEngine;
 
@@ -23,7 +24,7 @@ fn test_engine_registry_per_role() {
 
 #[test]
 fn test_provider_parsing() {
-    assert_eq!(Provider::from_str("Anthropic"), Some(Provider::Anthropic));
-    assert_eq!(Provider::from_str("MOCK"), Some(Provider::Mock));
-    assert_eq!(Provider::from_str("invalid"), None);
+    assert_eq!(Provider::from_str("Anthropic"), Ok(Provider::Anthropic));
+    assert_eq!(Provider::from_str("MOCK"), Ok(Provider::Mock));
+    assert!(Provider::from_str("invalid").is_err());
 }

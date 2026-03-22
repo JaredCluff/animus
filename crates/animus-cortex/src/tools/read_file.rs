@@ -23,7 +23,8 @@ impl Tool for ReadFileTool {
         match tokio::fs::read_to_string(path).await {
             Ok(contents) => {
                 let truncated = if contents.len() > 50_000 {
-                    format!("{}...\n[truncated, {} total bytes]", &contents[..50_000], contents.len())
+                    let boundary = contents.floor_char_boundary(50_000);
+                    format!("{}...\n[truncated, {} total bytes]", &contents[..boundary], contents.len())
                 } else { contents };
                 Ok(ToolResult { content: truncated, is_error: false })
             }
