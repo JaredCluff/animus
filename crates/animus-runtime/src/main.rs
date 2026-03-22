@@ -173,6 +173,14 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     network_monitor.start();
     tracing::info!("NetworkMonitor started (30s poll interval)");
 
+    // Start process monitor sensor
+    let mut process_monitor = animus_sensorium::sensors::process_monitor::ProcessMonitor::new(
+        event_bus.clone(),
+        std::time::Duration::from_secs(30),
+    );
+    process_monitor.start();
+    tracing::info!("ProcessMonitor started (30s poll interval)");
+
     // File watcher (started via /watch command)
     let file_watcher: Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>> =
         Arc::new(parking_lot::Mutex::new(None));
@@ -190,6 +198,12 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
             ))
         }
     };
+
+    // Initialize quality tracker
+    let quality_path = data_dir.join("quality.bin");
+    let quality_tracker = Arc::new(parking_lot::Mutex::new(
+        animus_mnemos::quality::QualityTracker::load(&quality_path)?,
+    ));
 
     // Initialize goal manager
     let goals_path = data_dir.join("goals.bin");
@@ -219,6 +233,19 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         tracing::info!("Federation disabled (default); use ANIMUS_FEDERATION=1 to enable");
         None
     };
+
+    // Start periodic tier management (every 10 minutes)
+    let tier_store = store.clone();
+    tokio::spawn(async move {
+        let tier_manager = animus_vectorfs::tier_manager::TierManager::new(
+            tier_store,
+            animus_core::tier::TierConfig::default(),
+        );
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            tier_manager.run_cycle();
+        }
+    });
 
     // Start periodic memory consolidation (every 5 minutes)
     let consolidation_store = store.clone();
@@ -291,6 +318,13 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         {
             Ok(response) => {
                 interface.display_response(&response);
+                // Record implicit acceptance for recalled segments
+                if let Some(thread) = scheduler.active_thread() {
+                    let mut qt = quality_tracker.lock();
+                    for seg_id in thread.stored_turn_ids() {
+                        qt.record_acceptance(*seg_id);
+                    }
+                }
             }
             Err(e) => {
                 interface.display_status(&format!("Error: {e}"));
@@ -303,12 +337,16 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
     // Stop sensors
     network_monitor.stop();
+    process_monitor.stop();
     if let Some(fw) = file_watcher.lock().take() {
         fw.stop();
     }
 
     // Persist state
     goals.save(&goals_path)?;
+    if let Err(e) = quality_tracker.lock().save(&quality_path) {
+        tracing::warn!("Failed to save quality tracker: {e}");
+    }
     store.flush()?;
     interface.display_status("Session ended. Memory persisted.");
 

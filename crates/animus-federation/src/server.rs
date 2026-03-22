@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use animus_core::{AnimusError, InstanceId, Result, SegmentId};
 use animus_vectorfs::VectorStore;
-use axum::extract::{Extension, Path as AxumPath, State};
+use axum::extract::{ConnectInfo, Extension, Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
@@ -134,7 +134,12 @@ impl<S: VectorStore + 'static> FederationServer<S> {
         tracing::info!("Federation HTTP server listening on {actual_addr}");
 
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
                 tracing::error!("Federation HTTP server error: {e}");
             }
         });
@@ -299,14 +304,18 @@ struct ErrorResponse {
 
 /// Build a JSON error response.
 fn error_response(status: StatusCode, msg: &str) -> Response {
-    (
-        status,
-        Json(serde_json::to_value(&ErrorResponse {
-            error: msg.to_string(),
-        })
-        .unwrap()),
-    )
-        .into_response()
+    (status, Json(ErrorResponse { error: msg.to_string() })).into_response()
+}
+
+/// Build a JSON success response, falling back to 500 if serialization fails.
+fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response {
+    match serde_json::to_value(body) {
+        Ok(json) => (status, Json(json)).into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("response serialization failed: {e}"),
+        ),
+    }
 }
 
 /// POST /federation/handshake
@@ -346,7 +355,7 @@ async fn handle_handshake<S: VectorStore + 'static>(
                 .await
                 .insert(request.instance_id, pending);
 
-            (StatusCode::OK, Json(serde_json::to_value(&response).unwrap())).into_response()
+            json_response(StatusCode::OK, &response)
         }
         Err(e) => {
             tracing::warn!(peer = %request.instance_id, error = %e, "Handshake failed");
@@ -369,6 +378,7 @@ struct HandshakeConfirmRequest {
 /// On success, registers or upgrades the peer to Verified trust level (M6).
 async fn handle_handshake_confirm<S: VectorStore + 'static>(
     State(state): State<Arc<ServerState<S>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Json(request): Json<HandshakeConfirmRequest>,
 ) -> Response {
     tracing::info!(
@@ -422,7 +432,7 @@ async fn handle_handshake_confirm<S: VectorStore + 'static>(
                             let info = PeerInfo {
                                 instance_id: request.instance_id,
                                 verifying_key: vk,
-                                address: "0.0.0.0:0".parse().unwrap(),
+                                address: peer_addr,
                             };
                             peers.add_peer(info);
                             peers.set_trust(&request.instance_id, TrustLevel::Verified);
@@ -439,16 +449,9 @@ async fn handle_handshake_confirm<S: VectorStore + 'static>(
                 status: String,
             }
 
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::to_value(&ConfirmResponse {
-                        status: "confirmed".to_string(),
-                    })
-                    .unwrap(),
-                ),
-            )
-                .into_response()
+            json_response(StatusCode::OK, &ConfirmResponse {
+                status: "confirmed".to_string(),
+            })
         }
         Err(e) => {
             tracing::warn!(peer = %request.instance_id, error = %e, "Handshake confirm failed");
@@ -490,7 +493,7 @@ async fn handle_get_segment<S: VectorStore + 'static>(
                 );
             }
 
-            (StatusCode::OK, Json(serde_json::to_value(&segment).unwrap())).into_response()
+            json_response(StatusCode::OK, &segment)
         }
         Ok(None) => error_response(StatusCode::NOT_FOUND, &format!("segment {id} not found")),
         Err(e) => error_response(
@@ -537,7 +540,7 @@ async fn handle_list_peers<S: VectorStore + 'static>(
         .map(|p| PeerSummary::from(*p))
         .collect();
 
-    (StatusCode::OK, Json(serde_json::to_value(&summaries).unwrap())).into_response()
+    json_response(StatusCode::OK, &summaries)
 }
 
 /// POST /federation/publish
@@ -586,17 +589,10 @@ async fn handle_publish<S: VectorStore + 'static>(
                 local_segment_id: SegmentId,
             }
 
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::to_value(&PublishResponse {
-                        status: "accepted".to_string(),
-                        local_segment_id: id,
-                    })
-                    .unwrap(),
-                ),
-            )
-                .into_response()
+            json_response(StatusCode::OK, &PublishResponse {
+                status: "accepted".to_string(),
+                local_segment_id: id,
+            })
         }
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -651,16 +647,9 @@ async fn handle_goals<S: VectorStore + 'static>(
         local_goal_id: Option<animus_core::GoalId>,
     }
 
-    (
-        StatusCode::OK,
-        Json(
-            serde_json::to_value(&GoalResponse {
-                status: "accepted".to_string(),
-                goal_id: announcement.goal_id,
-                local_goal_id,
-            })
-            .unwrap(),
-        ),
-    )
-        .into_response()
+    json_response(StatusCode::OK, &GoalResponse {
+        status: "accepted".to_string(),
+        goal_id: announcement.goal_id,
+        local_goal_id,
+    })
 }

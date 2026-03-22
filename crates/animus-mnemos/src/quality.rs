@@ -1,6 +1,8 @@
+use animus_core::error::{AnimusError, Result};
 use animus_core::identity::SegmentId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Tracks feedback signals for the quality gate.
 /// V0.1: simple heuristic based on human corrections and acceptances.
@@ -43,6 +45,30 @@ impl QualityTracker {
             }
             None => 0.0,
         }
+    }
+
+    /// Persist to disk.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let data = bincode::serialize(self)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &data)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load from disk.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let data = std::fs::read(path)?;
+        let tracker: Self = bincode::deserialize(&data).map_err(|e| {
+            AnimusError::Storage(format!("failed to load quality tracker: {e}"))
+        })?;
+        Ok(tracker)
     }
 }
 

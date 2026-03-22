@@ -71,9 +71,18 @@ impl SensoriumOrchestrator {
             });
         }
 
-        if consent_result.permission == Permission::AllowAnonymized {
-            tracing::warn!("AllowAnonymized consent not yet implemented — treating as Allow");
-        }
+        // If AllowAnonymized, strip identifying details from the event data
+        // before it flows through attention/storage. The event_type and structure
+        // are preserved so rule-based attention still works, but string values
+        // that could contain PII (paths, IPs, names) are redacted.
+        let event = if consent_result.permission == Permission::AllowAnonymized {
+            let mut anon = event.clone();
+            anon.data = anonymize_value(&anon.data);
+            anon.source = "<redacted>".to_string();
+            anon
+        } else {
+            event
+        };
 
         // Step 2: Tier 1 attention filter (microsecond, rule-based)
         let tier1_decision = self.attention.tier1_evaluate(&event);
@@ -137,5 +146,25 @@ impl SensoriumOrchestrator {
             passed_attention: passed,
             audit_action: action,
         })
+    }
+}
+
+/// Recursively redact string values in a JSON value while preserving structure.
+/// Object keys are kept so rule matching on structure still works.
+fn anonymize_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let redacted: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), anonymize_value(v)))
+                .collect();
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(anonymize_value).collect())
+        }
+        serde_json::Value::String(_) => serde_json::Value::String("<redacted>".to_string()),
+        // Numbers, booleans, and nulls are kept — they're structural, not identifying
+        other => other.clone(),
     }
 }
