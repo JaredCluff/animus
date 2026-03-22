@@ -12,6 +12,12 @@ animus-mnemos = { workspace = true }
 animus-embed = { workspace = true }
 animus-cortex = { workspace = true }
 animus-sensorium = { workspace = true }
+animus-federation = { workspace = true }
+ed25519-dalek = { workspace = true }
+parking_lot = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

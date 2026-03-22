@@ -27,7 +27,7 @@ pub enum GoalStatus {
 pub enum GoalSource {
     Human,
     SelfDerived,
-    Federated,
+    Federated { source_ailf: animus_core::InstanceId },
 }
 
 /// Autonomy level — how much freedom the AILF has with this goal.
@@ -51,6 +51,7 @@ pub struct Goal {
     pub autonomy: Autonomy,
     pub sub_goals: Vec<GoalId>,
     pub progress_notes: Vec<SegmentId>,
+    pub cached_embedding: Option<Vec<f32>>,
     pub created: chrono::DateTime<chrono::Utc>,
     pub deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -78,7 +79,7 @@ impl GoalManager {
         let autonomy = match &source {
             GoalSource::Human => Autonomy::Act,
             GoalSource::SelfDerived => Autonomy::Suggest,
-            GoalSource::Federated => Autonomy::Inform,
+            GoalSource::Federated { .. } => Autonomy::Inform,
         };
 
         let goal = Goal {
@@ -91,6 +92,7 @@ impl GoalManager {
             autonomy,
             sub_goals: Vec::new(),
             progress_notes: Vec::new(),
+            cached_embedding: None,
             created: chrono::Utc::now(),
             deadline: None,
         };

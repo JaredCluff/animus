@@ -1,3 +1,4 @@
+use animus_core::InstanceId;
 use animus_cortex::telos::{Autonomy, GoalManager, GoalSource, GoalStatus, Priority};
 use tempfile::TempDir;
 
@@ -60,7 +61,7 @@ fn test_default_autonomy_by_source() {
 
     let human_id = manager.create_goal("Human goal".to_string(), GoalSource::Human, Priority::Normal);
     let self_id = manager.create_goal("Self goal".to_string(), GoalSource::SelfDerived, Priority::Normal);
-    let fed_id = manager.create_goal("Fed goal".to_string(), GoalSource::Federated, Priority::Normal);
+    let fed_id = manager.create_goal("Fed goal".to_string(), GoalSource::Federated { source_ailf: InstanceId::new() }, Priority::Normal);
 
     assert_eq!(manager.get(human_id).unwrap().autonomy, Autonomy::Act);
     assert_eq!(manager.get(self_id).unwrap().autonomy, Autonomy::Suggest);
