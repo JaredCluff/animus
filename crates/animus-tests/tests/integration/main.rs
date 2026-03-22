@@ -10,3 +10,4 @@ mod sensorium_types;
 mod sensorium_bus;
 mod sensorium_consent;
 mod sensorium_audit;
+mod sensorium_attention;
