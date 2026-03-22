@@ -34,7 +34,7 @@ impl MmapVectorStore {
         for entry in fs::read_dir(&segments_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "bin") {
+            if path.extension().is_some_and(|ext| ext == "bin") {
                 let data = fs::read(&path)?;
                 match bincode::deserialize::<Segment>(&data) {
                     Ok(segment) => {
@@ -167,6 +167,11 @@ impl VectorStore for MmapVectorStore {
         }
     }
 
+    fn get_raw(&self, id: SegmentId) -> Result<Option<Segment>> {
+        let segments = self.segments.read();
+        Ok(segments.get(&id).cloned())
+    }
+
     fn update_meta(&self, id: SegmentId, update: SegmentUpdate) -> Result<()> {
         let mut segments = self.segments.write();
         let seg = segments
@@ -232,7 +237,7 @@ impl VectorStore for MmapVectorStore {
         let segments = self.segments.read();
         segments
             .iter()
-            .filter(|(_, s)| tier_filter.map_or(true, |t| s.tier == t))
+            .filter(|(_, s)| tier_filter.is_none_or(|t| s.tier == t))
             .map(|(id, _)| *id)
             .collect()
     }

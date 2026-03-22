@@ -109,17 +109,19 @@ fn test_full_pipeline_tier_lifecycle() {
     let id = seg.id;
     store.store(seg).unwrap();
 
-    let s = store.get(id).unwrap().unwrap();
+    // Use get_raw to avoid updating last_accessed
+    let s = store.get_raw(id).unwrap().unwrap();
     assert_eq!(s.tier, Tier::Warm);
 
     let config = TierConfig {
         cold_delay_secs: 1,
+        recency_max_age_secs: 3600, // 1 hour — so 2-hour-old segment has 0 recency
         ..Default::default()
     };
     let tier_manager = TierManager::new(store.clone(), config);
     tier_manager.run_cycle();
 
-    let s = store.get(id).unwrap().unwrap();
+    let s = store.get_raw(id).unwrap().unwrap();
     assert_eq!(s.tier, Tier::Cold, "stale segment should be Cold");
 }
 

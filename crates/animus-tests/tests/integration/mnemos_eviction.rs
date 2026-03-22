@@ -50,15 +50,22 @@ fn test_eviction_keeps_highest_relevance() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(MmapVectorStore::open(dir.path(), 4).unwrap());
 
-    let mut close = text_segment(vec![0.99, 0.01, 0.0, 0.0], "very relevant");
+    let mut close = text_segment(
+        vec![0.99, 0.01, 0.0, 0.0],
+        "very relevant content that takes up context tokens in the budget allocation",
+    );
     close.relevance_score = 0.9;
     let close_id = close.id;
     store.store(close).unwrap();
 
-    let mut far = text_segment(vec![0.0, 0.0, 1.0, 0.0], "not relevant");
+    let mut far = text_segment(
+        vec![0.0, 0.0, 1.0, 0.0],
+        "not relevant content that also takes up context tokens in the budget allocation",
+    );
     far.relevance_score = 0.1;
     store.store(far).unwrap();
 
+    // Budget enough for only one segment (~19 tokens each)
     let assembler = ContextAssembler::new(store, 20);
     let context = assembler
         .assemble(&[1.0, 0.0, 0.0, 0.0], &[], 2)

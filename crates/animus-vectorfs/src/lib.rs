@@ -1,4 +1,4 @@
-use animus_core::{AnimusError, Result, Segment, SegmentId, Tier};
+use animus_core::{Result, Segment, SegmentId, Tier};
 
 /// Metadata update for a segment (partial update without replacing content).
 #[derive(Debug, Default)]
@@ -21,8 +21,13 @@ pub trait VectorStore: Send + Sync {
         tier_filter: Option<Tier>,
     ) -> Result<Vec<Segment>>;
 
-    /// Retrieve a segment by exact ID.
+    /// Retrieve a segment by exact ID. Records an access.
     fn get(&self, id: SegmentId) -> Result<Option<Segment>>;
+
+    /// Retrieve a segment by exact ID without recording an access.
+    /// Used by internal systems (TierManager, Consolidator) that need to read
+    /// segments without affecting their access statistics.
+    fn get_raw(&self, id: SegmentId) -> Result<Option<Segment>>;
 
     /// Update segment metadata without replacing content.
     fn update_meta(&self, id: SegmentId, update: SegmentUpdate) -> Result<()>;

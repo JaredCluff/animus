@@ -35,7 +35,7 @@ impl<S: VectorStore> Consolidator<S> {
         // Collect warm segments
         let mut warm_segments: Vec<Segment> = Vec::new();
         for id in &warm_ids {
-            if let Some(seg) = self.store.get(*id)? {
+            if let Some(seg) = self.store.get_raw(*id)? {
                 warm_segments.push(seg);
             }
         }
