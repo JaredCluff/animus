@@ -134,7 +134,7 @@ impl Segment {
 
     /// Record an access, updating count and timestamp.
     pub fn record_access(&mut self) {
-        self.access_count += 1;
+        self.access_count = self.access_count.saturating_add(1);
         self.last_accessed = Utc::now();
     }
 

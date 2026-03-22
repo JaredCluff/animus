@@ -274,6 +274,10 @@ async fn auth_middleware<S: VectorStore + 'static>(
         let now = chrono::Utc::now().timestamp();
         let window_start = now - 60;
         let mut rate_map = state.rate_limits.lock().await;
+        // Prune peers with no recent activity to bound HashMap growth.
+        if rate_map.len() > 1000 {
+            rate_map.retain(|_, v| !v.is_empty());
+        }
         let timestamps = rate_map.entry(instance_id).or_default();
         // Remove entries older than 1 minute
         timestamps.retain(|&t| t > window_start);

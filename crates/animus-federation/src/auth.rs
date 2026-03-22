@@ -135,9 +135,16 @@ impl FederationAuth {
         peer_vk: &VerifyingKey,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        if (now - timestamp).abs() > REPLAY_WINDOW_SECS {
+        let skew = now - timestamp;
+        if skew > REPLAY_WINDOW_SECS {
             return Err(AnimusError::Federation(
-                format!("request timestamp too old: {}s (max {}s)", (now - timestamp).abs(), REPLAY_WINDOW_SECS)
+                format!("request timestamp too old: {skew}s (max {REPLAY_WINDOW_SECS}s)")
+            ));
+        }
+        // Reject timestamps more than 5 seconds in the future (clock skew tolerance).
+        if skew < -5 {
+            return Err(AnimusError::Federation(
+                format!("request timestamp is {}s in the future", -skew)
             ));
         }
 

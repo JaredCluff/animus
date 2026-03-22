@@ -130,14 +130,15 @@ impl<S: VectorStore> ReasoningThread<S> {
             .collect();
 
         // Implicit Bayesian feedback: retrieved segments get a small positive signal.
+        // Alpha is capped at 100.0 to prevent unbounded growth skewing confidence toward 1.0.
+        const MAX_IMPLICIT_ALPHA: f32 = 100.0;
         for seg in &context.segments {
-            if !anchor_set.contains(&seg.id) {
-                let new_alpha = seg.alpha + 0.1;
+            if !anchor_set.contains(&seg.id) && seg.alpha < MAX_IMPLICIT_ALPHA {
+                let new_alpha = (seg.alpha + 0.1).min(MAX_IMPLICIT_ALPHA);
                 if let Err(e) = self.store.update_meta(
                     seg.id,
                     animus_vectorfs::SegmentUpdate {
                         alpha: Some(new_alpha),
-                        confidence: Some(new_alpha / (new_alpha + seg.beta)),
                         ..Default::default()
                     },
                 ) {
