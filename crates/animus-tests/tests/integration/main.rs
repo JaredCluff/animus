@@ -19,3 +19,4 @@ mod sensorium_full_pipeline;
 mod threading_types;
 mod threading_signals;
 mod threading_scheduler;
+mod federation_peers;
