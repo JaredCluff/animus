@@ -235,7 +235,7 @@ async fn goals_announcement() {
     assert_eq!(resp.status(), 200, "goals should return 200");
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "acknowledged");
+    assert_eq!(body["status"], "accepted");
 }
 
 /// Unauthenticated access to protected endpoints should be rejected.

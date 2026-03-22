@@ -178,3 +178,47 @@ fn test_update_meta() {
     assert!((updated.relevance_score - 0.9).abs() < 1e-6);
     assert!((updated.confidence - 0.95).abs() < 1e-6);
 }
+
+#[test]
+fn test_dimensionality_migration_clears_segments() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // Create store with dim=4 and add a segment
+    {
+        let store = MmapVectorStore::open(&path, 4).unwrap();
+        let seg = test_segment(vec![1.0, 0.0, 0.0, 0.0], "dim4 segment");
+        store.store(seg).unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.count(None), 1);
+    }
+
+    // Reopen with dim=8 — should clear the old dim=4 segments
+    {
+        let store = MmapVectorStore::open(&path, 8).unwrap();
+        assert_eq!(store.count(None), 0);
+        assert_eq!(store.dimensionality(), 8);
+
+        // New segments with correct dimensionality should work
+        let seg = test_segment(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "dim8 segment");
+        store.store(seg).unwrap();
+        assert_eq!(store.count(None), 1);
+    }
+}
+
+#[test]
+fn test_dimensionality_persisted_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let store = MmapVectorStore::open(&path, 4).unwrap();
+        assert_eq!(store.dimensionality(), 4);
+    }
+
+    // Reopen with same dim — should preserve segments
+    {
+        let store = MmapVectorStore::open(&path, 4).unwrap();
+        assert_eq!(store.dimensionality(), 4);
+    }
+}
