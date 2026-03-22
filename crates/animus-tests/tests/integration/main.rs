@@ -23,3 +23,4 @@ mod federation_peers;
 mod federation_protocol;
 mod federation_audit;
 mod federation_auth;
+mod federation_knowledge;
