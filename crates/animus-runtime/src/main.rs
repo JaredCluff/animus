@@ -1194,12 +1194,19 @@ async fn handle_command(
             if name.is_empty() {
                 ctx.interface.display_status("Usage: /thread new <name>");
             } else {
-                let id = ctx.scheduler.create_thread(name.to_string());
-                ctx.interface.display_status(&format!(
-                    "Thread created: {} ({})",
-                    name,
-                    id.0.to_string().get(..8).unwrap_or("?")
-                ));
+                const MAX_THREADS: usize = 64;
+                if ctx.scheduler.thread_count() >= MAX_THREADS {
+                    ctx.interface.display_status(&format!(
+                        "Thread limit reached ({MAX_THREADS}). Complete or archive existing threads first."
+                    ));
+                } else {
+                    let id = ctx.scheduler.create_thread(name.to_string());
+                    ctx.interface.display_status(&format!(
+                        "Thread created: {} ({})",
+                        name,
+                        id.0.to_string().get(..8).unwrap_or("?")
+                    ));
+                }
             }
         }
         "/thread" if arg.starts_with("switch ") => {
