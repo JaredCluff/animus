@@ -7,7 +7,7 @@ use std::collections::HashMap;
 /// Wrapper around hnsw_rs providing vector similarity search.
 pub struct HnswIndex {
     /// The HNSW graph using cosine distance.
-    hnsw: RwLock<Hnsw<f32, DistCosine>>,
+    hnsw: RwLock<Hnsw<'static, f32, DistCosine>>,
     /// Map from internal HNSW data ID to SegmentId.
     id_map: RwLock<HashMap<usize, SegmentId>>,
     /// Reverse map from SegmentId to internal HNSW data ID.
@@ -17,6 +17,12 @@ pub struct HnswIndex {
     /// Vector dimensionality.
     dimensionality: usize,
 }
+
+// Safety: HnswIndex manages its own synchronization via RwLock.
+// The 'static lifetime on Hnsw is safe because the data is owned
+// (inserted via insert_slice which copies data into the graph).
+unsafe impl Send for HnswIndex {}
+unsafe impl Sync for HnswIndex {}
 
 impl HnswIndex {
     /// Create a new HNSW index for the given dimensionality.
@@ -61,8 +67,9 @@ impl HnswIndex {
         self.id_map.write().insert(internal_id, segment_id);
         self.reverse_map.write().insert(segment_id, internal_id);
 
-        let data_vec = vec![(embedding, internal_id)];
-        self.hnsw.write().parallel_insert(&data_vec);
+        self.hnsw
+            .write()
+            .insert_slice((embedding, internal_id));
 
         Ok(())
     }
@@ -138,7 +145,6 @@ mod tests {
 
         let results = index.search(&v1, 2).unwrap();
         assert_eq!(results.len(), 2);
-        // First result should be v1 (closest to itself)
         assert_eq!(results[0].0, id1);
     }
 
@@ -162,7 +168,6 @@ mod tests {
         index.remove(id).unwrap();
         assert_eq!(index.len(), 0);
 
-        // Search should return no results for removed segment
         let results = index.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert!(results.is_empty());
     }

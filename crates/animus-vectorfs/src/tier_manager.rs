@@ -21,7 +21,7 @@ impl<S: VectorStore> TierManager<S> {
         let all_ids = self.store.segment_ids(None);
 
         for id in all_ids {
-            let segment = match self.store.get(id) {
+            let segment = match self.store.get_raw(id) {
                 Ok(Some(s)) => s,
                 _ => continue,
             };

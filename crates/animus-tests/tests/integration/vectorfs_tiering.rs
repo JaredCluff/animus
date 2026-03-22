@@ -30,13 +30,15 @@ fn test_tier_manager_demotes_stale_segments() {
 
     let config = TierConfig {
         cold_delay_secs: 60,
+        recency_max_age_secs: 3600, // 1 hour — so 2-hour-old segment has 0 recency
         ..Default::default()
     };
 
     let manager = TierManager::new(store.clone(), config);
     manager.run_cycle();
 
-    let updated = store.get(id).unwrap().unwrap();
+    // Use get_raw to avoid updating last_accessed
+    let updated = store.get_raw(id).unwrap().unwrap();
     assert_eq!(
         updated.tier,
         Tier::Cold,
@@ -61,7 +63,7 @@ fn test_tier_manager_promotes_accessed_cold_segments() {
     let manager = TierManager::new(store.clone(), config);
     manager.run_cycle();
 
-    let updated = store.get(id).unwrap().unwrap();
+    let updated = store.get_raw(id).unwrap().unwrap();
     assert_eq!(
         updated.tier,
         Tier::Warm,

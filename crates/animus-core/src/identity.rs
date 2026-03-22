@@ -76,3 +76,9 @@ impl SnapshotId {
         Self(Uuid::new_v4())
     }
 }
+
+impl Default for SnapshotId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
