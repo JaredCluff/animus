@@ -181,6 +181,18 @@ impl<S: VectorStore> ReflectionLoop<S> {
         self
     }
 
+    /// Override the last cycle timestamp (useful for testing).
+    pub fn with_last_cycle(mut self, last_cycle: DateTime<Utc>) -> Self {
+        self.last_cycle = last_cycle;
+        self
+    }
+
+    /// Override the last segment count baseline (useful for testing).
+    pub fn with_last_segment_count(mut self, count: usize) -> Self {
+        self.last_segment_count = count;
+        self
+    }
+
     /// Gather segments created or accessed since last cycle.
     fn gather_recent_segments(&self) -> Vec<Segment> {
         let all_ids = self.store.segment_ids(None);
