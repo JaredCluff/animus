@@ -12,7 +12,7 @@ async fn detects_new_process() {
     monitor.start();
 
     // Spawn a short-lived process
-    let child = std::process::Command::new("sleep")
+    let mut child = std::process::Command::new("sleep")
         .arg("2")
         .spawn()
         .expect("failed to spawn sleep");
@@ -43,6 +43,7 @@ async fn detects_new_process() {
     }
 
     monitor.stop();
+    let _ = child.wait();
 }
 
 #[tokio::test]
