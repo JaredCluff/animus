@@ -55,8 +55,9 @@ impl<S: VectorStore> ContextAssembler<S> {
         let mut total_tokens: usize = 0;
 
         // Step 1: Include anchor segments (always included, budget permitting)
+        // Use get_raw to avoid inflating access counts on anchors
         for id in anchor_ids {
-            if let Some(segment) = self.store.get(*id)? {
+            if let Some(segment) = self.store.get_raw(*id)? {
                 let tokens = segment.estimated_tokens();
                 if total_tokens + tokens <= self.token_budget {
                     total_tokens += tokens;
@@ -66,8 +67,8 @@ impl<S: VectorStore> ContextAssembler<S> {
             }
         }
 
-        // Step 2: Retrieve top-k similar segments
-        let candidates = self.store.query(query_embedding, top_k, None)?;
+        // Step 2: Retrieve top-k similar segments from Warm tier
+        let candidates = self.store.query(query_embedding, top_k, Some(animus_core::segment::Tier::Warm))?;
 
         // Step 3: Add candidates until budget is exhausted
         let mut evicted: Vec<(Segment, f32)> = Vec::new();

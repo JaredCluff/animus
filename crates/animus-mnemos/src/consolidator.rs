@@ -65,10 +65,18 @@ impl<S: VectorStore> Consolidator<S> {
                 }
             }
 
-            // Only merge if we found near-duplicates
+            // Only merge if we found near-duplicates with text content
             if cluster.len() >= 2 {
                 let cluster_segments: Vec<&Segment> =
                     cluster.iter().map(|&idx| &warm_segments[idx]).collect();
+
+                // Skip clusters with no text content to prevent data loss
+                let has_text = cluster_segments
+                    .iter()
+                    .any(|s| matches!(&s.content, Content::Text(_)));
+                if !has_text {
+                    continue;
+                }
 
                 let merged = self.merge_cluster(&cluster_segments);
                 let source_ids: Vec<SegmentId> =
@@ -112,6 +120,14 @@ impl<S: VectorStore> Consolidator<S> {
         let n = segments.len() as f32;
         for v in &mut avg_embedding {
             *v /= n;
+        }
+
+        // Re-normalize to unit vector for correct cosine distance
+        let norm: f32 = avg_embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for v in &mut avg_embedding {
+                *v /= norm;
+            }
         }
 
         // Concatenate text content
