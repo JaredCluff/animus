@@ -49,6 +49,7 @@ dependencies = [
  "animus-mnemos",
  "animus-vectorfs",
  "async-trait",
+ "bincode",
  "chrono",
  "reqwest",
  "serde",
