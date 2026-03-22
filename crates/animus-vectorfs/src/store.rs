@@ -248,7 +248,12 @@ impl MmapVectorStore {
                             );
                             continue;
                         }
-                        self.index.insert(segment.id, &segment.embedding)?;
+                        // Only insert into the HNSW index if this segment ID is not
+                        // already present — duplicate insertions corrupt top_k counts.
+                        let already_exists = self.segments.read().contains_key(&segment.id);
+                        if !already_exists {
+                            self.index.insert(segment.id, &segment.embedding)?;
+                        }
                         self.persist_segment(&segment)?;
                         self.segments.write().insert(segment.id, segment);
                         count += 1;

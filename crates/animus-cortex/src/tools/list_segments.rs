@@ -28,7 +28,8 @@ impl Tool for ListSegmentsTool {
             "cold" => Some(Tier::Cold),
             _ => None,
         };
-        let limit = params["limit"].as_u64().unwrap_or(20) as usize;
+        const MAX_LIST_LIMIT: usize = 500;
+        let limit = (params["limit"].as_u64().unwrap_or(20) as usize).min(MAX_LIST_LIMIT);
 
         let ids = ctx.store.segment_ids(tier_filter);
         let total = ids.len();

@@ -207,7 +207,8 @@ impl<S: VectorStore> ReflectionLoop<S> {
                 }
             }
         }
-        recent.sort_by(|a, b| a.created.cmp(&b.created));
+        // Sort newest-first so the most recent activity is prioritised when truncating.
+        recent.sort_by(|a, b| b.created.cmp(&a.created));
         // Limit to avoid overwhelming the model
         recent.truncate(50);
         recent
