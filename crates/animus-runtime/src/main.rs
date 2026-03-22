@@ -97,7 +97,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     // Initialize terminal interface
     let interface = TerminalInterface::new(">> ".to_string());
     let instance_str = format!("{}", identity.instance_id);
-    interface.display_banner(&instance_str[..8], engine.model_name(), segment_count);
+    interface.display_banner(instance_str.get(..8).unwrap_or(&instance_str), engine.model_name(), segment_count);
 
     // Main conversation loop
     loop {
@@ -220,7 +220,7 @@ async fn handle_command(
                 embedding,
                 Source::Observation {
                     event_type: "user-remember".to_string(),
-                    raw_event_id: EventId(uuid::Uuid::new_v4()),
+                    raw_event_id: EventId::new(),
                 },
             );
             let id = store.store(segment)?;

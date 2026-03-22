@@ -178,8 +178,17 @@ impl GoalManager {
         if !path.exists() {
             return Ok(Self::new());
         }
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > 67_108_864 {
+            return Err(AnimusError::Goal(
+                format!("goals file too large: {} bytes (max 64 MiB)", metadata.len())
+            ));
+        }
         let data = std::fs::read(path)?;
-        let manager: Self = bincode::deserialize(&data)?;
+        let manager: Self = bincode::deserialize(&data)
+            .map_err(|e| AnimusError::Goal(
+                format!("failed to load goals from {}: {e}", path.display())
+            ))?;
         Ok(manager)
     }
 }
