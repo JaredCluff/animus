@@ -31,4 +31,5 @@ thiserror = "2"
 tempfile = "3"
 async-trait = "0.1"
 rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 parking_lot = "0.12"
