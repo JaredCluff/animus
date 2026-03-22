@@ -72,8 +72,7 @@ impl ConsentEngine {
 
 /// Simple glob matching: supports `**` (any path) and `*` (single component).
 fn glob_match(pattern: &str, path: &str) -> bool {
-    if pattern.ends_with("/**") {
-        let prefix = &pattern[..pattern.len() - 3];
+    if let Some(prefix) = pattern.strip_suffix("/**") {
         path.starts_with(prefix)
     } else if pattern.contains('*') {
         let parts: Vec<&str> = pattern.split('*').collect();
