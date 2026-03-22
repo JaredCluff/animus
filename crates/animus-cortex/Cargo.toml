@@ -14,5 +14,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }
+parking_lot = { workspace = true }
 uuid = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+animus-embed = { workspace = true }
+tempfile = { workspace = true }

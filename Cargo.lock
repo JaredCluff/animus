@@ -52,6 +52,7 @@ name = "animus-cortex"
 version = "0.1.0"
 dependencies = [
  "animus-core",
+ "animus-embed",
  "animus-mnemos",
  "animus-vectorfs",
  "async-trait",
@@ -60,6 +61,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

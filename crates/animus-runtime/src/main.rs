@@ -71,6 +71,7 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     std::fs::create_dir_all(&data_dir)?;
 
@@ -130,57 +131,6 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
     // Shared sleep flag for background tasks
     let sleeping_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Start background event processing loop
-    let orch_clone = orchestrator.clone();
-    let store_clone = store.clone();
-    let embedder_clone = embedder.clone();
-    let sleeping_bg = sleeping_flag.clone();
-    let mut bus_rx = event_bus.subscribe();
-    tokio::spawn(async move {
-        use tokio::sync::broadcast::error::RecvError;
-        loop {
-            match bus_rx.recv().await {
-                Ok(event) => {
-                    match orch_clone.process_event(event.clone()).await {
-                        Ok(outcome) if outcome.passed_attention => {
-                            let text = serde_json::to_string(&event.data).unwrap_or_default();
-                            let embedding = match embedder_clone.embed_text(&text).await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!("Observation embedding failed: {e}");
-                                    continue;
-                                }
-                            };
-                            let mut segment = animus_core::Segment::new(
-                                animus_core::Content::Structured(event.data.clone()),
-                                embedding,
-                                animus_core::Source::Observation {
-                                    event_type: format!("{:?}", event.event_type),
-                                    raw_event_id: event.id,
-                                },
-                            );
-                            segment.infer_decay_class();
-                            // During sleep, observations go to Cold tier only
-                            if sleeping_bg.load(std::sync::atomic::Ordering::Relaxed) {
-                                segment.tier = animus_core::Tier::Cold;
-                            }
-                            if let Err(e) = store_clone.store(segment) {
-                                tracing::warn!("Failed to store observation: {e}");
-                            }
-                        }
-                        Ok(_) => {} // filtered out — expected
-                        Err(e) => tracing::warn!("Sensorium processing error: {e}"),
-                    }
-                }
-                Err(RecvError::Lagged(n)) => {
-                    tracing::warn!("Sensorium event bus lagged, dropped {n} events");
-                    continue;
-                }
-                Err(RecvError::Closed) => break,
-            }
-        }
-    });
 
     // Start network monitor sensor
     let mut network_monitor = animus_sensorium::sensors::network_monitor::NetworkMonitor::new(
@@ -252,6 +202,9 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         registry
     };
 
+    // Create signal bridge channel for background cognitive loops
+    let (signal_tx, mut signal_rx) = tokio::sync::mpsc::channel::<animus_core::threading::Signal>(100);
+
     // Register tools
     let tool_registry = {
         let mut reg = ToolRegistry::new();
@@ -276,10 +229,13 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
     // Initialize goal manager
     let goals_path = data_dir.join("goals.bin");
-    let mut goals = GoalManager::load(&goals_path)?;
+    let goals = GoalManager::load(&goals_path)?;
 
     // Compute initial goal embeddings for Tier 2 attention
     update_goal_embeddings(&goals, &*embedder, &orchestrator).await;
+
+    // Wrap goals in Arc<Mutex<>> for sharing with ReflectionLoop
+    let goals = Arc::new(parking_lot::Mutex::new(goals));
 
     // Initialize thread scheduler
     let token_budget = 8000;
@@ -303,6 +259,60 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         None
     };
 
+    // Boot reconstitution — wake up with context from last session
+    let reconstitution_summary = {
+        let recon_engine: &dyn animus_cortex::ReasoningEngine = engine_registry.engine_for(CognitiveRole::Reflection);
+        let goals_snapshot = goals.lock().clone();
+        match animus_cortex::boot_reconstitution(
+            recon_engine,
+            &*store,
+            &*embedder,
+            &identity,
+            &goals_snapshot,
+        ).await {
+            Ok(Some(summary)) => {
+                tracing::info!("Reconstitution complete");
+                Some(summary)
+            }
+            Ok(None) => {
+                tracing::info!("No reconstitution context available");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Reconstitution failed: {e}");
+                None
+            }
+        }
+    };
+
+    // Start Perception loop (replaces mechanical event processing)
+    let perception_signal_tx = signal_tx.clone();
+    let perception_store = store.clone();
+    let perception_embedder = embedder.clone();
+    let perception_event_rx = event_bus.subscribe();
+    let perception_engine: Box<dyn animus_cortex::ReasoningEngine> = {
+        match AnthropicEngine::from_env(
+            &std::env::var("ANIMUS_PERCEPTION_MODEL").unwrap_or_default(),
+            1024,
+        ) {
+            Ok(e) => Box::new(e),
+            Err(_) => {
+                tracing::info!("No perception model configured, using mechanical event pipeline");
+                Box::new(animus_cortex::MockEngine::new("no perception model"))
+            }
+        }
+    };
+    tokio::spawn(async move {
+        let perception = animus_cortex::PerceptionLoop::new(
+            perception_engine,
+            perception_store,
+            perception_embedder,
+            perception_signal_tx,
+        );
+        perception.run(perception_event_rx).await;
+    });
+    tracing::info!("Perception loop started");
+
     // Start periodic tier management (every 10 minutes)
     let tier_store = store.clone();
     tokio::spawn(async move {
@@ -316,29 +326,34 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         }
     });
 
-    // Start periodic memory consolidation (every 5 minutes)
-    let consolidation_store = store.clone();
-    tokio::spawn(async move {
-        let consolidator = animus_mnemos::consolidator::Consolidator::new(
-            consolidation_store,
-            0.85, // similarity threshold for merging
-        );
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-            match consolidator.run_cycle() {
-                Ok(report) if report.segments_merged > 0 => {
-                    tracing::info!(
-                        "Consolidation: scanned {}, merged {} into {} new segments",
-                        report.segments_scanned,
-                        report.segments_merged,
-                        report.segments_created,
-                    );
-                }
-                Ok(_) => {} // nothing to consolidate
-                Err(e) => tracing::warn!("Consolidation cycle failed: {e}"),
+    // Start Reflection loop (replaces standalone consolidation)
+    let reflection_signal_tx = signal_tx.clone();
+    let reflection_store = store.clone();
+    let reflection_embedder = embedder.clone();
+    let reflection_goals = goals.clone();
+    let reflection_engine: Box<dyn animus_cortex::ReasoningEngine> = {
+        match AnthropicEngine::from_env(
+            &std::env::var("ANIMUS_REFLECTION_MODEL").unwrap_or_default(),
+            4096,
+        ) {
+            Ok(e) => Box::new(e),
+            Err(_) => {
+                tracing::info!("No reflection model configured, reflection loop disabled");
+                Box::new(animus_cortex::MockEngine::new("no reflection model"))
             }
         }
+    };
+    tokio::spawn(async move {
+        let reflection = animus_cortex::ReflectionLoop::new(
+            reflection_engine,
+            reflection_store,
+            reflection_embedder,
+            reflection_goals,
+            reflection_signal_tx,
+        );
+        reflection.run().await;
     });
+    tracing::info!("Reflection loop started");
 
     // Start periodic health sweep (every 15 minutes)
     // Recomputes health scores and logs segments with severely degraded confidence.
@@ -380,6 +395,13 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
     // Main conversation loop
     loop {
+        // Poll signal bridge — deliver signals from background cognitive loops
+        while let Ok(signal) = signal_rx.try_recv() {
+            if let Some(active) = scheduler.active_thread_mut() {
+                active.deliver_signal(signal);
+            }
+        }
+
         let input = match interface.read_input()? {
             Some(input) if input.is_empty() => continue,
             Some(input) => input,
@@ -388,9 +410,10 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
         // Handle slash commands
         if input.starts_with('/') {
+            let mut goals_guard = goals.lock();
             let mut ctx = CommandContext {
                 store: &store,
-                goals: &mut goals,
+                goals: &mut goals_guard,
                 goals_path: &goals_path,
                 interface: &interface,
                 embedder: &*embedder,
@@ -417,7 +440,10 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         }
 
         // Process through reasoning thread with tool use loop
-        let system = build_system_prompt(&scheduler, &goals);
+        let system = {
+            let goals_guard = goals.lock();
+            build_system_prompt(&scheduler, &goals_guard, reconstitution_summary.as_deref())
+        };
         let engine = engine_registry.engine_for(CognitiveRole::Reasoning);
         let tools_slice = if tool_definitions.is_empty() {
             None
@@ -551,8 +577,24 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         fw.stop();
     }
 
+    // Shutdown reflection — store current state for reconstitution
+    {
+        let recon_engine: &dyn animus_cortex::ReasoningEngine = engine_registry.engine_for(CognitiveRole::Reflection);
+        let goals_snapshot = goals.lock().clone();
+        if let Err(e) = animus_cortex::shutdown_reflection(
+            recon_engine,
+            &*store,
+            &*embedder,
+            &goals_snapshot,
+        ).await {
+            tracing::warn!("Shutdown reflection failed: {e}");
+        } else {
+            tracing::info!("Shutdown reflection stored");
+        }
+    }
+
     // Persist state
-    goals.save(&goals_path)?;
+    goals.lock().save(&goals_path)?;
     if let Err(e) = quality_tracker.lock().save(&quality_path) {
         tracing::warn!("Failed to save quality tracker: {e}");
     }
@@ -585,14 +627,21 @@ async fn update_goal_embeddings(
     }
 }
 
-fn build_system_prompt(_scheduler: &ThreadScheduler<MmapVectorStore>, goals: &GoalManager) -> String {
+fn build_system_prompt(
+    _scheduler: &ThreadScheduler<MmapVectorStore>,
+    goals: &GoalManager,
+    reconstitution_summary: Option<&str>,
+) -> String {
     let mut prompt = DEFAULT_SYSTEM_PROMPT.to_string();
     let goals_summary = goals.goals_summary();
     if !goals_summary.is_empty() {
         prompt.push_str("\n\n## Current Goals\n");
         prompt.push_str(&goals_summary);
     }
-    // Signals are injected by process_turn() which drains and formats them
+    if let Some(summary) = reconstitution_summary {
+        prompt.push_str("\n\n## Session Context (from reconstitution)\n");
+        prompt.push_str(summary);
+    }
     prompt
 }
 

@@ -30,3 +30,6 @@ mod quality_gate;
 mod thompson_sampling;
 mod tool_use;
 mod engine_registry;
+mod perception;
+mod reflection;
+mod reconstitution;
