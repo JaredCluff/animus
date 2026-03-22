@@ -8,3 +8,4 @@ mod telos_goals;
 mod identity_lifecycle;
 mod sensorium_types;
 mod sensorium_bus;
+mod sensorium_consent;
