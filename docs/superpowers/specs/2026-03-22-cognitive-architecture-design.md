@@ -126,9 +126,16 @@ pub struct ToolCall {
 }
 ```
 
-### Turn Type Extension
+### Turn Type Extension (Breaking Change)
 
-The `Turn` type must support tool use and tool results:
+The `Turn` type must support tool use and tool results. **This is a type-level rewrite of a core struct, not a simple extension.** The current `Turn` has `pub content: String`. Changing to `Vec<TurnContent>` ripples through:
+
+- `ReasoningThread.conversation: Vec<Turn>` — all push/read sites
+- `AnthropicEngine` — serialization of messages to API format
+- `ContextAssembler` / `build_system_prompt` — anywhere that reads `Turn.content`
+- `MockEngine` — test helper
+
+This should be one of the first implementation tasks, as everything else depends on it. A helper method `Turn::text(role, content)` should be provided to minimize churn at call sites that only deal with text.
 
 ```rust
 pub enum TurnContent {
@@ -139,7 +146,14 @@ pub enum TurnContent {
 
 pub struct Turn {
     pub role: Role,
-    pub content: Vec<TurnContent>,  // changed from String to Vec<TurnContent>
+    pub content: Vec<TurnContent>,
+}
+
+impl Turn {
+    /// Convenience constructor for text-only turns (most common case).
+    pub fn text(role: Role, content: impl Into<String>) -> Self {
+        Self { role, content: vec![TurnContent::Text(content.into())] }
+    }
 }
 ```
 
@@ -175,8 +189,8 @@ pub trait Tool: Send + Sync {
     ) -> Result<ToolResult>;
 }
 
-pub struct ToolContext {
-    pub store: Arc<dyn VectorStore>,
+pub struct ToolContext<S: VectorStore> {
+    pub store: Arc<S>,              // generic, not dyn — VectorStore may not be object-safe
     pub data_dir: PathBuf,
     pub audit: Arc<AuditTrail>,
 }
@@ -293,6 +307,21 @@ Sensor Event --> ConsentEngine --> AttentionFilter (Tier 1 rules only)
                          summarized)
 ```
 
+### Signal Delivery from Background Loops
+
+The existing signal system uses `ThreadScheduler::send_signal()` which calls `ReasoningThread::deliver_signal()` — a synchronous push into a `Vec<Signal>`. Background loops (Perception, Reflection) run in separate `tokio::spawn` tasks and cannot hold a mutable reference to the scheduler.
+
+**Solution:** Add an `mpsc::Sender<Signal>` channel that background loops write to. The main conversation loop polls this channel before each turn and calls `deliver_signal()` on the appropriate thread. This is a bridge — the existing synchronous `deliver_signal` / `drain_signals` pattern is preserved; the `mpsc` channel is how async background tasks feed into it.
+
+```rust
+// In the main conversation loop, before processing human input:
+while let Ok(signal) = signal_rx.try_recv() {
+    scheduler.deliver_to_active(signal);
+}
+```
+
+This means the existing `ThreadScheduler::send_signal()` API stays for thread-to-thread signals (e.g., from a `/thread signal` command). The `mpsc` channel is specifically for background cognitive processes to reach the Reasoning thread without holding scheduler references.
+
 ### PerceptionLoop Structure
 
 ```rust
@@ -301,7 +330,7 @@ struct PerceptionLoop<S: VectorStore> {
     store: Arc<S>,
     embedder: Arc<dyn EmbeddingService>,
     event_rx: broadcast::Receiver<SensorEvent>,
-    signal_tx: mpsc::Sender<Signal>,       // channel to Reasoning thread
+    signal_tx: mpsc::Sender<Signal>,       // async bridge to Reasoning (see above)
     batch_window: Duration,                // default: 2 seconds
     max_batch_size: usize,                 // default: 10 events
     system_autonomy: Autonomy,             // configurable, default: Act
@@ -536,14 +565,16 @@ ANIMUS_PERCEPTION_MODEL=claude-haiku-4-5-20251001
 ANIMUS_REFLECTION_MODEL=claude-sonnet-4-6
 ANIMUS_REASONING_MODEL=claude-opus-4-6
 
-# Shared API key
-ANIMUS_API_KEY=sk-...
+# API key — uses existing ANTHROPIC_API_KEY (NOT renamed)
+ANTHROPIC_API_KEY=sk-...
 
 # Legacy (still works — all roles use this if per-role not set)
 ANIMUS_MODEL=claude-sonnet-4-6
 ```
 
-If only `ANIMUS_API_KEY` and `ANIMUS_MODEL` are set (today's behavior), all three roles use the same model. The registry is backwards-compatible.
+**API key precedence:** The existing `ANTHROPIC_API_KEY` environment variable is preserved — no rename. All engines in the registry share this key when using the Anthropic provider. Future providers (Ollama) don't need an API key. If per-provider keys are needed later, add `ANIMUS_OLLAMA_API_KEY` etc. — but `ANTHROPIC_API_KEY` stays as-is for backwards compatibility.
+
+If only `ANTHROPIC_API_KEY` and `ANIMUS_MODEL` are set (today's behavior), all three roles use the same model. The registry is backwards-compatible.
 
 ### EngineConfig
 
