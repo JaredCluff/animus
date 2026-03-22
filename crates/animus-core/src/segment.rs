@@ -139,14 +139,16 @@ impl Segment {
     }
 
     /// Record positive feedback (acceptance). Updates Bayesian parameters and confidence.
+    /// Alpha is capped at 100.0 to prevent unbounded growth skewing confidence toward 1.0.
     pub fn record_positive_feedback(&mut self) {
-        self.alpha += 1.0;
+        self.alpha = (self.alpha + 1.0).min(100.0);
         self.confidence = self.bayesian_confidence();
     }
 
     /// Record negative feedback (correction). Updates Bayesian parameters and confidence.
+    /// Beta is capped at 100.0 to prevent unbounded growth skewing confidence toward 0.0.
     pub fn record_negative_feedback(&mut self) {
-        self.beta += 1.0;
+        self.beta = (self.beta + 1.0).min(100.0);
         self.confidence = self.bayesian_confidence();
     }
 
