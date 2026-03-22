@@ -71,10 +71,12 @@ impl<S: VectorStore> ContextAssembler<S> {
         // Step 2: Retrieve candidates with exploration pool (2x top_k)
         // Extra candidates give Thompson Sampling room to surface less-used knowledge.
         let exploration_pool = top_k.saturating_mul(2).max(top_k + 3);
+        // Query across all tiers (Hot + Warm + Cold) so that frequently-used
+        // high-confidence knowledge in Hot tier is also eligible for retrieval.
         let candidates = self.store.query(
             query_embedding,
             exploration_pool,
-            Some(animus_core::segment::Tier::Warm),
+            None,
         )?;
 
         // Step 2.5: Thompson Sampling re-ranking.

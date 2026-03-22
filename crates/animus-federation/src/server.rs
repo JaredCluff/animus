@@ -598,6 +598,24 @@ async fn handle_publish<S: VectorStore + 'static>(
         );
     }
 
+    // Bound tag count and individual key/value lengths to prevent store bloat.
+    const MAX_TAG_COUNT: usize = 50;
+    const MAX_TAG_BYTES: usize = 256;
+    if announcement.tags.len() > MAX_TAG_COUNT {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("too many tags: {} (max {MAX_TAG_COUNT})", announcement.tags.len()),
+        );
+    }
+    for (k, v) in &announcement.tags {
+        if k.len() > MAX_TAG_BYTES || v.len() > MAX_TAG_BYTES {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "tag key or value exceeds maximum length",
+            );
+        }
+    }
+
     // Store a federation-sourced segment with the announced embedding
     let mut segment = animus_core::Segment::new(
         animus_core::Content::Text(format!(
@@ -658,6 +676,18 @@ async fn handle_goals<S: VectorStore + 'static>(
         "Received goal announcement: {}",
         announcement.description
     );
+
+    // Enforce a description size limit to prevent large strings from filling the goal store.
+    const MAX_GOAL_DESC_BYTES: usize = 1024;
+    if announcement.description.len() > MAX_GOAL_DESC_BYTES {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "goal description too large: {} bytes (max {MAX_GOAL_DESC_BYTES})",
+                announcement.description.len()
+            ),
+        );
+    }
 
     // Create goal in local GoalManager if available
     let local_goal_id = if let Some(ref goals) = state.goals {

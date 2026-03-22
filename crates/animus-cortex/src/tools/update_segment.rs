@@ -36,13 +36,15 @@ impl Tool for UpdateSegmentTool {
             Err(e) => return Ok(ToolResult { content: format!("Failed to retrieve segment: {e}"), is_error: true }),
         };
 
+        // Cap alpha and beta to prevent runaway accumulation from repeated tool calls.
+        const MAX_BAYES_PARAM: f32 = 100.0;
         let update = match feedback {
             "positive" => SegmentUpdate {
-                alpha: Some(seg.alpha + 1.0),
+                alpha: Some((seg.alpha + 1.0).min(MAX_BAYES_PARAM)),
                 ..Default::default()
             },
             "negative" => SegmentUpdate {
-                beta: Some(seg.beta + 1.0),
+                beta: Some((seg.beta + 1.0).min(MAX_BAYES_PARAM)),
                 ..Default::default()
             },
             other => return Err(format!("invalid feedback type: {other}")),

@@ -729,11 +729,13 @@ async fn handle_command(
                         if let Ok(Some(seg)) = ctx.store.get_raw(**id) {
                             let preview = match &seg.content {
                                 animus_core::Content::Text(t) => {
-                                    if t.len() > 80 { format!("{}...", &t[..80]) } else { t.clone() }
+                                    let truncated: String = t.chars().take(80).collect();
+                                    if t.chars().count() > 80 { format!("{truncated}...") } else { truncated }
                                 }
                                 animus_core::Content::Structured(v) => {
                                     let s = v.to_string();
-                                    if s.len() > 80 { format!("{}...", &s[..80]) } else { s }
+                                    let truncated: String = s.chars().take(80).collect();
+                                    if s.chars().count() > 80 { format!("{truncated}...") } else { truncated }
                                 }
                                 animus_core::Content::Binary { mime_type, .. } => format!("[binary: {mime_type}]"),
                                 animus_core::Content::Reference { uri, .. } => format!("[ref: {uri}]"),
