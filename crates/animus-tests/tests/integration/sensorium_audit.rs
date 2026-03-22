@@ -84,3 +84,37 @@ fn audit_trail_entry_count() {
 
     assert_eq!(trail.entry_count(), 5);
 }
+
+#[test]
+fn audit_trail_rotation() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("audit.jsonl");
+
+    // Use a tiny max size so rotation triggers quickly
+    let mut trail = AuditTrail::open_with_max_size(&path, 200).unwrap();
+
+    let entry = AuditEntry {
+        timestamp: chrono::Utc::now(),
+        event_id: EventId::new(),
+        consent_policy: None,
+        attention_tier_reached: 1,
+        action_taken: AuditAction::Logged,
+        segment_created: None,
+    };
+
+    // Write enough entries to trigger at least one rotation
+    for _ in 0..20 {
+        trail.append(&entry).unwrap();
+    }
+
+    // The rotated file should exist
+    let rotated = dir.path().join("audit.jsonl.1");
+    assert!(rotated.exists(), "rotation should create .1 file");
+
+    // Current file should have been reset (fewer entries than total)
+    assert!(trail.entry_count() < 20);
+
+    // Rotated file should contain entries
+    let rotated_entries = AuditTrail::read_all(&rotated).unwrap();
+    assert!(!rotated_entries.is_empty(), "rotated file should have entries");
+}
