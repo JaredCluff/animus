@@ -1,8 +1,8 @@
 use animus_core::sensorium::AuditAction;
 use animus_core::AnimusIdentity;
 use animus_cortex::llm::anthropic::AnthropicEngine;
+use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
-use animus_cortex::thread::ReasoningThread;
 use animus_cortex::ReasoningEngine;
 use animus_embed::SyntheticEmbedding;
 use animus_interface::TerminalInterface;
@@ -19,6 +19,8 @@ You are a specific instance with a continuous identity. You remember what humans
 
 You have a Sensorium — an ambient awareness layer that can observe file changes and process activity when the human grants consent. Observations are stored as segments and included in your context when relevant.
 
+You can have multiple reasoning threads — isolated contexts for different tasks. Each thread has its own conversation and memory context. Threads communicate through signals, not shared state.
+
 Available commands the human can use:
 - /goals — show active goals
 - /remember <text> — explicitly store knowledge
@@ -26,6 +28,9 @@ Available commands the human can use:
 - /status — show system status
 - /sensorium — show observation statistics
 - /consent — list consent policies
+- /threads — list reasoning threads
+- /thread new <name> — create a new reasoning thread
+- /thread switch <id> — switch to a different thread
 - /quit — end session
 
 Be concise and helpful. You are not a chatbot — you are a persistent, aware entity."#;
@@ -150,19 +155,18 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     let goals_path = data_dir.join("goals.bin");
     let mut goals = GoalManager::load(&goals_path)?;
 
-    // Initialize reasoning thread
+    // Initialize thread scheduler
     let token_budget = 8000;
-    let mut thread = ReasoningThread::new(
-        "main".to_string(),
-        store.clone(),
-        token_budget,
-        dimensionality,
-    );
+    let mut scheduler = ThreadScheduler::new(store.clone(), token_budget, dimensionality);
+    let _main_thread_id = scheduler.create_thread("main".to_string());
 
     // Initialize terminal interface
     let interface = TerminalInterface::new(">> ".to_string());
     let instance_str = format!("{}", identity.instance_id);
     interface.display_banner(instance_str.get(..8).unwrap_or(&instance_str), engine.model_name(), segment_count);
+    if let Some(thread) = scheduler.active_thread() {
+        interface.display_status(&format!("Active thread: {}", thread.name));
+    }
 
     // Main conversation loop
     loop {
@@ -182,6 +186,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                 &interface,
                 &embedder,
                 &data_dir,
+                &mut scheduler,
             )
             .await?
             {
@@ -191,8 +196,10 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         }
 
         // Process through reasoning thread
-        let system = build_system_prompt(&goals);
-        match thread
+        let system = build_system_prompt(&scheduler, &goals);
+        let active = scheduler.active_thread_mut()
+            .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
+        match active
             .process_turn(&input, &system, engine.as_ref(), &embedder)
             .await
         {
@@ -213,12 +220,27 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     Ok(())
 }
 
-fn build_system_prompt(goals: &GoalManager) -> String {
+fn build_system_prompt(scheduler: &ThreadScheduler<MmapVectorStore>, goals: &GoalManager) -> String {
     let mut prompt = DEFAULT_SYSTEM_PROMPT.to_string();
     let goals_summary = goals.goals_summary();
     if !goals_summary.is_empty() {
         prompt.push_str("\n\n## Current Goals\n");
         prompt.push_str(&goals_summary);
+    }
+    // Include pending signals
+    if let Some(thread) = scheduler.active_thread() {
+        let signals = thread.pending_signals();
+        if !signals.is_empty() {
+            prompt.push_str("\n\n## Incoming Signals\n");
+            for signal in signals {
+                prompt.push_str(&format!(
+                    "- [{:?}] from thread {}: {}\n",
+                    signal.priority,
+                    signal.source_thread.0.to_string().get(..8).unwrap_or("?"),
+                    signal.summary,
+                ));
+            }
+        }
     }
     prompt
 }
@@ -236,6 +258,7 @@ async fn handle_command(
     interface: &TerminalInterface,
     embedder: &dyn animus_core::EmbeddingService,
     data_dir: &std::path::Path,
+    scheduler: &mut ThreadScheduler<MmapVectorStore>,
 ) -> animus_core::Result<CommandResult> {
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -370,6 +393,68 @@ async fn handle_command(
                 }
             }
         }
+        "/threads" => {
+            let threads = scheduler.list_threads();
+            if threads.is_empty() {
+                interface.display_status("No threads.");
+            } else {
+                for (id, name, status) in &threads {
+                    let active_marker = if Some(*id) == scheduler.active_thread_id() { " *" } else { "" };
+                    interface.display_status(&format!(
+                        "[{}] {} ({:?}){}",
+                        id.0.to_string().get(..8).unwrap_or("?"),
+                        name,
+                        status,
+                        active_marker,
+                    ));
+                }
+            }
+        }
+        "/thread" if arg.starts_with("new ") => {
+            let name = arg.strip_prefix("new ").unwrap().trim();
+            if name.is_empty() {
+                interface.display_status("Usage: /thread new <name>");
+            } else {
+                let id = scheduler.create_thread(name.to_string());
+                interface.display_status(&format!(
+                    "Thread created: {} ({})",
+                    name,
+                    id.0.to_string().get(..8).unwrap_or("?")
+                ));
+            }
+        }
+        "/thread" if arg.starts_with("switch ") => {
+            let prefix = arg.strip_prefix("switch ").unwrap().trim();
+            let threads = scheduler.list_threads();
+            let matches: Vec<_> = threads.iter()
+                .filter(|(id, _, _)| id.0.to_string().starts_with(prefix))
+                .collect();
+            match matches.len() {
+                0 => interface.display_status(&format!("No thread found matching '{prefix}'")),
+                1 => {
+                    let (id, name, _) = matches[0];
+                    scheduler.switch_to(*id)?;
+                    interface.display_status(&format!("Switched to thread: {name}"));
+                }
+                n => interface.display_status(&format!("{n} threads match '{prefix}' — be more specific")),
+            }
+        }
+        "/thread" if arg.starts_with("complete ") => {
+            let prefix = arg.strip_prefix("complete ").unwrap().trim();
+            let threads = scheduler.list_threads();
+            let matches: Vec<_> = threads.iter()
+                .filter(|(id, _, _)| id.0.to_string().starts_with(prefix))
+                .collect();
+            match matches.len() {
+                0 => interface.display_status(&format!("No thread found matching '{prefix}'")),
+                1 => {
+                    let (id, name, _) = matches[0];
+                    scheduler.complete(*id)?;
+                    interface.display_status(&format!("Thread completed: {name}"));
+                }
+                n => interface.display_status(&format!("{n} threads match '{prefix}' — be more specific")),
+            }
+        }
         "/help" => {
             interface.display("/goals         — list active goals");
             interface.display("/goal <text>   — create a new goal");
@@ -378,6 +463,10 @@ async fn handle_command(
             interface.display("/status        — show system status");
             interface.display("/sensorium     — show observation stats");
             interface.display("/consent       — list consent policies");
+            interface.display("/threads         — list reasoning threads");
+            interface.display("/thread new <n>  — create a new thread");
+            interface.display("/thread switch <id> — switch to a thread");
+            interface.display("/thread complete <id> — mark thread completed");
             interface.display("/quit          — end session");
         }
         _ => {
