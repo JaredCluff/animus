@@ -1,3 +1,6 @@
+pub mod anthropic;
+pub use anthropic::AnthropicEngine;
+
 use animus_core::error::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

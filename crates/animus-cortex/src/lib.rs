@@ -1,3 +1,3 @@
 pub mod llm;
 
-pub use llm::{MockEngine, ReasoningEngine, ReasoningOutput, Role, Turn};
+pub use llm::{AnthropicEngine, MockEngine, ReasoningEngine, ReasoningOutput, Role, Turn};
