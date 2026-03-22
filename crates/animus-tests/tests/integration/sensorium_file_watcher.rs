@@ -11,7 +11,7 @@ async fn detects_file_creation() {
     let mut rx = bus.subscribe();
 
     let mut watcher = FileWatcher::new(bus.clone(), vec![dir.path().to_path_buf()]).unwrap();
-    watcher.start();
+    watcher.start().unwrap();
 
     // Give watcher time to initialize
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -46,7 +46,7 @@ async fn detects_file_modification() {
     let mut rx = bus.subscribe();
 
     let mut watcher = FileWatcher::new(bus.clone(), vec![dir.path().to_path_buf()]).unwrap();
-    watcher.start();
+    watcher.start().unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 

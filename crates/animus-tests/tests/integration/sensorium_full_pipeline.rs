@@ -65,7 +65,7 @@ async fn full_pipeline_file_change_to_segment() {
 
     // Start file watcher
     let mut watcher = FileWatcher::new(bus.clone(), vec![watch_dir.clone()]).unwrap();
-    watcher.start();
+    watcher.start().unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 

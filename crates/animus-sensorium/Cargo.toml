@@ -13,3 +13,4 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 notify = { workspace = true }
 sysinfo = { workspace = true }
+parking_lot = { workspace = true }

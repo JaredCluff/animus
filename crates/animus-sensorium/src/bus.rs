@@ -21,10 +21,4 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<SensorEvent> {
         self.tx.subscribe()
     }
-
-    pub fn shutdown(&self) {
-        // Dropping the EventBus (and its Sender) closes all receivers.
-        // For explicit shutdown, the caller should drop the EventBus
-        // or wrap it in an Arc and drop that.
-    }
 }

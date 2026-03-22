@@ -96,24 +96,34 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     let dim = dimensionality;
     let mut bus_rx = event_bus.subscribe();
     tokio::spawn(async move {
-        while let Ok(event) = bus_rx.recv().await {
-            match orch_clone.process_event(event.clone()).await {
-                Ok(outcome) if outcome.passed_attention => {
-                    let embedding = vec![0.0f32; dim]; // synthetic placeholder
-                    let segment = animus_core::Segment::new(
-                        animus_core::Content::Structured(event.data.clone()),
-                        embedding,
-                        animus_core::Source::Observation {
-                            event_type: format!("{:?}", event.event_type),
-                            raw_event_id: event.id,
-                        },
-                    );
-                    if let Err(e) = store_clone.store(segment) {
-                        tracing::warn!("Failed to store observation: {e}");
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            match bus_rx.recv().await {
+                Ok(event) => {
+                    match orch_clone.process_event(event.clone()).await {
+                        Ok(outcome) if outcome.passed_attention => {
+                            let embedding = vec![0.0f32; dim]; // synthetic placeholder
+                            let segment = animus_core::Segment::new(
+                                animus_core::Content::Structured(event.data.clone()),
+                                embedding,
+                                animus_core::Source::Observation {
+                                    event_type: format!("{:?}", event.event_type),
+                                    raw_event_id: event.id,
+                                },
+                            );
+                            if let Err(e) = store_clone.store(segment) {
+                                tracing::warn!("Failed to store observation: {e}");
+                            }
+                        }
+                        Ok(_) => {} // filtered out — expected
+                        Err(e) => tracing::warn!("Sensorium processing error: {e}"),
                     }
                 }
-                Ok(_) => {} // filtered out — expected
-                Err(e) => tracing::warn!("Sensorium processing error: {e}"),
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!("Sensorium event bus lagged, dropped {n} events");
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
             }
         }
     });

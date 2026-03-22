@@ -1,6 +1,6 @@
 use animus_core::sensorium::*;
+use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use crate::attention::{AttentionFilter, AttentionRule};
 use crate::audit::AuditTrail;
@@ -49,12 +49,16 @@ impl SensoriumOrchestrator {
                 action_taken: AuditAction::DeniedByConsent,
                 segment_created: None,
             };
-            self.audit.lock().unwrap().append(&entry)?;
+            self.audit.lock().append(&entry)?;
             return Ok(ProcessOutcome {
                 permitted: false,
                 passed_attention: false,
                 audit_action: AuditAction::DeniedByConsent,
             });
+        }
+
+        if consent_result.permission == Permission::AllowAnonymized {
+            tracing::warn!("AllowAnonymized consent not yet implemented — treating as Allow");
         }
 
         // Step 2: Tier 1 attention filter
@@ -80,7 +84,7 @@ impl SensoriumOrchestrator {
             action_taken: action,
             segment_created: None,
         };
-        self.audit.lock().unwrap().append(&entry)?;
+        self.audit.lock().append(&entry)?;
 
         Ok(ProcessOutcome {
             permitted: true,

@@ -116,6 +116,7 @@ dependencies = [
  "animus-core",
  "chrono",
  "notify",
+ "parking_lot",
  "serde",
  "serde_json",
  "sysinfo",

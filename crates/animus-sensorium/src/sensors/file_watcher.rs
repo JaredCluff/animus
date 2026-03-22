@@ -25,19 +25,18 @@ impl FileWatcher {
         })
     }
 
-    pub fn start(&mut self) {
+    pub fn start(&mut self) -> animus_core::Result<()> {
         let bus = self.bus.clone();
         let shutdown = self.shutdown.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(256);
 
-        let tx_clone = tx.clone();
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
-                let _ = tx_clone.blocking_send(event);
+                let _ = tx.blocking_send(event);
             }
         })
-        .expect("failed to create file watcher");
+        .map_err(|e| animus_core::AnimusError::Sensorium(format!("failed to create file watcher: {e}")))?;
 
         for path in &self.paths {
             if let Err(e) = watcher.watch(path, RecursiveMode::Recursive) {
@@ -75,6 +74,8 @@ impl FileWatcher {
                 }
             }
         });
+
+        Ok(())
     }
 
     pub fn stop(&self) {

@@ -87,6 +87,8 @@ pub enum AuditAction {
     Promoted,
     Ignored,
     DeniedByConsent,
+    /// Reserved for Phase 4: thread signaling via Sensorium events.
+    SignaledThread,
 }
 
 /// Result of the attention filter evaluating an event.
