@@ -1,3 +1,4 @@
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -39,6 +40,12 @@ impl Default for InstanceId {
     }
 }
 
+impl std::fmt::Display for InstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Unique identifier for a reasoning thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ThreadId(pub Uuid);
@@ -55,6 +62,12 @@ impl Default for ThreadId {
     }
 }
 
+impl std::fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Unique identifier for a Sensorium event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EventId(pub Uuid);
@@ -66,6 +79,24 @@ pub struct PolicyId(pub Uuid);
 /// Unique identifier for a goal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GoalId(pub Uuid);
+
+impl GoalId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for GoalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for GoalId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Unique identifier for a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -80,5 +111,78 @@ impl SnapshotId {
 impl Default for SnapshotId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Persistent identity for an AILF instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnimusIdentity {
+    /// Ed25519 signing key (private). Serialized as bytes.
+    #[serde(with = "signing_key_serde")]
+    pub signing_key: SigningKey,
+    /// Unique instance ID, immutable after birth.
+    pub instance_id: InstanceId,
+    /// Parent instance if this AILF was forked/cloned.
+    pub parent_id: Option<InstanceId>,
+    /// Timestamp of creation.
+    pub born: chrono::DateTime<chrono::Utc>,
+    /// Generation: 0 = original, 1 = first fork, etc.
+    pub generation: u32,
+    /// Which LLM model powers reasoning.
+    pub base_model: String,
+}
+
+impl AnimusIdentity {
+    /// Generate a new identity for a fresh AILF.
+    pub fn generate(base_model: String) -> Self {
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        Self {
+            signing_key,
+            instance_id: InstanceId::new(),
+            parent_id: None,
+            born: chrono::Utc::now(),
+            generation: 0,
+            base_model,
+        }
+    }
+
+    /// Get the public verifying key.
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.signing_key.verifying_key()
+    }
+
+    /// Load identity from a file, or generate and save if not found.
+    pub fn load_or_generate(path: &std::path::Path, base_model: &str) -> crate::Result<Self> {
+        if path.exists() {
+            let data = std::fs::read(path)?;
+            let identity: Self = bincode::deserialize(&data)
+                .map_err(|e| crate::AnimusError::Identity(format!("failed to load identity: {e}")))?;
+            Ok(identity)
+        } else {
+            let identity = Self::generate(base_model.to_string());
+            let data = bincode::serialize(&identity)
+                .map_err(|e| crate::AnimusError::Identity(format!("failed to serialize identity: {e}")))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, &data)?;
+            Ok(identity)
+        }
+    }
+}
+
+/// Serde helper for SigningKey (serialize as 32-byte array).
+mod signing_key_serde {
+    use ed25519_dalek::SigningKey;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(key: &SigningKey, s: S) -> Result<S::Ok, S::Error> {
+        key.to_bytes().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SigningKey, D::Error> {
+        let bytes = <[u8; 32]>::deserialize(d)?;
+        Ok(SigningKey::from_bytes(&bytes))
     }
 }

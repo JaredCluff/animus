@@ -1,0 +1,9 @@
+[package]
+name = "animus-interface"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+animus-core = { path = "../animus-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }

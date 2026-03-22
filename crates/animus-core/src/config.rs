@@ -19,6 +19,12 @@ pub struct AnimusConfig {
 
     /// Tier management configuration.
     pub tier: TierConfig,
+
+    /// Cortex reasoning layer configuration.
+    pub cortex: CortexConfig,
+
+    /// Terminal interface configuration.
+    pub interface: InterfaceConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +63,52 @@ pub struct MnemosConfig {
     pub consolidation_similarity_threshold: f32,
 }
 
+/// Configuration for the Cortex reasoning layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CortexConfig {
+    /// LLM provider name (e.g., "anthropic").
+    pub llm_provider: String,
+    /// Model identifier (e.g., "claude-sonnet-4-20250514").
+    pub model_id: String,
+    /// API key for the LLM provider. Always read from env at runtime; never serialized.
+    #[serde(skip)]
+    pub api_key: Option<String>,
+    /// Maximum tokens for LLM response.
+    pub max_response_tokens: usize,
+    /// System prompt prepended to every reasoning call.
+    pub system_prompt: String,
+}
+
+impl Default for CortexConfig {
+    fn default() -> Self {
+        Self {
+            llm_provider: "anthropic".to_string(),
+            model_id: "claude-sonnet-4-20250514".to_string(),
+            api_key: None,
+            max_response_tokens: 4096,
+            system_prompt: String::new(),
+        }
+    }
+}
+
+/// Configuration for the terminal interface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceConfig {
+    /// Prompt string shown to the user.
+    pub prompt: String,
+    /// Whether to display system status on startup.
+    pub show_status_on_start: bool,
+}
+
+impl Default for InterfaceConfig {
+    fn default() -> Self {
+        Self {
+            prompt: ">> ".to_string(),
+            show_status_on_start: true,
+        }
+    }
+}
+
 impl Default for AnimusConfig {
     fn default() -> Self {
         Self {
@@ -75,6 +127,8 @@ impl Default for AnimusConfig {
                 consolidation_similarity_threshold: 0.95,
             },
             tier: TierConfig::default(),
+            cortex: CortexConfig::default(),
+            interface: InterfaceConfig::default(),
         }
     }
 }

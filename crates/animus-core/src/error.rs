@@ -29,6 +29,18 @@ pub enum AnimusError {
     #[error("dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
 
+    #[error("LLM error: {0}")]
+    Llm(String),
+
+    #[error("identity error: {0}")]
+    Identity(String),
+
+    #[error("interface error: {0}")]
+    Interface(String),
+
+    #[error("goal error: {0}")]
+    Goal(String),
+
     #[error("{0}")]
     Other(String),
 }

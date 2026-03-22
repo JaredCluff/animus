@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1.86-bookworm
+FROM docker.io/library/rust:1.87-bookworm
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
