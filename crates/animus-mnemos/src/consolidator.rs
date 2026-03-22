@@ -79,8 +79,14 @@ impl<S: VectorStore> Consolidator<S> {
                 }
 
                 let merged = self.merge_cluster(&cluster_segments);
-                let source_ids: Vec<SegmentId> =
-                    cluster_segments.iter().map(|s| s.id).collect();
+                // Only delete text-content segments — non-text content (audio, image, etc.)
+                // cannot be reconstructed from the merged text segment, so we leave them in
+                // the store rather than permanently destroying them.
+                let source_ids: Vec<SegmentId> = cluster_segments
+                    .iter()
+                    .filter(|s| matches!(&s.content, Content::Text(_)))
+                    .map(|s| s.id)
+                    .collect();
 
                 for &id in &source_ids {
                     merged_ids.insert(id);
