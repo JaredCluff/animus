@@ -117,6 +117,7 @@ async fn signals_drained_after_processing() {
         "You are an AI.",
         &engine,
         &embedder,
+        None,
     ).await.unwrap();
 
     // After processing, signals should be drained

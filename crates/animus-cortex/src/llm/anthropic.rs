@@ -2,7 +2,7 @@ use animus_core::error::{AnimusError, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{ReasoningEngine, ReasoningOutput, Role, Turn};
+use super::{ReasoningEngine, ReasoningOutput, Role, StopReason, ToolDefinition, Turn};
 
 /// Anthropic Claude API provider.
 pub struct AnthropicEngine {
@@ -83,6 +83,7 @@ impl ReasoningEngine for AnthropicEngine {
         &self,
         system: &str,
         messages: &[Turn],
+        _tools: Option<&[ToolDefinition]>,
     ) -> Result<ReasoningOutput> {
         let api_messages: Vec<ApiMessage> = messages
             .iter()
@@ -93,7 +94,7 @@ impl ReasoningEngine for AnthropicEngine {
                     Role::Assistant => "assistant".to_string(),
                     Role::System => unreachable!(),
                 },
-                content: t.content.clone(),
+                content: t.text_content().unwrap_or("").to_string(),
             })
             .collect();
 
@@ -152,6 +153,8 @@ impl ReasoningEngine for AnthropicEngine {
             content,
             input_tokens: api_response.usage.input_tokens,
             output_tokens: api_response.usage.output_tokens,
+            tool_calls: vec![],
+            stop_reason: StopReason::EndTurn,
         })
     }
 

@@ -67,6 +67,7 @@ impl<S: VectorStore> ReasoningThread<S> {
         system_prompt: &str,
         engine: &dyn ReasoningEngine,
         embedder: &dyn animus_core::EmbeddingService,
+        tools: Option<&[crate::llm::ToolDefinition]>,
     ) -> Result<String> {
         // Store user input as a segment
         let user_embedding = embedder.embed_text(user_input).await?;
@@ -83,10 +84,7 @@ impl<S: VectorStore> ReasoningThread<S> {
         self.stored_turn_ids.push(user_seg_id);
 
         // Add to conversation history
-        self.conversation.push(Turn {
-            role: Role::User,
-            content: user_input.to_string(),
-        });
+        self.conversation.push(Turn::text(Role::User, user_input));
 
         // Assemble context: anchor on stored turns, retrieve similar knowledge
         let context = self.assembler.assemble(
@@ -114,7 +112,7 @@ impl<S: VectorStore> ReasoningThread<S> {
         };
 
         // Call the LLM
-        let output = engine.reason(&enriched_system, &self.conversation).await?;
+        let output = engine.reason(&enriched_system, &self.conversation, tools).await?;
 
         // Track which knowledge segments were retrieved (not conversation anchors).
         // Used for implicit feedback now and explicit feedback via /accept, /correct.
@@ -159,10 +157,7 @@ impl<S: VectorStore> ReasoningThread<S> {
         self.stored_turn_ids.push(response_seg_id);
 
         // Add to conversation history
-        self.conversation.push(Turn {
-            role: Role::Assistant,
-            content: output.content.clone(),
-        });
+        self.conversation.push(Turn::text(Role::Assistant, &output.content));
 
         tracing::debug!(
             "thread {} turn complete: {} input tokens, {} output tokens",

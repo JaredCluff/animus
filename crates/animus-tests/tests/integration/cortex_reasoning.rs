@@ -22,7 +22,7 @@ async fn test_reasoning_thread_processes_turn() {
     );
 
     let response = thread
-        .process_turn("Hi there", "You are a test AILF.", &engine, &embedder)
+        .process_turn("Hi there", "You are a test AILF.", &engine, &embedder, None)
         .await
         .unwrap();
 
@@ -47,7 +47,7 @@ async fn test_reasoning_thread_stores_conversation_as_segments() {
     );
 
     thread
-        .process_turn("Remember that I like Rust", "System", &engine, &embedder)
+        .process_turn("Remember that I like Rust", "System", &engine, &embedder, None)
         .await
         .unwrap();
 
@@ -83,12 +83,12 @@ async fn test_multi_turn_stores_all_segments() {
     );
 
     // First turn
-    thread.process_turn("First message", "System", &engine, &embedder).await.unwrap();
+    thread.process_turn("First message", "System", &engine, &embedder, None).await.unwrap();
     assert_eq!(thread.turn_count(), 2);
     assert_eq!(store.count(None), 2);
 
     // Second turn — should accumulate
-    thread.process_turn("Second message", "System", &engine, &embedder).await.unwrap();
+    thread.process_turn("Second message", "System", &engine, &embedder, None).await.unwrap();
     assert_eq!(thread.turn_count(), 4);
     assert_eq!(store.count(None), 4);
     assert_eq!(thread.stored_turn_ids().len(), 4);
@@ -97,12 +97,9 @@ async fn test_multi_turn_stores_all_segments() {
 #[tokio::test]
 async fn test_mock_engine_basic() {
     let engine = MockEngine::new("test response");
-    let turns = vec![Turn {
-        role: Role::User,
-        content: "hello".to_string(),
-    }];
+    let turns = vec![Turn::text(Role::User, "hello")];
 
-    let output = engine.reason("system", &turns).await.unwrap();
+    let output = engine.reason("system", &turns, None).await.unwrap();
     assert_eq!(output.content, "test response");
     assert_eq!(engine.model_name(), "mock-engine");
     assert_eq!(engine.context_limit(), 8192);

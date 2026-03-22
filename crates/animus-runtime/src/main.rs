@@ -376,7 +376,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         let active = scheduler.active_thread_mut()
             .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
         match active
-            .process_turn(&input, &system, engine.as_ref(), &*embedder)
+            .process_turn(&input, &system, engine.as_ref(), &*embedder, None)
             .await
         {
             Ok(response) => {
