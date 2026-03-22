@@ -1,0 +1,10 @@
+/Users/jared.cluff/gitrepos/animus/target/debug/deps/anndists-51228327970790cb.d: /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/lib.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/mod.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/distances.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/distsimd.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/disteez.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/prelude.rs
+
+/Users/jared.cluff/gitrepos/animus/target/debug/deps/libanndists-51228327970790cb.rmeta: /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/lib.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/mod.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/distances.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/distsimd.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/disteez.rs /Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/prelude.rs
+
+/Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/lib.rs:
+/Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/mod.rs:
+/Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/distances.rs:
+/Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/distsimd.rs:
+/Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/dist/disteez.rs:
+/Users/jared.cluff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anndists-0.1.4/src/prelude.rs:
