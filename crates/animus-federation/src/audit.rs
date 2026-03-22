@@ -68,17 +68,27 @@ impl FederationAuditTrail {
     }
 
     pub fn read_all(path: &Path) -> animus_core::Result<Vec<FederationAuditEntry>> {
+        Self::read_recent(path, usize::MAX)
+    }
+
+    /// Read the most recent `limit` entries from the federation audit trail.
+    /// Reads the entire file but only retains the last `limit` entries,
+    /// preventing unbounded memory growth for large audit files.
+    pub fn read_recent(path: &Path, limit: usize) -> animus_core::Result<Vec<FederationAuditEntry>> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let mut entries = Vec::new();
+        let mut entries = std::collections::VecDeque::with_capacity(limit.min(1024));
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
             let entry: FederationAuditEntry = serde_json::from_str(&line)?;
-            entries.push(entry);
+            if entries.len() == limit {
+                entries.pop_front();
+            }
+            entries.push_back(entry);
         }
-        Ok(entries)
+        Ok(entries.into())
     }
 }

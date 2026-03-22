@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{EventId, PolicyId, SegmentId};
+use crate::segment::Principal;
 
 /// A normalized event from a sensor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,9 @@ pub struct ConsentPolicy {
     pub rules: Vec<ConsentRule>,
     pub active: bool,
     pub created: DateTime<Utc>,
+    /// Who created this policy (human or AILF). None for system-generated defaults.
+    #[serde(default)]
+    pub created_by: Option<Principal>,
 }
 
 /// A single consent rule within a policy.

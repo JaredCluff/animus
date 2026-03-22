@@ -1,8 +1,14 @@
+use std::sync::Arc;
 use animus_core::sensorium::*;
 use animus_core::{EventId, PolicyId};
+use animus_embed::SyntheticEmbedding;
 use animus_sensorium::attention::{AttentionRule, RuleAction};
 use animus_sensorium::orchestrator::SensoriumOrchestrator;
 use tempfile::TempDir;
+
+fn make_embedder() -> Arc<dyn animus_core::EmbeddingService> {
+    Arc::new(SyntheticEmbedding::new(128))
+}
 
 fn make_policies() -> Vec<ConsentPolicy> {
     vec![ConsentPolicy {
@@ -16,6 +22,7 @@ fn make_policies() -> Vec<ConsentPolicy> {
         }],
         active: true,
         created: chrono::Utc::now(),
+        created_by: None,
     }]
 }
 
@@ -37,6 +44,7 @@ async fn pipeline_processes_permitted_event() {
         make_rules(),
         audit_path.clone(),
         0.5,
+        make_embedder(),
     )
     .unwrap();
 
@@ -66,6 +74,7 @@ async fn pipeline_blocks_denied_event() {
         make_rules(),
         audit_path.clone(),
         0.5,
+        make_embedder(),
     )
     .unwrap();
 
@@ -94,6 +103,7 @@ async fn pipeline_filters_git_noise() {
         make_rules(),
         audit_path.clone(),
         0.5,
+        make_embedder(),
     )
     .unwrap();
 
@@ -123,6 +133,7 @@ async fn pipeline_writes_audit_entries() {
         make_rules(),
         audit_path.clone(),
         0.5,
+        make_embedder(),
     )
     .unwrap();
 

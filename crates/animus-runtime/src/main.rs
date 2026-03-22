@@ -86,6 +86,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
     // Initialize embedding service
     let embedder = SyntheticEmbedding::new(dimensionality);
+    let embedder: Arc<dyn animus_core::EmbeddingService> = Arc::new(embedder);
 
     // Initialize Sensorium
     let event_bus = Arc::new(EventBus::new(1000));
@@ -99,6 +100,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         vec![], // no attention rules initially
         audit_path.clone(),
         0.5,
+        embedder.clone(),
     )?);
 
     // Start background event processing loop
@@ -206,7 +208,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                 goals: &mut goals,
                 goals_path: &goals_path,
                 interface: &interface,
-                embedder: &embedder,
+                embedder: &*embedder,
                 data_dir: &data_dir,
                 scheduler: &mut scheduler,
                 federation: federation.as_ref(),
@@ -222,7 +224,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         let active = scheduler.active_thread_mut()
             .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
         match active
-            .process_turn(&input, &system, engine.as_ref(), &embedder)
+            .process_turn(&input, &system, engine.as_ref(), &*embedder)
             .await
         {
             Ok(response) => {
@@ -356,8 +358,9 @@ async fn handle_command(
             }
         }
         "/sensorium" => {
-            let audit_entries = animus_sensorium::audit::AuditTrail::read_all(
+            let audit_entries = animus_sensorium::audit::AuditTrail::read_recent(
                 &ctx.data_dir.join("sensorium-audit.jsonl"),
+                10_000,
             )
             .ok()
             .unwrap_or_default();
