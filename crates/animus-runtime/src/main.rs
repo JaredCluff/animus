@@ -578,6 +578,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     // Stop sensors
     network_monitor.stop();
     process_monitor.stop();
+    clipboard_monitor.stop();
     if let Some(fw) = file_watcher.lock().take() {
         fw.stop();
     }
@@ -823,6 +824,13 @@ async fn handle_command(
             }
         }
         "/goal" if !arg.is_empty() => {
+            const MAX_GOAL_DESC_BYTES: usize = 1024; // consistent with federation handle_goals cap
+            if arg.len() > MAX_GOAL_DESC_BYTES {
+                ctx.interface.display_status(&format!(
+                    "Goal description too long: {} bytes (max {MAX_GOAL_DESC_BYTES})",
+                    arg.len()
+                ));
+            } else {
             let id = ctx.goals.create_goal(arg.to_string(), GoalSource::Human, Priority::Normal);
             ctx.goals.save(ctx.goals_path)?;
             update_goal_embeddings(ctx.goals, ctx.embedder, ctx.sensorium).await;
@@ -830,6 +838,7 @@ async fn handle_command(
                 "Goal created: {}",
                 id.0.to_string().get(..8).unwrap_or("?")
             ));
+            } // end size check
         }
         "/remember" if !arg.is_empty() => {
             use animus_core::segment::{Content, Segment, Source};
@@ -1104,6 +1113,12 @@ async fn handle_command(
             ));
         }
         "/watch" if !arg.is_empty() => {
+            use std::path::{Component, Path};
+            let has_traversal = Path::new(arg).components()
+                .any(|c| matches!(c, Component::ParentDir));
+            if has_traversal {
+                ctx.interface.display_status("Invalid watch path: parent-directory traversal not allowed");
+            } else {
             let watch_path = std::path::PathBuf::from(arg);
             if !watch_path.exists() {
                 ctx.interface.display_status(&format!("Path does not exist: {arg}"));
@@ -1133,6 +1148,7 @@ async fn handle_command(
                     }
                 }
             }
+            } // end traversal check
         }
         "/consent" => {
             let loaded = animus_sensorium::policy_store::PolicyStore::load(
