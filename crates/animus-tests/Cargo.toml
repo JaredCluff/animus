@@ -10,6 +10,7 @@ animus-core = { workspace = true }
 animus-vectorfs = { workspace = true }
 animus-mnemos = { workspace = true }
 animus-embed = { workspace = true }
+animus-cortex = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

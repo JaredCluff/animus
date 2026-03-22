@@ -22,6 +22,7 @@ animus-core = { path = "crates/animus-core" }
 animus-vectorfs = { path = "crates/animus-vectorfs" }
 animus-mnemos = { path = "crates/animus-mnemos" }
 animus-embed = { path = "crates/animus-embed" }
+animus-cortex = { path = "crates/animus-cortex" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"

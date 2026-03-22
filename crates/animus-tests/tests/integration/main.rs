@@ -3,3 +3,6 @@ mod vectorfs_tiering;
 mod mnemos_assembly;
 mod mnemos_eviction;
 mod full_pipeline;
+mod cortex_reasoning;
+mod telos_goals;
+mod identity_lifecycle;
