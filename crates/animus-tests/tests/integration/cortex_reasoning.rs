@@ -21,15 +21,17 @@ async fn test_reasoning_thread_processes_turn() {
         128,
     );
 
-    let response = thread
+    let output = thread
         .process_turn("Hi there", "You are a test AILF.", &engine, &embedder, None)
         .await
         .unwrap();
 
-    assert_eq!(response, "Hello! I remember things now.");
-    assert_eq!(thread.turn_count(), 2); // user + assistant
-    assert_eq!(thread.stored_turn_ids().len(), 2);
-    assert_eq!(store.count(None), 2); // 2 segments stored
+    assert_eq!(output.content, "Hello! I remember things now.");
+    // process_turn no longer pushes the assistant turn or stores the response segment;
+    // the runtime drives that. So we only see user turn + user segment.
+    assert_eq!(thread.turn_count(), 1); // user only
+    assert_eq!(thread.stored_turn_ids().len(), 1);
+    assert_eq!(store.count(None), 1); // 1 segment stored (user only)
 }
 
 #[tokio::test]
@@ -46,20 +48,25 @@ async fn test_reasoning_thread_stores_conversation_as_segments() {
         128,
     );
 
-    thread
+    let output = thread
         .process_turn("Remember that I like Rust", "System", &engine, &embedder, None)
         .await
         .unwrap();
 
-    // Verify both turns are stored as segments
+    // process_turn only stores the user segment now; runtime stores the response.
     let ids = thread.stored_turn_ids();
-    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.len(), 1);
 
     let user_seg = store.get_raw(ids[0]).unwrap().unwrap();
     match &user_seg.content {
         Content::Text(t) => assert!(t.contains("Rust")),
         _ => panic!("expected text content"),
     }
+
+    // Simulate what the runtime does: store the response segment
+    thread.store_response_segment(&output.content, &embedder).await.unwrap();
+    let ids = thread.stored_turn_ids();
+    assert_eq!(ids.len(), 2);
 
     let assistant_seg = store.get_raw(ids[1]).unwrap().unwrap();
     match &assistant_seg.content {
@@ -82,13 +89,18 @@ async fn test_multi_turn_stores_all_segments() {
         128,
     );
 
-    // First turn
-    thread.process_turn("First message", "System", &engine, &embedder, None).await.unwrap();
+    // First turn — process_turn only stores user segment now
+    let output1 = thread.process_turn("First message", "System", &engine, &embedder, None).await.unwrap();
+    // Simulate runtime: push assistant turn and store response
+    thread.push_turn(animus_cortex::Turn::text(animus_cortex::Role::Assistant, &output1.content));
+    thread.store_response_segment(&output1.content, &embedder).await.unwrap();
     assert_eq!(thread.turn_count(), 2);
     assert_eq!(store.count(None), 2);
 
     // Second turn — should accumulate
-    thread.process_turn("Second message", "System", &engine, &embedder, None).await.unwrap();
+    let output2 = thread.process_turn("Second message", "System", &engine, &embedder, None).await.unwrap();
+    thread.push_turn(animus_cortex::Turn::text(animus_cortex::Role::Assistant, &output2.content));
+    thread.store_response_segment(&output2.content, &embedder).await.unwrap();
     assert_eq!(thread.turn_count(), 4);
     assert_eq!(store.count(None), 4);
     assert_eq!(thread.stored_turn_ids().len(), 4);

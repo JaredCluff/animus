@@ -60,7 +60,11 @@ impl<S: VectorStore> ReasoningThread<S> {
         }
     }
 
-    /// Process a user message: store it, assemble context, reason, store response.
+    /// Process a user message: store it, assemble context, reason.
+    ///
+    /// Returns `ReasoningOutput` so the runtime can inspect `stop_reason` and
+    /// drive multi-round tool execution. The caller is responsible for pushing
+    /// the assistant turn and storing the response segment.
     pub async fn process_turn(
         &mut self,
         user_input: &str,
@@ -68,7 +72,7 @@ impl<S: VectorStore> ReasoningThread<S> {
         engine: &dyn ReasoningEngine,
         embedder: &dyn animus_core::EmbeddingService,
         tools: Option<&[crate::llm::ToolDefinition]>,
-    ) -> Result<String> {
+    ) -> Result<crate::llm::ReasoningOutput> {
         // Store user input as a segment
         let user_embedding = embedder.embed_text(user_input).await?;
         let mut user_segment = Segment::new(
@@ -142,23 +146,6 @@ impl<S: VectorStore> ReasoningThread<S> {
             }
         }
 
-        // Store assistant response as a segment
-        let response_embedding = embedder.embed_text(&output.content).await?;
-        let mut response_segment = Segment::new(
-            Content::Text(output.content.clone()),
-            response_embedding,
-            Source::Conversation {
-                thread_id: self.id,
-                turn: self.conversation.len() as u64,
-            },
-        );
-        response_segment.infer_decay_class();
-        let response_seg_id = self.store.store(response_segment)?;
-        self.stored_turn_ids.push(response_seg_id);
-
-        // Add to conversation history
-        self.conversation.push(Turn::text(Role::Assistant, &output.content));
-
         tracing::debug!(
             "thread {} turn complete: {} input tokens, {} output tokens",
             self.id,
@@ -166,7 +153,7 @@ impl<S: VectorStore> ReasoningThread<S> {
             output.output_tokens
         );
 
-        Ok(output.content)
+        Ok(output)
     }
 
     /// Build system prompt enriched with assembled context.
@@ -207,6 +194,32 @@ impl<S: VectorStore> ReasoningThread<S> {
     /// Get the conversation history.
     pub fn conversation(&self) -> &[Turn] {
         &self.conversation
+    }
+
+    /// Push a turn directly to the conversation (used by runtime tool loop).
+    pub fn push_turn(&mut self, turn: Turn) {
+        self.conversation.push(turn);
+    }
+
+    /// Store a response as a VectorFS segment (called by runtime after final response).
+    pub async fn store_response_segment(
+        &mut self,
+        response: &str,
+        embedder: &dyn animus_core::EmbeddingService,
+    ) -> Result<()> {
+        let embedding = embedder.embed_text(response).await?;
+        let mut segment = Segment::new(
+            Content::Text(response.to_string()),
+            embedding,
+            Source::Conversation {
+                thread_id: self.id,
+                turn: self.conversation.len() as u64,
+            },
+        );
+        segment.infer_decay_class();
+        let id = self.store.store(segment)?;
+        self.stored_turn_ids.push(id);
+        Ok(())
     }
 
     /// Get the number of turns.

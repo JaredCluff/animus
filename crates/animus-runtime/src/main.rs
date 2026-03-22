@@ -1,9 +1,10 @@
 use animus_core::sensorium::AuditAction;
 use animus_core::AnimusIdentity;
+use animus_cortex::engine_registry::{CognitiveRole, EngineRegistry};
 use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
-use animus_cortex::ReasoningEngine;
+use animus_cortex::tools::{ToolContext, ToolRegistry};
 use animus_embed::{OllamaEmbedding, ResilientEmbedding, SyntheticEmbedding};
 use animus_federation::orchestrator::FederationOrchestrator;
 use animus_federation::peers::TrustLevel;
@@ -211,17 +212,61 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
     tracing::info!("Sensorium initialized (use /consent to manage observation policies)");
 
-    // Initialize LLM engine
-    let engine: Box<dyn ReasoningEngine> = match AnthropicEngine::from_env(&model_id, 4096) {
-        Ok(e) => Box::new(e),
-        Err(e) => {
-            eprintln!("Warning: Could not initialize Anthropic engine: {e}");
-            eprintln!("Running with mock engine (responses will be placeholder text).");
-            Box::new(animus_cortex::MockEngine::new(
-                "I'm running without an LLM connection. Set ANTHROPIC_API_KEY to enable reasoning.",
-            ))
+    // Build engine registry from env vars
+    let engine_registry = {
+        let perception_model = std::env::var("ANIMUS_PERCEPTION_MODEL").ok();
+        let reflection_model = std::env::var("ANIMUS_REFLECTION_MODEL").ok();
+        let reasoning_model = std::env::var("ANIMUS_REASONING_MODEL")
+            .unwrap_or_else(|_| model_id.clone());
+
+        let fallback: Box<dyn animus_cortex::ReasoningEngine> =
+            match AnthropicEngine::from_env(&model_id, 4096) {
+                Ok(e) => Box::new(e),
+                Err(e) => {
+                    eprintln!("Warning: Could not initialize Anthropic engine: {e}");
+                    eprintln!("Running with mock engine (responses will be placeholder text).");
+                    Box::new(animus_cortex::MockEngine::new(
+                        "I'm running without an LLM connection. Set ANTHROPIC_API_KEY to enable reasoning.",
+                    ))
+                }
+            };
+
+        let mut registry = EngineRegistry::new(fallback);
+
+        if let Some(model) = perception_model {
+            if let Ok(engine) = AnthropicEngine::from_env(&model, 1024) {
+                registry.set_engine(CognitiveRole::Perception, Box::new(engine));
+                tracing::info!("Perception engine: {model}");
+            }
         }
+        if let Some(model) = reflection_model {
+            if let Ok(engine) = AnthropicEngine::from_env(&model, 4096) {
+                registry.set_engine(CognitiveRole::Reflection, Box::new(engine));
+                tracing::info!("Reflection engine: {model}");
+            }
+        }
+        if let Ok(engine) = AnthropicEngine::from_env(&reasoning_model, 4096) {
+            registry.set_engine(CognitiveRole::Reasoning, Box::new(engine));
+        }
+
+        registry
     };
+
+    // Register tools
+    let tool_registry = {
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(animus_cortex::tools::read_file::ReadFileTool));
+        reg.register(Box::new(animus_cortex::tools::write_file::WriteFileTool));
+        reg.register(Box::new(animus_cortex::tools::shell_exec::ShellExecTool));
+        reg.register(Box::new(animus_cortex::tools::remember::RememberTool));
+        reg.register(Box::new(animus_cortex::tools::list_segments::ListSegmentsTool));
+        reg.register(Box::new(animus_cortex::tools::send_signal::SendSignalTool));
+        reg.register(Box::new(animus_cortex::tools::update_segment::UpdateSegmentTool));
+        reg
+    };
+    let tool_definitions = tool_registry.definitions();
+    let tool_ctx = ToolContext { data_dir: data_dir.clone() };
+    tracing::info!("{} tools registered", tool_definitions.len());
 
     // Initialize quality tracker
     let quality_path = data_dir.join("quality.bin");
@@ -324,7 +369,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     // Initialize terminal interface
     let interface = TerminalInterface::new(">> ".to_string());
     let instance_str = format!("{}", identity.instance_id);
-    interface.display_banner(instance_str.get(..8).unwrap_or(&instance_str), engine.model_name(), segment_count);
+    interface.display_banner(instance_str.get(..8).unwrap_or(&instance_str), engine_registry.engine_for(CognitiveRole::Reasoning).model_name(), segment_count);
     if let Some(thread) = scheduler.active_thread() {
         interface.display_status(&format!("Active thread: {}", thread.name));
     }
@@ -371,16 +416,124 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
             continue;
         }
 
-        // Process through reasoning thread
+        // Process through reasoning thread with tool use loop
         let system = build_system_prompt(&scheduler, &goals);
-        let active = scheduler.active_thread_mut()
-            .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
-        match active
-            .process_turn(&input, &system, engine.as_ref(), &*embedder, None)
-            .await
-        {
-            Ok(response) => {
-                interface.display_response(&response);
+        let engine = engine_registry.engine_for(CognitiveRole::Reasoning);
+        let tools_slice = if tool_definitions.is_empty() {
+            None
+        } else {
+            Some(tool_definitions.as_slice())
+        };
+
+        const MAX_TOOL_ROUNDS: usize = 10;
+
+        // Round 0: process_turn handles user input storage, context assembly, Bayesian feedback
+        let result = {
+            let active = scheduler.active_thread_mut()
+                .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
+            active.process_turn(&input, &system, engine, &*embedder, tools_slice).await
+        };
+
+        match result {
+            Ok(mut output) => {
+                // Tool use loop
+                for _round in 0..MAX_TOOL_ROUNDS {
+                    if output.stop_reason != animus_cortex::StopReason::ToolUse
+                        || output.tool_calls.is_empty()
+                    {
+                        break;
+                    }
+
+                    let active = scheduler.active_thread_mut().unwrap();
+
+                    // Build assistant turn with tool_use blocks
+                    let mut assistant_content: Vec<animus_cortex::TurnContent> = Vec::new();
+                    if !output.content.is_empty() {
+                        assistant_content
+                            .push(animus_cortex::TurnContent::Text(output.content.clone()));
+                    }
+                    for tc in &output.tool_calls {
+                        assistant_content.push(animus_cortex::TurnContent::ToolUse {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            input: tc.input.clone(),
+                        });
+                    }
+                    active.push_turn(animus_cortex::Turn {
+                        role: animus_cortex::Role::Assistant,
+                        content: assistant_content,
+                    });
+
+                    // Execute each tool call
+                    let mut tool_results: Vec<animus_cortex::TurnContent> = Vec::new();
+                    for tc in &output.tool_calls {
+                        let result = if let Some(tool) = tool_registry.get(&tc.name) {
+                            tool.execute(tc.input.clone(), &tool_ctx)
+                                .await
+                                .unwrap_or_else(|e| animus_cortex::tools::ToolResult {
+                                    content: format!("Error: {e}"),
+                                    is_error: true,
+                                })
+                        } else {
+                            animus_cortex::tools::ToolResult {
+                                content: format!("Unknown tool: {}", tc.name),
+                                is_error: true,
+                            }
+                        };
+
+                        tool_results.push(animus_cortex::TurnContent::ToolResult {
+                            tool_use_id: tc.id.clone(),
+                            content: result.content,
+                            is_error: result.is_error,
+                        });
+                    }
+
+                    active.push_turn(animus_cortex::Turn {
+                        role: animus_cortex::Role::User,
+                        content: tool_results,
+                    });
+
+                    // Call engine again with updated conversation
+                    output = engine
+                        .reason(&system, active.conversation(), tools_slice)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::error!("Engine error during tool loop: {e}");
+                            animus_cortex::ReasoningOutput {
+                                content: format!("Error during tool execution: {e}"),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                tool_calls: vec![],
+                                stop_reason: animus_cortex::StopReason::EndTurn,
+                            }
+                        });
+                }
+
+                // If we exhausted max tool rounds, warn and use whatever content we have
+                if output.stop_reason == animus_cortex::StopReason::ToolUse {
+                    tracing::warn!(
+                        "Tool use loop exhausted after {MAX_TOOL_ROUNDS} rounds, forcing end"
+                    );
+                    if output.content.is_empty() {
+                        output.content = "[Tool execution limit reached. Please try again with a simpler request.]".to_string();
+                    }
+                }
+
+                // Store response segment BEFORE pushing turn (so turn index is correct)
+                // then push the assistant turn to conversation
+                {
+                    let active = scheduler.active_thread_mut().unwrap();
+                    active
+                        .store_response_segment(&output.content, &*embedder)
+                        .await
+                        .ok();
+                    active.push_turn(animus_cortex::Turn::text(
+                        animus_cortex::Role::Assistant,
+                        &output.content,
+                    ));
+                }
+
+                interface.display_response(&output.content);
             }
             Err(e) => {
                 interface.display_status(&format!("Error: {e}"));

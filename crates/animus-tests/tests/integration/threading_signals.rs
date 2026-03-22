@@ -112,7 +112,7 @@ async fn signals_drained_after_processing() {
     let embedder = SyntheticEmbedding::new(128);
     let engine = animus_cortex::MockEngine::new("I see the build failure.");
 
-    let _result = thread.process_turn(
+    let _output = thread.process_turn(
         "How are things going?",
         "You are an AI.",
         &engine,
