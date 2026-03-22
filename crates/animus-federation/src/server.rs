@@ -730,20 +730,27 @@ async fn handle_goals<S: VectorStore + 'static>(
     // Create goal in local GoalManager if available
     let local_goal_id = if let Some(ref goals) = state.goals {
         let mut goals = goals.lock();
-        let id = goals.create_goal(
+        match goals.create_goal(
             announcement.description.clone(),
             GoalSource::Federated {
                 source_ailf: auth_peer.instance_id,
             },
             announcement.priority,
-        );
-        // Persist goals
-        if let Some(ref path) = state.goals_path {
-            if let Err(e) = goals.save(path) {
-                tracing::warn!("Failed to persist federated goal: {e}");
+        ) {
+            Ok(id) => {
+                // Persist goals
+                if let Some(ref path) = state.goals_path {
+                    if let Err(e) = goals.save(path) {
+                        tracing::warn!("Failed to persist federated goal: {e}");
+                    }
+                }
+                Some(id)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create federated goal: {e}");
+                None
             }
         }
-        Some(id)
     } else {
         None
     };
