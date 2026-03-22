@@ -6,4 +6,4 @@ pub mod quality;
 pub use assembler::{AssembledContext, ContextAssembler, EvictedSummary};
 pub use consolidator::{ConsolidationReport, Consolidator};
 pub use evictor::{DefaultEvictionStrategy, EvictionStrategy};
-pub use quality::QualityTracker;
+pub use quality::{effective_confidence, BayesianFeedback, QualityTracker};

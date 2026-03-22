@@ -384,6 +384,15 @@ impl VectorStore for MmapVectorStore {
         if let Some(tags) = update.tags {
             seg.tags = tags;
         }
+        if let Some(alpha) = update.alpha {
+            seg.alpha = alpha;
+        }
+        if let Some(beta) = update.beta {
+            seg.beta = beta;
+        }
+        if let Some(decay_class) = update.decay_class {
+            seg.decay_class = decay_class;
+        }
 
         let segment_clone = seg.clone();
         drop(segments);

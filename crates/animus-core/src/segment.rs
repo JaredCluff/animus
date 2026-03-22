@@ -5,6 +5,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::{EventId, InstanceId, PolicyId, SegmentId, ThreadId};
 
+/// How knowledge decays over time. Different knowledge types have different half-lives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DecayClass {
+    /// Verifiable facts: very slow decay (half-life: 90 days).
+    Factual,
+    /// How-to knowledge: moderate decay (half-life: 30 days).
+    Procedural,
+    /// Events and experiences: faster decay (half-life: 14 days).
+    Episodic,
+    /// Opinions and preferences: fast decay (half-life: 7 days).
+    Opinion,
+    /// Default: moderate decay (half-life: 30 days).
+    #[default]
+    General,
+}
+
+impl DecayClass {
+    /// Half-life in seconds for this decay class.
+    pub fn half_life_secs(&self) -> f64 {
+        const DAY: f64 = 86400.0;
+        match self {
+            Self::Factual => 90.0 * DAY,
+            Self::Procedural => 30.0 * DAY,
+            Self::Episodic => 14.0 * DAY,
+            Self::Opinion => 7.0 * DAY,
+            Self::General => 30.0 * DAY,
+        }
+    }
+}
+
+fn default_bayesian_param() -> f32 {
+    1.0
+}
+
 /// The atomic unit of VectorFS storage. A unit of meaning with context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Segment {
@@ -21,6 +55,7 @@ pub struct Segment {
     pub source: Source,
 
     /// Validation level (0.0 - 1.0). Higher = more trusted.
+    /// Updated automatically when alpha/beta change.
     pub confidence: f32,
 
     /// Parent segments (for consolidation tracking).
@@ -53,6 +88,19 @@ pub struct Segment {
     /// User-defined key-value labels for categorization and federation scoping.
     #[serde(default)]
     pub tags: HashMap<String, String>,
+
+    /// Beta distribution positive parameter (successful retrievals/acceptances).
+    /// Part of Bayesian confidence tracking: confidence = alpha / (alpha + beta).
+    #[serde(default = "default_bayesian_param")]
+    pub alpha: f32,
+
+    /// Beta distribution negative parameter (corrections/rejections).
+    #[serde(default = "default_bayesian_param")]
+    pub beta: f32,
+
+    /// How this knowledge decays over time.
+    #[serde(default)]
+    pub decay_class: DecayClass,
 }
 
 impl Segment {
@@ -75,6 +123,9 @@ impl Segment {
             consent_policy: None,
             observable_by: Vec::new(),
             tags: HashMap::new(),
+            alpha: 1.0,
+            beta: 1.0,
+            decay_class: DecayClass::default(),
         }
     }
 
@@ -82,6 +133,49 @@ impl Segment {
     pub fn record_access(&mut self) {
         self.access_count += 1;
         self.last_accessed = Utc::now();
+    }
+
+    /// Record positive feedback (acceptance). Updates Bayesian parameters and confidence.
+    pub fn record_positive_feedback(&mut self) {
+        self.alpha += 1.0;
+        self.confidence = self.bayesian_confidence();
+    }
+
+    /// Record negative feedback (correction). Updates Bayesian parameters and confidence.
+    pub fn record_negative_feedback(&mut self) {
+        self.beta += 1.0;
+        self.confidence = self.bayesian_confidence();
+    }
+
+    /// Mean of the Beta(alpha, beta) distribution.
+    /// This is the Bayesian estimate of the segment's reliability.
+    pub fn bayesian_confidence(&self) -> f32 {
+        if self.alpha + self.beta == 0.0 {
+            return 0.5;
+        }
+        self.alpha / (self.alpha + self.beta)
+    }
+
+    /// Temporal decay factor based on decay class and segment age.
+    /// Returns a value in (0.0, 1.0] — 1.0 for brand new, approaching 0.0 for very old.
+    /// Uses exponential decay: exp(-ln(2) * age / half_life).
+    pub fn temporal_decay_factor(&self) -> f32 {
+        let age_secs = (Utc::now() - self.created).num_seconds().max(0) as f64;
+        let half_life = self.decay_class.half_life_secs();
+        let lambda = (2.0_f64).ln() / half_life;
+        (-lambda * age_secs).exp() as f32
+    }
+
+    /// Composite health score combining Bayesian confidence, temporal decay,
+    /// and access patterns. Range: [0.0, 1.0].
+    pub fn health_score(&self) -> f32 {
+        let confidence = self.bayesian_confidence();
+        let decay = self.temporal_decay_factor();
+        let access = (self.access_count as f32 / 10.0).sqrt().min(1.0);
+
+        // Weighted composite: confidence matters most, decay prevents stale data,
+        // access patterns provide usage signal
+        (0.5 * confidence * decay + 0.3 * self.relevance_score + 0.2 * access).clamp(0.0, 1.0)
     }
 
     /// Estimated token count for context budgeting.

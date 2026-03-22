@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use animus_core::segment::DecayClass;
 use animus_core::{Result, Segment, SegmentId, Tier};
 
 /// Metadata update for a segment (partial update without replacing content).
@@ -9,6 +10,12 @@ pub struct SegmentUpdate {
     pub confidence: Option<f32>,
     pub associations: Option<Vec<(SegmentId, f32)>>,
     pub tags: Option<HashMap<String, String>>,
+    /// Update Bayesian alpha parameter.
+    pub alpha: Option<f32>,
+    /// Update Bayesian beta parameter.
+    pub beta: Option<f32>,
+    /// Update decay class.
+    pub decay_class: Option<DecayClass>,
 }
 
 /// The core storage abstraction for VectorFS.

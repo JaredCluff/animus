@@ -35,6 +35,8 @@ Available commands the human can use:
 - /thread switch <id> — switch to a different thread
 - /peers — list discovered federation peers
 - /tag <id> <key>=<value> — label a segment for categorization/federation
+- /classify <id> <class> — set knowledge decay class (factual/procedural/episodic/opinion/general)
+- /health <id> — show segment health details (Bayesian confidence, decay, access patterns)
 - /trust <id> — upgrade a peer to Trusted
 - /block <id> — block a peer
 - /federate — show federation status
@@ -635,6 +637,87 @@ async fn handle_command(
                 }
             }
         }
+        // /classify <segment-prefix> <class> — set decay class for a segment
+        "/classify" if !arg.is_empty() => {
+            let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                ctx.interface.display_status("Usage: /classify <segment-id-prefix> <factual|procedural|episodic|opinion|general>");
+            } else {
+                let prefix = parts[0];
+                let class_str = parts[1].to_lowercase();
+                let decay_class = match class_str.as_str() {
+                    "factual" => Some(animus_core::DecayClass::Factual),
+                    "procedural" => Some(animus_core::DecayClass::Procedural),
+                    "episodic" => Some(animus_core::DecayClass::Episodic),
+                    "opinion" => Some(animus_core::DecayClass::Opinion),
+                    "general" => Some(animus_core::DecayClass::General),
+                    _ => None,
+                };
+                match decay_class {
+                    None => {
+                        ctx.interface.display_status("Valid classes: factual, procedural, episodic, opinion, general");
+                    }
+                    Some(dc) => {
+                        let all_ids = ctx.store.segment_ids(None);
+                        let matches: Vec<_> = all_ids
+                            .iter()
+                            .filter(|id| id.0.to_string().starts_with(prefix))
+                            .collect();
+                        match matches.len() {
+                            0 => ctx.interface.display_status(&format!("No segment found matching '{prefix}'")),
+                            1 => {
+                                let id = *matches[0];
+                                ctx.store.update_meta(id, animus_vectorfs::SegmentUpdate {
+                                    decay_class: Some(dc),
+                                    ..Default::default()
+                                })?;
+                                ctx.interface.display_status(&format!(
+                                    "Classified segment {} as {class_str} (half-life: {} days)",
+                                    id.0.to_string().get(..8).unwrap_or("?"),
+                                    dc.half_life_secs() / 86400.0
+                                ));
+                            }
+                            n => ctx.interface.display_status(&format!(
+                                "{n} segments match '{prefix}' — be more specific"
+                            )),
+                        }
+                    }
+                }
+            }
+        }
+        // /health <segment-prefix> — show health details for a segment
+        "/health" if !arg.is_empty() => {
+            let all_ids = ctx.store.segment_ids(None);
+            let matches: Vec<_> = all_ids
+                .iter()
+                .filter(|id| id.0.to_string().starts_with(arg))
+                .collect();
+            match matches.len() {
+                0 => ctx.interface.display_status(&format!("No segment found matching '{arg}'")),
+                1 => {
+                    let id = *matches[0];
+                    if let Some(seg) = ctx.store.get_raw(id)? {
+                        let short_id = seg.id.0.to_string();
+                        let short_id = short_id.get(..8).unwrap_or("?");
+                        ctx.interface.display(&format!("Segment {short_id} health:"));
+                        ctx.interface.display(&format!("  Bayesian confidence: {:.3} (alpha={:.1}, beta={:.1})",
+                            seg.bayesian_confidence(), seg.alpha, seg.beta));
+                        ctx.interface.display(&format!("  Temporal decay: {:.3} (class={:?})",
+                            seg.temporal_decay_factor(), seg.decay_class));
+                        ctx.interface.display(&format!("  Health score: {:.3}", seg.health_score()));
+                        ctx.interface.display(&format!("  Relevance: {:.3}", seg.relevance_score));
+                        ctx.interface.display(&format!("  Access count: {}", seg.access_count));
+                        ctx.interface.display(&format!("  Tier: {:?}", seg.tier));
+
+                        let age_days = (chrono::Utc::now() - seg.created).num_hours() as f64 / 24.0;
+                        ctx.interface.display(&format!("  Age: {:.1} days", age_days));
+                    }
+                }
+                n => ctx.interface.display_status(&format!(
+                    "{n} segments match '{arg}' — be more specific"
+                )),
+            }
+        }
         "/sensorium" => {
             let audit_entries = animus_sensorium::audit::AuditTrail::read_recent(
                 &ctx.data_dir.join("sensorium-audit.jsonl"),
@@ -912,6 +995,8 @@ async fn handle_command(
             ctx.interface.display("/remember <text> — store knowledge explicitly");
             ctx.interface.display("/forget <id>   — remove a stored segment by ID prefix");
             ctx.interface.display("/tag <id> <k>=<v> — add a tag to a segment");
+            ctx.interface.display("/classify <id> <class> — set knowledge decay class");
+            ctx.interface.display("/health <id>   — show segment health details");
             ctx.interface.display("/status        — show system status");
             ctx.interface.display("/sensorium     — show observation stats");
             ctx.interface.display("/consent       — list consent policies");

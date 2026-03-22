@@ -115,6 +115,7 @@ dependencies = [
  "bincode",
  "chrono",
  "serde",
+ "tempfile",
  "tracing",
 ]
 
