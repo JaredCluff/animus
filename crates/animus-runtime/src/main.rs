@@ -218,28 +218,14 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     Ok(())
 }
 
-fn build_system_prompt(scheduler: &ThreadScheduler<MmapVectorStore>, goals: &GoalManager) -> String {
+fn build_system_prompt(_scheduler: &ThreadScheduler<MmapVectorStore>, goals: &GoalManager) -> String {
     let mut prompt = DEFAULT_SYSTEM_PROMPT.to_string();
     let goals_summary = goals.goals_summary();
     if !goals_summary.is_empty() {
         prompt.push_str("\n\n## Current Goals\n");
         prompt.push_str(&goals_summary);
     }
-    // Include pending signals
-    if let Some(thread) = scheduler.active_thread() {
-        let signals = thread.pending_signals();
-        if !signals.is_empty() {
-            prompt.push_str("\n\n## Incoming Signals\n");
-            for signal in signals {
-                prompt.push_str(&format!(
-                    "- [{:?}] from thread {}: {}\n",
-                    signal.priority,
-                    signal.source_thread.0.to_string().get(..8).unwrap_or("?"),
-                    signal.summary,
-                ));
-            }
-        }
-    }
+    // Signals are injected by process_turn() which drains and formats them
     prompt
 }
 

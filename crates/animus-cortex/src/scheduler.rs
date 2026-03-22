@@ -37,7 +37,8 @@ impl<S: VectorStore> ThreadScheduler<S> {
 
         let id = thread.id;
         if self.active_thread.is_some() {
-            let _ = thread.set_status(ThreadStatus::Suspended);
+            thread.set_status(ThreadStatus::Suspended)
+                .expect("new Active thread must be suspendable");
         }
         if self.active_thread.is_none() {
             self.active_thread = Some(id);
@@ -59,7 +60,7 @@ impl<S: VectorStore> ThreadScheduler<S> {
         if let Some(current_id) = self.active_thread {
             if current_id != thread_id {
                 if let Some(current) = self.threads.get_mut(&current_id) {
-                    let _ = current.set_status(ThreadStatus::Suspended);
+                    current.set_status(ThreadStatus::Suspended)?;
                 }
             }
         }
@@ -104,9 +105,11 @@ impl<S: VectorStore> ThreadScheduler<S> {
     }
 
     pub fn list_threads(&self) -> Vec<(ThreadId, String, ThreadStatus)> {
-        self.threads.values()
+        let mut list: Vec<_> = self.threads.values()
             .map(|t| (t.id, t.name.clone(), t.status()))
-            .collect()
+            .collect();
+        list.sort_by(|a, b| a.1.cmp(&b.1));
+        list
     }
 
     pub fn thread_count(&self) -> usize {
@@ -121,6 +124,9 @@ impl<S: VectorStore> ThreadScheduler<S> {
         summary: String,
         segment_refs: Vec<SegmentId>,
     ) -> Result<()> {
+        if !self.threads.contains_key(&source) {
+            return Err(AnimusError::Threading(format!("source thread not found: {source}")));
+        }
         if !self.threads.contains_key(&target) {
             return Err(AnimusError::Threading(format!("target thread not found: {target}")));
         }
