@@ -20,3 +20,5 @@ mod threading_types;
 mod threading_signals;
 mod threading_scheduler;
 mod federation_peers;
+mod federation_protocol;
+mod federation_audit;
