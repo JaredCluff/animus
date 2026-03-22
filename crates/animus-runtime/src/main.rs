@@ -195,6 +195,14 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     process_monitor.start();
     tracing::info!("ProcessMonitor started (30s poll interval)");
 
+    // Start clipboard monitor sensor
+    let mut clipboard_monitor = animus_sensorium::sensors::clipboard_monitor::ClipboardMonitor::new(
+        event_bus.clone(),
+        std::time::Duration::from_secs(5),
+    );
+    clipboard_monitor.start();
+    tracing::info!("ClipboardMonitor started (5s poll interval)");
+
     // File watcher (started via /watch command)
     let file_watcher: Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>> =
         Arc::new(parking_lot::Mutex::new(None));
@@ -281,6 +289,32 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                 }
                 Ok(_) => {} // nothing to consolidate
                 Err(e) => tracing::warn!("Consolidation cycle failed: {e}"),
+            }
+        }
+    });
+
+    // Start periodic health sweep (every 15 minutes)
+    // Recomputes health scores and logs segments with severely degraded confidence.
+    let health_store = store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(900)).await;
+            let all_ids = health_store.segment_ids(None);
+            let mut degraded = 0usize;
+            for id in &all_ids {
+                if let Ok(Some(seg)) = health_store.get_raw(*id) {
+                    let health = seg.health_score();
+                    if health < 0.1 && seg.tier != animus_core::Tier::Cold {
+                        tracing::debug!(
+                            "segment {} health={health:.3} — degraded",
+                            id.0.to_string().get(..8).unwrap_or("?")
+                        );
+                        degraded += 1;
+                    }
+                }
+            }
+            if degraded > 0 {
+                tracing::info!("Health sweep: {degraded}/{} segments degraded", all_ids.len());
             }
         }
     });
