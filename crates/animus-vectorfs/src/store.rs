@@ -209,6 +209,10 @@ impl MmapVectorStore {
             count += 1;
         }
 
+        // Write completion marker last so a partial snapshot is distinguishable from a
+        // complete one: if this write fails, the marker is absent and restore will refuse.
+        fs::write(snapshot_dir.join("COMPLETE"), b"")?;
+
         tracing::info!(
             "Snapshot created at {} ({count} segments)",
             snapshot_dir.display()
@@ -223,6 +227,14 @@ impl MmapVectorStore {
         if !snap_segments.exists() {
             return Err(AnimusError::Storage(format!(
                 "snapshot directory has no segments: {}",
+                snapshot_dir.display()
+            )));
+        }
+        // Refuse to restore from a snapshot that was never fully written.
+        if !snapshot_dir.join("COMPLETE").exists() {
+            return Err(AnimusError::Storage(format!(
+                "snapshot at {} is incomplete (missing COMPLETE marker) — \
+                 it may have been interrupted mid-write",
                 snapshot_dir.display()
             )));
         }

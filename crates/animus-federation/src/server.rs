@@ -617,6 +617,16 @@ async fn handle_publish<S: VectorStore + 'static>(
         );
     }
 
+    // Defense-in-depth: reject non-finite embedding values at the protocol layer
+    // before they reach the VectorStore (which also validates, but explicit rejection
+    // here produces a more informative error to the peer).
+    if announcement.embedding.iter().any(|v| !v.is_finite()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "embedding contains non-finite values (NaN or Inf)",
+        );
+    }
+
     // Bound tag count and individual key/value lengths to prevent store bloat.
     const MAX_TAG_COUNT: usize = 50;
     const MAX_TAG_BYTES: usize = 256;
