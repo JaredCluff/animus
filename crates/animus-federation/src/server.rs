@@ -281,11 +281,20 @@ async fn auth_middleware<S: VectorStore + 'static>(
 
     // Replay attack prevention: reject signatures seen within the replay window.
     {
+        const MAX_SEEN_SIGNATURES: usize = 50_000;
         let now = chrono::Utc::now().timestamp();
         let cutoff = now - REPLAY_WINDOW_SECS;
         let mut seen = state.seen_signatures.lock().await;
         // Prune expired entries first.
         seen.retain(|_, ts| *ts > cutoff);
+        // Hard cap: if the map is still very large after TTL pruning, reset it
+        // to prevent unbounded memory growth under extremely high request rates.
+        if seen.len() >= MAX_SEEN_SIGNATURES {
+            tracing::warn!(
+                "seen_signatures cap ({MAX_SEEN_SIGNATURES}) reached; resetting replay window"
+            );
+            seen.clear();
+        }
         if seen.contains_key(&signature_hex) {
             return error_response(StatusCode::UNAUTHORIZED, "replayed request rejected");
         }

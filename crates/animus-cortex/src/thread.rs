@@ -86,6 +86,12 @@ impl<S: VectorStore> ReasoningThread<S> {
         user_segment.infer_decay_class();
         let user_seg_id = self.store.store(user_segment)?;
         self.stored_turn_ids.push(user_seg_id);
+        // Keep only the most recent anchor IDs to prevent token budget starvation.
+        // Older turn segments remain in VectorFS and can still be retrieved via similarity search.
+        const MAX_ANCHOR_IDS: usize = 50;
+        if self.stored_turn_ids.len() > MAX_ANCHOR_IDS {
+            self.stored_turn_ids.drain(..self.stored_turn_ids.len() - MAX_ANCHOR_IDS);
+        }
 
         // Add to conversation history
         self.conversation.push(Turn::text(Role::User, user_input));
@@ -220,6 +226,10 @@ impl<S: VectorStore> ReasoningThread<S> {
         segment.infer_decay_class();
         let id = self.store.store(segment)?;
         self.stored_turn_ids.push(id);
+        const MAX_ANCHOR_IDS: usize = 50;
+        if self.stored_turn_ids.len() > MAX_ANCHOR_IDS {
+            self.stored_turn_ids.drain(..self.stored_turn_ids.len() - MAX_ANCHOR_IDS);
+        }
         Ok(())
     }
 

@@ -134,6 +134,26 @@ impl GoalManager {
         Ok(())
     }
 
+    /// Pause a goal.
+    pub fn pause_goal(&mut self, id: GoalId) -> Result<()> {
+        let goal = self
+            .goals
+            .get_mut(&id)
+            .ok_or(AnimusError::Goal(format!("goal not found: {}", id.0)))?;
+        goal.status = GoalStatus::Paused;
+        Ok(())
+    }
+
+    /// Abandon a goal.
+    pub fn abandon_goal(&mut self, id: GoalId) -> Result<()> {
+        let goal = self
+            .goals
+            .get_mut(&id)
+            .ok_or(AnimusError::Goal(format!("goal not found: {}", id.0)))?;
+        goal.status = GoalStatus::Abandoned;
+        Ok(())
+    }
+
     /// Add a progress note (segment ID) to a goal.
     pub fn add_progress_note(&mut self, goal_id: GoalId, segment_id: SegmentId) -> Result<()> {
         let goal = self
