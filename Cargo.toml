@@ -50,3 +50,4 @@ sha2 = "0.10"
 hex = "0.4"
 animus-federation = { path = "crates/animus-federation" }
 arboard = "3"
+toml = "0.8"

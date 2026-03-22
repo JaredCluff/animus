@@ -25,3 +25,6 @@ bincode = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
 chrono = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+toml = { workspace = true }

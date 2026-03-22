@@ -1,3 +1,4 @@
+use animus_core::config::AnimusConfig;
 use animus_core::sensorium::AuditAction;
 use animus_core::AnimusIdentity;
 use animus_cortex::engine_registry::{CognitiveRole, EngineRegistry};
@@ -13,6 +14,7 @@ use animus_sensorium::bus::EventBus;
 use animus_sensorium::orchestrator::SensoriumOrchestrator;
 use animus_vectorfs::store::MmapVectorStore;
 use animus_vectorfs::VectorStore;
+use axum::{extract::State, routing::get, Json, Router};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -51,15 +53,30 @@ Be concise and helpful. You are not a chatbot — you are a persistent, aware en
 
 #[tokio::main]
 async fn main() {
+    let log_filter = std::env::var("ANIMUS_LOG_LEVEL")
+        .unwrap_or_else(|_| "animus=info".to_string());
     tracing_subscriber::fmt()
-        .with_env_filter("animus=info")
+        .with_env_filter(log_filter)
         .init();
 
     let data_dir = std::env::var("ANIMUS_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| dirs_home().join(".animus"));
 
-    if let Err(e) = run(data_dir).await {
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        eprintln!("Fatal error: could not create data dir: {e}");
+        std::process::exit(1);
+    }
+
+    let config = match AnimusConfig::load(&data_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Fatal error: could not load config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = run(data_dir, config).await {
         eprintln!("Fatal error: {e}");
         std::process::exit(1);
     }
@@ -72,13 +89,10 @@ fn dirs_home() -> PathBuf {
 }
 
 #[allow(clippy::await_holding_lock)]
-async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
-    std::fs::create_dir_all(&data_dir)?;
-
+async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()> {
     // Load or generate identity
     let identity_path = data_dir.join("identity.bin");
-    let model_id = std::env::var("ANIMUS_MODEL")
-        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+    let model_id = config.cortex.model_id.clone();
     let identity = AnimusIdentity::load_or_generate(&identity_path, &model_id)?;
 
     tracing::info!(
@@ -87,27 +101,9 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         identity.generation
     );
 
-    // Initialize embedding service (ollama with fallback to synthetic)
-    let ollama_url = std::env::var("ANIMUS_OLLAMA_URL")
-        .unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let ollama_model = std::env::var("ANIMUS_EMBED_MODEL")
-        .unwrap_or_else(|_| "mxbai-embed-large".to_string());
-
+    // Initialize embedding service from config
     let (embedder, dimensionality): (Arc<dyn animus_core::EmbeddingService>, usize) =
-        match OllamaEmbedding::probe(&ollama_url, &ollama_model).await {
-            Ok(dim) => {
-                tracing::info!("Using Ollama embeddings ({ollama_model}, {dim} dims) with resilient fallback");
-                let ollama = OllamaEmbedding::new(&ollama_url, &ollama_model, dim);
-                (Arc::new(ResilientEmbedding::new(ollama, dim)), dim)
-            }
-            Err(e) => {
-                let dim = 128;
-                tracing::warn!(
-                    "Ollama unavailable ({e}), falling back to SyntheticEmbedding ({dim} dims)"
-                );
-                (Arc::new(SyntheticEmbedding::new(dim)), dim)
-            }
-        };
+        init_embedding(&config.embedding).await;
 
     // Initialize VectorFS
     let vectorfs_dir = data_dir.join("vectorfs");
@@ -248,7 +244,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     let _main_thread_id = scheduler.create_thread("main".to_string());
 
     // Initialize federation
-    let federation_config = animus_core::FederationConfig::default();
+    let federation_config = config.federation.clone();
     let federation = if federation_config.enabled {
         let mut orch = FederationOrchestrator::new(
             identity.clone(),
@@ -260,9 +256,18 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         tracing::info!("Federation started");
         Some(orch)
     } else {
-        tracing::info!("Federation disabled (default); use ANIMUS_FEDERATION=1 to enable");
+        tracing::info!("Federation disabled; enable in config.toml or set ANIMUS_FEDERATION=1");
         None
     };
+
+    // Start health endpoint
+    if config.health.enabled {
+        start_health_server(
+            config.health.bind.clone(),
+            store.clone(),
+            format!("{}", identity.instance_id),
+        );
+    }
 
     // Boot reconstitution — wake up with context from last session
     let reconstitution_summary = {
@@ -609,6 +614,106 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Embedding provider initialization
+// ---------------------------------------------------------------------------
+
+async fn init_embedding(
+    cfg: &animus_core::config::EmbeddingConfig,
+) -> (Arc<dyn animus_core::EmbeddingService>, usize) {
+    use animus_core::config::EmbeddingProviderKind;
+
+    match cfg.provider {
+        EmbeddingProviderKind::Synthetic => {
+            let dim = if cfg.dimensionality > 0 { cfg.dimensionality } else { 128 };
+            tracing::info!("Using SyntheticEmbedding ({dim} dims)");
+            (Arc::new(SyntheticEmbedding::new(dim)), dim)
+        }
+        EmbeddingProviderKind::Ollama => {
+            match OllamaEmbedding::probe(&cfg.ollama_url, &cfg.model).await {
+                Ok(detected_dim) => {
+                    let dim = if cfg.dimensionality > 0 { cfg.dimensionality } else { detected_dim };
+                    tracing::info!(
+                        "Using Ollama embeddings at {} ({}, {dim} dims) with resilient fallback",
+                        cfg.ollama_url, cfg.model
+                    );
+                    let ollama = OllamaEmbedding::new(&cfg.ollama_url, &cfg.model, dim);
+                    (Arc::new(ResilientEmbedding::new(ollama, dim)), dim)
+                }
+                Err(e) => {
+                    let dim = if cfg.dimensionality > 0 { cfg.dimensionality } else { 128 };
+                    tracing::warn!(
+                        "Ollama unavailable at {} ({e}); falling back to SyntheticEmbedding ({dim} dims)",
+                        cfg.ollama_url
+                    );
+                    (Arc::new(SyntheticEmbedding::new(dim)), dim)
+                }
+            }
+        }
+        EmbeddingProviderKind::OpenAI => {
+            // OpenAI embedding bridge — dimensionality must be specified in config.
+            // Requires OPENAI_API_KEY env var and an `animus-bridge-openai` implementation.
+            // Until the bridge crate is linked, fall back to synthetic with a warning.
+            let dim = if cfg.dimensionality > 0 { cfg.dimensionality } else { 1536 };
+            tracing::warn!(
+                "OpenAI embedding provider selected but animus-bridge-openai is not linked. \
+                 Falling back to SyntheticEmbedding ({dim} dims). \
+                 See https://github.com/JaredCluff/animus-bridge-openai"
+            );
+            (Arc::new(SyntheticEmbedding::new(dim)), dim)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Health endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct HealthState {
+    instance_id: String,
+    store: Arc<MmapVectorStore>,
+    version: &'static str,
+}
+
+async fn health_handler(State(state): State<HealthState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": state.version,
+        "instance_id": state.instance_id,
+        "segments": state.store.count(None),
+    }))
+}
+
+fn start_health_server(bind: String, store: Arc<MmapVectorStore>, instance_id: String) {
+    let state = HealthState {
+        instance_id,
+        store,
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .with_state(state);
+
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(&bind).await {
+            Ok(listener) => {
+                tracing::info!("Health endpoint listening on http://{bind}/health");
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::warn!("Health server error: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Could not bind health endpoint to {bind}: {e}");
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /// Compute embeddings for all active goals and update the Sensorium orchestrator.
 async fn update_goal_embeddings(
