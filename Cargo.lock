@@ -98,6 +98,7 @@ dependencies = [
  "animus-embed",
  "animus-interface",
  "animus-mnemos",
+ "animus-sensorium",
  "animus-vectorfs",
  "bincode",
  "serde",
@@ -109,6 +110,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "animus-sensorium"
+version = "0.1.0"
+dependencies = [
+ "animus-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "animus-tests"
 version = "0.1.0"
 dependencies = [
@@ -116,6 +129,7 @@ dependencies = [
  "animus-cortex",
  "animus-embed",
  "animus-mnemos",
+ "animus-sensorium",
  "animus-vectorfs",
  "chrono",
  "rand 0.8.5",

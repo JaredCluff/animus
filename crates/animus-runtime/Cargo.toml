@@ -14,6 +14,7 @@ animus-mnemos = { path = "../animus-mnemos" }
 animus-embed = { path = "../animus-embed" }
 animus-cortex = { path = "../animus-cortex" }
 animus-interface = { path = "../animus-interface" }
+animus-sensorium = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
