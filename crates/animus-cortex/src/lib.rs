@@ -3,6 +3,7 @@ pub mod llm;
 pub mod scheduler;
 pub mod telos;
 pub mod thread;
+pub mod tools;
 
 pub use engine_registry::{CognitiveRole, EngineConfig, EngineRegistry, Provider};
 pub use llm::{
