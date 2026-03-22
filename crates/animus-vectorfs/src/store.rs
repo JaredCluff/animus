@@ -310,7 +310,12 @@ impl VectorStore for MmapVectorStore {
         // Persist to disk first — if this fails, no in-memory state is modified.
         // If HNSW insert fails after persist, the orphan file is benign (reloaded on restart).
         self.persist_segment(&segment)?;
-        self.index.insert(id, &segment.embedding)?;
+        // Only insert into the HNSW index if this ID is not already present —
+        // duplicate HNSW entries corrupt top_k counts.
+        let already_exists = self.segments.read().contains_key(&id);
+        if !already_exists {
+            self.index.insert(id, &segment.embedding)?;
+        }
         self.segments.write().insert(id, segment);
         Ok(id)
     }

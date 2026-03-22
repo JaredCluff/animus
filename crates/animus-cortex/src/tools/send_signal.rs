@@ -26,6 +26,16 @@ impl Tool for SendSignalTool {
         let target = params["target_thread_prefix"].as_str().ok_or("missing 'target_thread_prefix'")?;
         let priority_str = params["priority"].as_str().unwrap_or("normal");
         let message = params["message"].as_str().ok_or("missing 'message'")?;
+        const MAX_SIGNAL_MESSAGE_BYTES: usize = 4 * 1024; // 4 KiB
+        if message.len() > MAX_SIGNAL_MESSAGE_BYTES {
+            return Ok(ToolResult {
+                content: format!(
+                    "Message too large: {} bytes (max {MAX_SIGNAL_MESSAGE_BYTES}). Summarize before sending.",
+                    message.len()
+                ),
+                is_error: true,
+            });
+        }
 
         let priority = match priority_str {
             "urgent" => SignalPriority::Urgent,

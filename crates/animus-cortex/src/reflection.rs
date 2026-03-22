@@ -285,6 +285,19 @@ impl<S: VectorStore> ReflectionLoop<S> {
             if self.signaled_contradictions.contains(&pair) {
                 continue;
             }
+            // Cap the deduplication set to prevent unbounded growth in long sessions.
+            // When full, evict ~10% of entries so we don't evict on every insert.
+            const MAX_SIGNALED_CONTRADICTIONS: usize = 10_000;
+            if self.signaled_contradictions.len() >= MAX_SIGNALED_CONTRADICTIONS {
+                let to_remove: Vec<_> = self.signaled_contradictions
+                    .iter()
+                    .take(MAX_SIGNALED_CONTRADICTIONS / 10)
+                    .cloned()
+                    .collect();
+                for k in to_remove {
+                    self.signaled_contradictions.remove(&k);
+                }
+            }
             self.signaled_contradictions.insert(pair);
 
             let sig = Signal {

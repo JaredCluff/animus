@@ -109,15 +109,20 @@ impl<S: VectorStore> Consolidator<S> {
 
     /// Merge a cluster of similar segments into one consolidated segment.
     fn merge_cluster(&self, segments: &[&Segment]) -> Segment {
-        // Average the embeddings
+        // Average only the embeddings of text-content segments so that the merged
+        // embedding represents the text being stored, not a blend with non-text vectors.
+        let text_segs: Vec<&&Segment> = segments.iter()
+            .filter(|s| matches!(s.content, Content::Text(_)))
+            .collect();
+        let embed_source = if text_segs.is_empty() { segments.iter().collect::<Vec<_>>() } else { text_segs };
         let dim = segments[0].embedding.len();
         let mut avg_embedding = vec![0.0f32; dim];
-        for seg in segments {
+        for seg in &embed_source {
             for (i, v) in seg.embedding.iter().enumerate() {
                 avg_embedding[i] += v;
             }
         }
-        let n = segments.len() as f32;
+        let n = embed_source.len() as f32;
         for v in &mut avg_embedding {
             *v /= n;
         }
