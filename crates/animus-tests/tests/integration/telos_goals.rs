@@ -6,8 +6,8 @@ use tempfile::TempDir;
 fn test_create_and_list_goals() {
     let mut manager = GoalManager::new();
 
-    manager.create_goal("Learn Rust".to_string(), GoalSource::Human, Priority::High);
-    manager.create_goal("Read docs".to_string(), GoalSource::Human, Priority::Low);
+    manager.create_goal("Learn Rust".to_string(), GoalSource::Human, Priority::High).unwrap();
+    manager.create_goal("Read docs".to_string(), GoalSource::Human, Priority::Low).unwrap();
 
     let active = manager.active_goals();
     assert_eq!(active.len(), 2);
@@ -18,7 +18,7 @@ fn test_create_and_list_goals() {
 #[test]
 fn test_complete_goal() {
     let mut manager = GoalManager::new();
-    let id = manager.create_goal("Test goal".to_string(), GoalSource::Human, Priority::Normal);
+    let id = manager.create_goal("Test goal".to_string(), GoalSource::Human, Priority::Normal).unwrap();
 
     manager.complete_goal(id).unwrap();
 
@@ -34,7 +34,7 @@ fn test_goal_persistence() {
 
     let id = {
         let mut manager = GoalManager::new();
-        let id = manager.create_goal("Persist me".to_string(), GoalSource::Human, Priority::Normal);
+        let id = manager.create_goal("Persist me".to_string(), GoalSource::Human, Priority::Normal).unwrap();
         manager.save(&path).unwrap();
         id
     };
@@ -47,8 +47,8 @@ fn test_goal_persistence() {
 #[test]
 fn test_goals_summary() {
     let mut manager = GoalManager::new();
-    manager.create_goal("High priority task".to_string(), GoalSource::Human, Priority::High);
-    manager.create_goal("Background task".to_string(), GoalSource::SelfDerived, Priority::Background);
+    manager.create_goal("High priority task".to_string(), GoalSource::Human, Priority::High).unwrap();
+    manager.create_goal("Background task".to_string(), GoalSource::SelfDerived, Priority::Background).unwrap();
 
     let summary = manager.goals_summary();
     assert!(summary.contains("High priority task"));
@@ -59,9 +59,9 @@ fn test_goals_summary() {
 fn test_default_autonomy_by_source() {
     let mut manager = GoalManager::new();
 
-    let human_id = manager.create_goal("Human goal".to_string(), GoalSource::Human, Priority::Normal);
-    let self_id = manager.create_goal("Self goal".to_string(), GoalSource::SelfDerived, Priority::Normal);
-    let fed_id = manager.create_goal("Fed goal".to_string(), GoalSource::Federated { source_ailf: InstanceId::new() }, Priority::Normal);
+    let human_id = manager.create_goal("Human goal".to_string(), GoalSource::Human, Priority::Normal).unwrap();
+    let self_id = manager.create_goal("Self goal".to_string(), GoalSource::SelfDerived, Priority::Normal).unwrap();
+    let fed_id = manager.create_goal("Fed goal".to_string(), GoalSource::Federated { source_ailf: InstanceId::new() }, Priority::Normal).unwrap();
 
     assert_eq!(manager.get(human_id).unwrap().autonomy, Autonomy::Act);
     assert_eq!(manager.get(self_id).unwrap().autonomy, Autonomy::Suggest);

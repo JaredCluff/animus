@@ -69,13 +69,23 @@ impl GoalManager {
         }
     }
 
-    /// Create a new goal.
+    /// Maximum number of goals the manager will hold simultaneously.
+    pub const MAX_GOALS: usize = 10_000;
+
+    /// Create a new goal. Returns an error if the goal limit has been reached.
     pub fn create_goal(
         &mut self,
         description: String,
         source: GoalSource,
         priority: Priority,
-    ) -> GoalId {
+    ) -> Result<GoalId> {
+        if self.goals.len() >= Self::MAX_GOALS {
+            return Err(AnimusError::Goal(format!(
+                "goal limit reached ({} goals); complete or abandon existing goals first",
+                Self::MAX_GOALS
+            )));
+        }
+
         let autonomy = match &source {
             GoalSource::Human => Autonomy::Act,
             GoalSource::SelfDerived => Autonomy::Suggest,
@@ -99,7 +109,7 @@ impl GoalManager {
 
         let id = goal.id;
         self.goals.insert(id, goal);
-        id
+        Ok(id)
     }
 
     /// Get a goal by ID.
@@ -154,12 +164,22 @@ impl GoalManager {
         Ok(())
     }
 
+    /// Maximum number of progress notes per goal.
+    pub const MAX_PROGRESS_NOTES: usize = 1_000;
+
     /// Add a progress note (segment ID) to a goal.
     pub fn add_progress_note(&mut self, goal_id: GoalId, segment_id: SegmentId) -> Result<()> {
         let goal = self
             .goals
             .get_mut(&goal_id)
             .ok_or(AnimusError::Goal(format!("goal not found: {}", goal_id.0)))?;
+        if goal.progress_notes.len() >= Self::MAX_PROGRESS_NOTES {
+            return Err(AnimusError::Goal(format!(
+                "progress note limit ({}) reached for goal {}",
+                Self::MAX_PROGRESS_NOTES,
+                goal_id.0
+            )));
+        }
         goal.progress_notes.push(segment_id);
         Ok(())
     }

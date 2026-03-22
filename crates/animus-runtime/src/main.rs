@@ -831,13 +831,19 @@ async fn handle_command(
                     arg.len()
                 ));
             } else {
-            let id = ctx.goals.create_goal(arg.to_string(), GoalSource::Human, Priority::Normal);
-            ctx.goals.save(ctx.goals_path)?;
-            update_goal_embeddings(ctx.goals, ctx.embedder, ctx.sensorium).await;
-            ctx.interface.display_status(&format!(
-                "Goal created: {}",
-                id.0.to_string().get(..8).unwrap_or("?")
-            ));
+            match ctx.goals.create_goal(arg.to_string(), GoalSource::Human, Priority::Normal) {
+                Ok(id) => {
+                    ctx.goals.save(ctx.goals_path)?;
+                    update_goal_embeddings(ctx.goals, ctx.embedder, ctx.sensorium).await;
+                    ctx.interface.display_status(&format!(
+                        "Goal created: {}",
+                        id.0.to_string().get(..8).unwrap_or("?")
+                    ));
+                }
+                Err(e) => {
+                    ctx.interface.display_status(&format!("Failed to create goal: {e}"));
+                }
+            }
             } // end size check
         }
         "/remember" if !arg.is_empty() => {
