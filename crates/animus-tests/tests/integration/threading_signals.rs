@@ -1,6 +1,7 @@
 use animus_core::threading::*;
 use animus_core::ThreadId;
 use animus_cortex::thread::ReasoningThread;
+use animus_embed::SyntheticEmbedding;
 use animus_vectorfs::store::MmapVectorStore;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -86,5 +87,38 @@ fn drain_signals_clears_inbox() {
         created: chrono::Utc::now(),
     });
     let _ = thread.drain_signals();
+    assert!(thread.pending_signals().is_empty());
+}
+
+#[tokio::test]
+async fn signals_drained_after_processing() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(MmapVectorStore::open(&dir.path().join("vfs"), 128).unwrap());
+    let mut thread = ReasoningThread::new("test".to_string(), store, 8000, 128);
+
+    // Deliver a signal
+    let signal = Signal {
+        source_thread: ThreadId::new(),
+        target_thread: thread.id,
+        priority: SignalPriority::Urgent,
+        summary: "Important: build failed".to_string(),
+        segment_refs: vec![],
+        created: chrono::Utc::now(),
+    };
+    thread.deliver_signal(signal);
+    assert_eq!(thread.pending_signals().len(), 1);
+
+    // Process a turn
+    let embedder = SyntheticEmbedding::new(128);
+    let engine = animus_cortex::MockEngine::new("I see the build failure.");
+
+    let _result = thread.process_turn(
+        "How are things going?",
+        "You are an AI.",
+        &engine,
+        &embedder,
+    ).await.unwrap();
+
+    // After processing, signals should be drained
     assert!(thread.pending_signals().is_empty());
 }

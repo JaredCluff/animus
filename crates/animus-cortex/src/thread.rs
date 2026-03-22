@@ -90,8 +90,23 @@ impl<S: VectorStore> ReasoningThread<S> {
             10,
         )?;
 
-        // Build the system prompt with assembled context
-        let enriched_system = self.build_system_prompt(system_prompt, &context);
+        // Inject pending signals into context
+        let signals = self.drain_signals();
+        let enriched_system = if signals.is_empty() {
+            self.build_system_prompt(system_prompt, &context)
+        } else {
+            let mut sys = self.build_system_prompt(system_prompt, &context);
+            sys.push_str("\n\n## Inter-Thread Signals\n");
+            for signal in &signals {
+                sys.push_str(&format!(
+                    "- [{:?}] from thread {}: {}\n",
+                    signal.priority,
+                    signal.source_thread.0.to_string().get(..8).unwrap_or("?"),
+                    signal.summary,
+                ));
+            }
+            sys
+        };
 
         // Call the LLM
         let output = engine.reason(&enriched_system, &self.conversation).await?;
