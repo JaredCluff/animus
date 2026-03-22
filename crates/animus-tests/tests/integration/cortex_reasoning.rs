@@ -69,6 +69,32 @@ async fn test_reasoning_thread_stores_conversation_as_segments() {
 }
 
 #[tokio::test]
+async fn test_multi_turn_stores_all_segments() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(MmapVectorStore::open(dir.path(), 128).unwrap());
+    let embedder = SyntheticEmbedding::new(128);
+    let engine = MockEngine::new("Response to turn");
+
+    let mut thread = ReasoningThread::new(
+        "multi-turn-test".to_string(),
+        store.clone(),
+        8000,
+        128,
+    );
+
+    // First turn
+    thread.process_turn("First message", "System", &engine, &embedder).await.unwrap();
+    assert_eq!(thread.turn_count(), 2);
+    assert_eq!(store.count(None), 2);
+
+    // Second turn — should accumulate
+    thread.process_turn("Second message", "System", &engine, &embedder).await.unwrap();
+    assert_eq!(thread.turn_count(), 4);
+    assert_eq!(store.count(None), 4);
+    assert_eq!(thread.stored_turn_ids().len(), 4);
+}
+
+#[tokio::test]
 async fn test_mock_engine_basic() {
     let engine = MockEngine::new("test response");
     let turns = vec![Turn {

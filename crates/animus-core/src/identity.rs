@@ -72,9 +72,45 @@ impl std::fmt::Display for ThreadId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EventId(pub Uuid);
 
+impl EventId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for EventId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Unique identifier for a consent policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PolicyId(pub Uuid);
+
+impl PolicyId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for PolicyId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for PolicyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Unique identifier for a goal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -155,9 +191,17 @@ impl AnimusIdentity {
     /// Load identity from a file, or generate and save if not found.
     pub fn load_or_generate(path: &std::path::Path, base_model: &str) -> crate::Result<Self> {
         if path.exists() {
+            let metadata = std::fs::metadata(path)?;
+            if metadata.len() > 1_048_576 {
+                return Err(crate::AnimusError::Identity(
+                    format!("identity file too large: {} bytes (max 1 MiB)", metadata.len())
+                ));
+            }
             let data = std::fs::read(path)?;
             let identity: Self = bincode::deserialize(&data)
-                .map_err(|e| crate::AnimusError::Identity(format!("failed to load identity: {e}")))?;
+                .map_err(|e| crate::AnimusError::Identity(
+                    format!("failed to load identity from {}: {e}", path.display())
+                ))?;
             Ok(identity)
         } else {
             let identity = Self::generate(base_model.to_string());
@@ -166,7 +210,16 @@ impl AnimusIdentity {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(path, &data)?;
+            let tmp_path = path.with_extension("bin.tmp");
+            std::fs::write(&tmp_path, &data)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+
+            std::fs::rename(&tmp_path, path)?;
             Ok(identity)
         }
     }

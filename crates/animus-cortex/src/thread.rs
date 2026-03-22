@@ -3,6 +3,7 @@ use animus_core::identity::{GoalId, SegmentId, ThreadId};
 use animus_core::segment::{Content, Segment, Source};
 use animus_mnemos::assembler::{AssembledContext, ContextAssembler};
 use animus_vectorfs::VectorStore;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::llm::{ReasoningEngine, Role, Turn};
@@ -122,10 +123,11 @@ impl<S: VectorStore> ReasoningThread<S> {
         let mut prompt = base_prompt.to_string();
 
         // Add recalled knowledge from VectorFS
+        let turn_ids: HashSet<_> = self.stored_turn_ids.iter().copied().collect();
         let knowledge_segments: Vec<&Segment> = context
             .segments
             .iter()
-            .filter(|s| !self.stored_turn_ids.contains(&s.id))
+            .filter(|s| !turn_ids.contains(&s.id))
             .collect();
 
         if !knowledge_segments.is_empty() {

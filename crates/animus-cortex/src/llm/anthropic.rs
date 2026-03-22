@@ -15,7 +15,11 @@ pub struct AnthropicEngine {
 impl AnthropicEngine {
     pub fn new(api_key: String, model: String, max_tokens: usize) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
             api_key,
             model,
             max_tokens,
@@ -132,7 +136,10 @@ impl ReasoningEngine for AnthropicEngine {
         }
 
         let api_response: ApiResponse = serde_json::from_str(&body)
-            .map_err(|e| AnimusError::Llm(format!("failed to parse response: {e}")))?;
+            .map_err(|e| AnimusError::Llm(format!(
+                "failed to parse response: {e}\nbody: {}",
+                &body[..body.len().min(500)]
+            )))?;
 
         let content = api_response
             .content
