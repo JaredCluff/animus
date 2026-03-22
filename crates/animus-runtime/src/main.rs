@@ -35,6 +35,8 @@ Available commands the human can use:
 - /thread switch <id> — switch to a different thread
 - /peers — list discovered federation peers
 - /tag <id> <key>=<value> — label a segment for categorization/federation
+- /accept — record that the last response used good knowledge
+- /correct — record that the last response used wrong knowledge
 - /classify <id> <class> — set knowledge decay class (factual/procedural/episodic/opinion/general)
 - /health <id> — show segment health details (Bayesian confidence, decay, access patterns)
 - /trust <id> — upgrade a peer to Trusted
@@ -379,13 +381,6 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         {
             Ok(response) => {
                 interface.display_response(&response);
-                // Record implicit acceptance for recalled segments
-                if let Some(thread) = scheduler.active_thread() {
-                    let mut qt = quality_tracker.lock();
-                    for seg_id in thread.stored_turn_ids() {
-                        qt.record_acceptance(*seg_id);
-                    }
-                }
             }
             Err(e) => {
                 interface.display_status(&format!("Error: {e}"));
@@ -665,6 +660,66 @@ async fn handle_command(
                 n => ctx.interface.display_status(&format!(
                     "{n} segments match '{arg}' — be more specific"
                 )),
+            }
+        }
+        // /accept — record positive feedback for segments used in the last turn
+        "/accept" => {
+            if let Some(thread) = ctx.scheduler.active_thread() {
+                let retrieved = thread.last_retrieved_ids().to_vec();
+                if retrieved.is_empty() {
+                    ctx.interface.display_status("No retrieved segments to accept (no knowledge was used in the last response).");
+                } else {
+                    let mut updated = 0;
+                    for id in &retrieved {
+                        if let Ok(Some(mut seg)) = ctx.store.get_raw(*id) {
+                            seg.record_positive_feedback();
+                            if let Err(e) = ctx.store.update_meta(*id, animus_vectorfs::SegmentUpdate {
+                                alpha: Some(seg.alpha),
+                                confidence: Some(seg.confidence),
+                                ..Default::default()
+                            }) {
+                                tracing::warn!("Failed to update feedback for {id}: {e}");
+                            } else {
+                                updated += 1;
+                            }
+                        }
+                    }
+                    ctx.interface.display_status(&format!(
+                        "Accepted: positive feedback recorded for {updated} knowledge segment(s)"
+                    ));
+                }
+            } else {
+                ctx.interface.display_status("No active thread.");
+            }
+        }
+        // /correct — record negative feedback for segments used in the last turn
+        "/correct" => {
+            if let Some(thread) = ctx.scheduler.active_thread() {
+                let retrieved = thread.last_retrieved_ids().to_vec();
+                if retrieved.is_empty() {
+                    ctx.interface.display_status("No retrieved segments to correct (no knowledge was used in the last response).");
+                } else {
+                    let mut updated = 0;
+                    for id in &retrieved {
+                        if let Ok(Some(mut seg)) = ctx.store.get_raw(*id) {
+                            seg.record_negative_feedback();
+                            if let Err(e) = ctx.store.update_meta(*id, animus_vectorfs::SegmentUpdate {
+                                beta: Some(seg.beta),
+                                confidence: Some(seg.confidence),
+                                ..Default::default()
+                            }) {
+                                tracing::warn!("Failed to update feedback for {id}: {e}");
+                            } else {
+                                updated += 1;
+                            }
+                        }
+                    }
+                    ctx.interface.display_status(&format!(
+                        "Corrected: negative feedback recorded for {updated} knowledge segment(s)"
+                    ));
+                }
+            } else {
+                ctx.interface.display_status("No active thread.");
             }
         }
         // /tag <segment-prefix> <key>=<value> — add a tag to a segment
@@ -1064,6 +1119,8 @@ async fn handle_command(
             ctx.interface.display("/goal <text>   — create a new goal");
             ctx.interface.display("/remember <text> — store knowledge explicitly");
             ctx.interface.display("/forget <id>   — remove a stored segment by ID prefix");
+            ctx.interface.display("/accept        — knowledge in last response was correct");
+            ctx.interface.display("/correct       — knowledge in last response was wrong");
             ctx.interface.display("/tag <id> <k>=<v> — add a tag to a segment");
             ctx.interface.display("/classify <id> <class> — set knowledge decay class");
             ctx.interface.display("/health <id>   — show segment health details");

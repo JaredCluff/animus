@@ -32,6 +32,9 @@ pub struct ReasoningThread<S: VectorStore> {
     status: ThreadStatus,
     /// Pending inter-thread signals (inbox).
     pending_signals: Vec<Signal>,
+    /// Segment IDs retrieved (not anchors) in the most recent turn.
+    /// Used for explicit feedback commands (/accept, /correct).
+    last_retrieved_ids: Vec<SegmentId>,
 }
 
 impl<S: VectorStore> ReasoningThread<S> {
@@ -53,6 +56,7 @@ impl<S: VectorStore> ReasoningThread<S> {
             embedding_dim,
             status: ThreadStatus::Active,
             pending_signals: Vec::new(),
+            last_retrieved_ids: Vec::new(),
         }
     }
 
@@ -112,14 +116,20 @@ impl<S: VectorStore> ReasoningThread<S> {
         // Call the LLM
         let output = engine.reason(&enriched_system, &self.conversation).await?;
 
-        // Implicit Bayesian feedback: retrieved segments that made it into context
-        // get a small positive signal. This makes frequently-used knowledge
-        // gradually accumulate confidence over time.
+        // Track which knowledge segments were retrieved (not conversation anchors).
+        // Used for implicit feedback now and explicit feedback via /accept, /correct.
         let anchor_set: std::collections::HashSet<_> =
             self.stored_turn_ids.iter().copied().collect();
+        self.last_retrieved_ids = context
+            .segments
+            .iter()
+            .filter(|s| !anchor_set.contains(&s.id))
+            .map(|s| s.id)
+            .collect();
+
+        // Implicit Bayesian feedback: retrieved segments get a small positive signal.
         for seg in &context.segments {
             if !anchor_set.contains(&seg.id) {
-                // Small implicit boost (0.1) vs explicit feedback (1.0)
                 let new_alpha = seg.alpha + 0.1;
                 if let Err(e) = self.store.update_meta(
                     seg.id,
@@ -212,6 +222,12 @@ impl<S: VectorStore> ReasoningThread<S> {
     /// Get stored turn segment IDs.
     pub fn stored_turn_ids(&self) -> &[SegmentId] {
         &self.stored_turn_ids
+    }
+
+    /// Get segment IDs that were retrieved (not conversation anchors) in the last turn.
+    /// Empty if no turn has been processed yet.
+    pub fn last_retrieved_ids(&self) -> &[SegmentId] {
+        &self.last_retrieved_ids
     }
 
     /// Get the current thread status.

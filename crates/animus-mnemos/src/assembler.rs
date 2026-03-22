@@ -2,6 +2,7 @@ use animus_core::error::Result;
 use animus_core::identity::SegmentId;
 use animus_core::segment::Segment;
 use animus_vectorfs::VectorStore;
+use rand::Rng;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -67,24 +68,47 @@ impl<S: VectorStore> ContextAssembler<S> {
             }
         }
 
-        // Step 2: Retrieve top-k similar segments from Warm tier
-        let candidates = self.store.query(query_embedding, top_k, Some(animus_core::segment::Tier::Warm))?;
+        // Step 2: Retrieve candidates with exploration pool (2x top_k)
+        // Extra candidates give Thompson Sampling room to surface less-used knowledge.
+        let exploration_pool = top_k.saturating_mul(2).max(top_k + 3);
+        let candidates = self.store.query(
+            query_embedding,
+            exploration_pool,
+            Some(animus_core::segment::Tier::Warm),
+        )?;
+
+        // Step 2.5: Thompson Sampling re-ranking.
+        // Combines semantic similarity with a sampled confidence score. Segments with
+        // uncertain Beta distributions (few observations) get more variance,
+        // enabling exploration of potentially valuable but under-used knowledge.
+        let mut scored: Vec<(Segment, f32)> = candidates
+            .into_iter()
+            .filter(|c| !seen_ids.contains(&c.id))
+            .map(|seg| {
+                let sampled = thompson_sample(seg.alpha, seg.beta);
+                let similarity = crate::evictor::cosine_similarity(&seg.embedding, query_embedding);
+                // Similarity dominates (0.7) so relevant segments still rank first.
+                // Thompson-sampled confidence (0.3) enables exploration of uncertain
+                // but potentially valuable segments.
+                let combined = 0.7 * similarity + 0.3 * sampled;
+                (seg, combined)
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Step 3: Add candidates until budget is exhausted
         let mut evicted: Vec<(Segment, f32)> = Vec::new();
 
-        for candidate in candidates {
-            if seen_ids.contains(&candidate.id) {
-                continue;
-            }
-
+        for (candidate, score) in scored {
             let tokens = candidate.estimated_tokens();
             if total_tokens + tokens <= self.token_budget {
                 total_tokens += tokens;
                 seen_ids.insert(candidate.id);
                 included.push(candidate);
             } else {
-                let score = candidate.relevance_score;
                 evicted.push((candidate, score));
             }
         }
@@ -113,6 +137,27 @@ impl<S: VectorStore> ContextAssembler<S> {
     pub fn set_token_budget(&mut self, budget: usize) {
         self.token_budget = budget;
     }
+}
+
+/// Approximate Thompson Sampling from a Beta(alpha, beta) distribution.
+///
+/// Instead of a true Beta sample (which requires the `rand_distr` crate),
+/// we use mean + scaled noise proportional to the distribution's standard deviation.
+/// For segments with many observations (low variance), the sampled value stays
+/// close to the mean. For segments with few observations (high variance),
+/// exploration is enabled through larger noise.
+fn thompson_sample(alpha: f32, beta: f32) -> f32 {
+    let sum = alpha + beta;
+    if sum == 0.0 {
+        return 0.5;
+    }
+    let mean = alpha / sum;
+    let variance = (alpha * beta) / (sum * sum * (sum + 1.0));
+    let stddev = variance.sqrt();
+
+    let noise: f32 = rand::thread_rng().gen_range(-1.0..1.0);
+    // Scale noise by 2 stddevs for meaningful exploration
+    (mean + noise * stddev * 2.0).clamp(0.0, 1.0)
 }
 
 /// Generate a short summary for an evicted segment.

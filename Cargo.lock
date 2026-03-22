@@ -120,6 +120,7 @@ dependencies = [
  "animus-vectorfs",
  "bincode",
  "chrono",
+ "rand 0.8.5",
  "serde",
  "tempfile",
  "tracing",
