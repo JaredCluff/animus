@@ -5,6 +5,8 @@ use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
 use animus_cortex::ReasoningEngine;
 use animus_embed::SyntheticEmbedding;
+use animus_federation::orchestrator::FederationOrchestrator;
+use animus_federation::peers::TrustLevel;
 use animus_interface::TerminalInterface;
 use animus_sensorium::bus::EventBus;
 use animus_sensorium::orchestrator::SensoriumOrchestrator;
@@ -31,6 +33,10 @@ Available commands the human can use:
 - /threads — list reasoning threads
 - /thread new <name> — create a new reasoning thread
 - /thread switch <id> — switch to a different thread
+- /peers — list discovered federation peers
+- /trust <id> — upgrade a peer to Trusted
+- /block <id> — block a peer
+- /federate — show federation status
 - /quit — end session
 
 Be concise and helpful. You are not a chatbot — you are a persistent, aware entity."#;
@@ -160,6 +166,23 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     let mut scheduler = ThreadScheduler::new(store.clone(), token_budget, dimensionality);
     let _main_thread_id = scheduler.create_thread("main".to_string());
 
+    // Initialize federation
+    let federation_config = animus_core::FederationConfig::default();
+    let federation = if federation_config.enabled {
+        let mut orch = FederationOrchestrator::new(
+            identity.clone(),
+            federation_config,
+            store.clone(),
+            &data_dir,
+        );
+        orch.start().await?;
+        tracing::info!("Federation started");
+        Some(orch)
+    } else {
+        tracing::info!("Federation disabled (default); use ANIMUS_FEDERATION=1 to enable");
+        None
+    };
+
     // Initialize terminal interface
     let interface = TerminalInterface::new(">> ".to_string());
     let instance_str = format!("{}", identity.instance_id);
@@ -186,6 +209,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                 embedder: &embedder,
                 data_dir: &data_dir,
                 scheduler: &mut scheduler,
+                federation: federation.as_ref(),
             };
             match handle_command(&input, &mut ctx).await? {
                 CommandResult::Continue => continue,
@@ -242,6 +266,7 @@ struct CommandContext<'a> {
     embedder: &'a dyn animus_core::EmbeddingService,
     data_dir: &'a std::path::Path,
     scheduler: &'a mut ThreadScheduler<MmapVectorStore>,
+    federation: Option<&'a FederationOrchestrator<MmapVectorStore>>,
 }
 
 async fn handle_command(
@@ -443,6 +468,99 @@ async fn handle_command(
                 n => ctx.interface.display_status(&format!("{n} threads match '{prefix}' — be more specific")),
             }
         }
+        "/peers" => {
+            if let Some(fed) = ctx.federation {
+                let registry = fed.peers();
+                let peers = registry.read();
+                let all = peers.all_peers();
+                if all.is_empty() {
+                    ctx.interface.display_status("No peers discovered.");
+                } else {
+                    ctx.interface.display_status(&format!("{} peer(s):", all.len()));
+                    for peer in &all {
+                        let id_str = peer.info.instance_id.0.to_string();
+                        let short_id = id_str.get(..8).unwrap_or(&id_str);
+                        ctx.interface.display(&format!(
+                            "  [{short_id}] {:?} — {} (last seen: {})",
+                            peer.trust,
+                            peer.info.address,
+                            peer.last_seen.format("%Y-%m-%d %H:%M:%S UTC"),
+                        ));
+                    }
+                }
+            } else {
+                ctx.interface.display_status("Federation is not enabled.");
+            }
+        }
+        "/trust" if !arg.is_empty() => {
+            if let Some(fed) = ctx.federation {
+                let registry = fed.peers();
+                let mut peers = registry.write();
+                let all: Vec<_> = peers.all_peers().iter().map(|p| p.info.instance_id).collect();
+                let matches: Vec<_> = all.iter()
+                    .filter(|id| id.0.to_string().starts_with(arg))
+                    .collect();
+                match matches.len() {
+                    0 => ctx.interface.display_status(&format!("No peer found matching '{arg}'")),
+                    1 => {
+                        let id = *matches[0];
+                        peers.set_trust(&id, TrustLevel::Trusted);
+                        ctx.interface.display_status(&format!(
+                            "Peer {} upgraded to Trusted",
+                            id.0.to_string().get(..8).unwrap_or("?")
+                        ));
+                    }
+                    n => ctx.interface.display_status(&format!(
+                        "{n} peers match '{arg}' — be more specific"
+                    )),
+                }
+            } else {
+                ctx.interface.display_status("Federation is not enabled.");
+            }
+        }
+        "/block" if !arg.is_empty() => {
+            if let Some(fed) = ctx.federation {
+                let registry = fed.peers();
+                let mut peers = registry.write();
+                let all: Vec<_> = peers.all_peers().iter().map(|p| p.info.instance_id).collect();
+                let matches: Vec<_> = all.iter()
+                    .filter(|id| id.0.to_string().starts_with(arg))
+                    .collect();
+                match matches.len() {
+                    0 => ctx.interface.display_status(&format!("No peer found matching '{arg}'")),
+                    1 => {
+                        let id = *matches[0];
+                        peers.set_trust(&id, TrustLevel::Blocked);
+                        ctx.interface.display_status(&format!(
+                            "Peer {} blocked",
+                            id.0.to_string().get(..8).unwrap_or("?")
+                        ));
+                    }
+                    n => ctx.interface.display_status(&format!(
+                        "{n} peers match '{arg}' — be more specific"
+                    )),
+                }
+            } else {
+                ctx.interface.display_status("Federation is not enabled.");
+            }
+        }
+        "/federate" => {
+            if let Some(fed) = ctx.federation {
+                let peer_count = fed.peer_count();
+                let trusted_count = fed.trusted_peer_count();
+                let addr = fed.server_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "not started".to_string());
+                ctx.interface.display_status(&format!(
+                    "Federation: enabled, server at {addr}"
+                ));
+                ctx.interface.display_status(&format!(
+                    "Peers: {peer_count} total, {trusted_count} trusted"
+                ));
+            } else {
+                ctx.interface.display_status("Federation: disabled");
+            }
+        }
         "/help" => {
             ctx.interface.display("/goals         — list active goals");
             ctx.interface.display("/goal <text>   — create a new goal");
@@ -455,6 +573,10 @@ async fn handle_command(
             ctx.interface.display("/thread new <n>  — create a new thread");
             ctx.interface.display("/thread switch <id> — switch to a thread");
             ctx.interface.display("/thread complete <id> — mark thread completed");
+            ctx.interface.display("/peers           — list discovered peers");
+            ctx.interface.display("/trust <id>      — upgrade peer to Trusted");
+            ctx.interface.display("/block <id>      — block a peer");
+            ctx.interface.display("/federate        — show federation status");
             ctx.interface.display("/quit          — end session");
         }
         _ => {

@@ -121,6 +121,7 @@ dependencies = [
  "animus-core",
  "animus-cortex",
  "animus-embed",
+ "animus-federation",
  "animus-interface",
  "animus-mnemos",
  "animus-sensorium",
