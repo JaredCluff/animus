@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::auth::FederationAuth;
 use crate::knowledge::KnowledgeSharing;
 use crate::peers::{Peer, PeerInfo, PeerRegistry, TrustLevel};
-use crate::protocol::{HandshakeConfirm, HandshakeRequest};
+use crate::protocol::{GoalAnnouncement, HandshakeConfirm, HandshakeRequest, SegmentAnnouncement};
 
 /// Verified peer identity, inserted into request extensions by auth middleware.
 #[derive(Clone)]
@@ -93,6 +93,8 @@ impl<S: VectorStore + 'static> FederationServer<S> {
         let protected_routes = Router::new()
             .route("/federation/segments/{id}", get(handle_get_segment::<S>))
             .route("/federation/peers", get(handle_list_peers::<S>))
+            .route("/federation/publish", post(handle_publish::<S>))
+            .route("/federation/goals", post(handle_goals::<S>))
             .layer(middleware::from_fn_with_state(
                 self.state.clone(),
                 auth_middleware::<S>,
@@ -210,11 +212,32 @@ async fn auth_middleware<S: VectorStore + 'static>(
         None => return error_response(StatusCode::UNAUTHORIZED, "unknown or invalid peer"),
     };
 
-    // Verify request signature (H1).
-    // For GET requests, body is empty — clients sign with b"".
+    // Extract body bytes for signature verification.
+    // For GET/DELETE the body is empty; for POST/PUT we read the full body.
     let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    let body_bytes = if method == axum::http::Method::GET || method == axum::http::Method::DELETE {
+        Vec::new()
+    } else {
+        let (parts, body) = request.into_parts();
+        let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+            Ok(b) => b,
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("failed to read request body: {e}"),
+                );
+            }
+        };
+        let body_vec = bytes.to_vec();
+        // Reconstruct request with the body so downstream handlers can read it
+        request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+        body_vec
+    };
+
+    // Verify request signature (H1).
     if let Err(e) =
-        FederationAuth::verify_signed_request(timestamp, &path, b"", &signature_hex, &peer_vk)
+        FederationAuth::verify_signed_request(timestamp, &path, &body_bytes, &signature_hex, &peer_vk)
     {
         return error_response(
             StatusCode::UNAUTHORIZED,
@@ -479,4 +502,106 @@ async fn handle_list_peers<S: VectorStore + 'static>(
         .collect();
 
     (StatusCode::OK, Json(serde_json::to_value(&summaries).unwrap())).into_response()
+}
+
+/// POST /federation/publish
+///
+/// Receives a segment announcement from an authenticated peer.
+/// Validates the announcement and stores a reference to the remote segment
+/// in the local VectorFS as a federation-sourced segment.
+async fn handle_publish<S: VectorStore + 'static>(
+    State(state): State<Arc<ServerState<S>>>,
+    Extension(auth_peer): Extension<AuthenticatedPeer>,
+    Json(announcement): Json<SegmentAnnouncement>,
+) -> Response {
+    tracing::info!(
+        peer = %auth_peer.instance_id,
+        segment = %announcement.segment_id,
+        "Received segment announcement"
+    );
+
+    // Store a federation-sourced segment with the announced embedding
+    let segment = animus_core::Segment::new(
+        animus_core::Content::Text(format!(
+            "Federation segment from {} (kind: {:?})",
+            auth_peer.instance_id, announcement.content_kind
+        )),
+        announcement.embedding,
+        animus_core::Source::Federation {
+            source_ailf: auth_peer.instance_id,
+            original_id: announcement.segment_id,
+        },
+    );
+
+    match state.store.store(segment) {
+        Ok(id) => {
+            // Update peer stats
+            {
+                let mut peers = state.peers.write();
+                if let Some(peer) = peers.get_peer_mut(&auth_peer.instance_id) {
+                    peer.segments_received += 1;
+                    peer.last_seen = Utc::now();
+                }
+            }
+
+            #[derive(Serialize)]
+            struct PublishResponse {
+                status: String,
+                local_segment_id: SegmentId,
+            }
+
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(&PublishResponse {
+                        status: "accepted".to_string(),
+                        local_segment_id: id,
+                    })
+                    .unwrap(),
+                ),
+            )
+                .into_response()
+        }
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to store announcement: {e}"),
+        ),
+    }
+}
+
+/// POST /federation/goals
+///
+/// Receives a goal announcement from an authenticated peer.
+/// Returns acknowledgement. Goal integration with the local Telos
+/// goal manager happens at the orchestrator level.
+async fn handle_goals<S: VectorStore + 'static>(
+    State(_state): State<Arc<ServerState<S>>>,
+    Extension(auth_peer): Extension<AuthenticatedPeer>,
+    Json(announcement): Json<GoalAnnouncement>,
+) -> Response {
+    tracing::info!(
+        peer = %auth_peer.instance_id,
+        goal = %announcement.goal_id,
+        priority = ?announcement.priority,
+        "Received goal announcement: {}",
+        announcement.description
+    );
+
+    #[derive(Serialize)]
+    struct GoalResponse {
+        status: String,
+        goal_id: animus_core::GoalId,
+    }
+
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(&GoalResponse {
+                status: "acknowledged".to_string(),
+                goal_id: announcement.goal_id,
+            })
+            .unwrap(),
+        ),
+    )
+        .into_response()
 }

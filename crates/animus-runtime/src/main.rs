@@ -4,7 +4,7 @@ use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
 use animus_cortex::ReasoningEngine;
-use animus_embed::SyntheticEmbedding;
+use animus_embed::{OllamaEmbedding, SyntheticEmbedding};
 use animus_federation::orchestrator::FederationOrchestrator;
 use animus_federation::peers::TrustLevel;
 use animus_interface::TerminalInterface;
@@ -78,15 +78,34 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         identity.generation
     );
 
+    // Initialize embedding service (ollama with fallback to synthetic)
+    let ollama_url = std::env::var("ANIMUS_OLLAMA_URL")
+        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let ollama_model = std::env::var("ANIMUS_EMBED_MODEL")
+        .unwrap_or_else(|_| "mxbai-embed-large".to_string());
+
+    let (embedder, dimensionality): (Arc<dyn animus_core::EmbeddingService>, usize) =
+        match OllamaEmbedding::probe(&ollama_url, &ollama_model).await {
+            Ok(dim) => {
+                tracing::info!("Using Ollama embeddings ({ollama_model}, {dim} dims)");
+                (
+                    Arc::new(OllamaEmbedding::new(&ollama_url, &ollama_model, dim)),
+                    dim,
+                )
+            }
+            Err(e) => {
+                let dim = 128;
+                tracing::warn!(
+                    "Ollama unavailable ({e}), falling back to SyntheticEmbedding ({dim} dims)"
+                );
+                (Arc::new(SyntheticEmbedding::new(dim)), dim)
+            }
+        };
+
     // Initialize VectorFS
     let vectorfs_dir = data_dir.join("vectorfs");
-    let dimensionality = 128;
     let store = Arc::new(MmapVectorStore::open(&vectorfs_dir, dimensionality)?);
     let segment_count = store.count(None);
-
-    // Initialize embedding service
-    let embedder = SyntheticEmbedding::new(dimensionality);
-    let embedder: Arc<dyn animus_core::EmbeddingService> = Arc::new(embedder);
 
     // Initialize Sensorium
     let event_bus = Arc::new(EventBus::new(1000));
@@ -106,7 +125,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     // Start background event processing loop
     let orch_clone = orchestrator.clone();
     let store_clone = store.clone();
-    let dim = dimensionality;
+    let embedder_clone = embedder.clone();
     let mut bus_rx = event_bus.subscribe();
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
@@ -115,7 +134,14 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                 Ok(event) => {
                     match orch_clone.process_event(event.clone()).await {
                         Ok(outcome) if outcome.passed_attention => {
-                            let embedding = vec![0.0f32; dim]; // synthetic placeholder
+                            let text = serde_json::to_string(&event.data).unwrap_or_default();
+                            let embedding = match embedder_clone.embed_text(&text).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!("Observation embedding failed: {e}");
+                                    continue;
+                                }
+                            };
                             let segment = animus_core::Segment::new(
                                 animus_core::Content::Structured(event.data.clone()),
                                 embedding,

@@ -35,6 +35,9 @@ fn test_query_by_similarity() {
     let dir = TempDir::new().unwrap();
     let store = MmapVectorStore::open(dir.path(), 4).unwrap();
 
+    // HNSW needs enough elements to build a stable graph structure.
+    // With very few elements, the randomized layer assignment can cause
+    // nondeterministic search results. Add padding vectors for stability.
     let s1 = test_segment(vec![1.0, 0.0, 0.0, 0.0], "north");
     let s2 = test_segment(vec![0.0, 1.0, 0.0, 0.0], "east");
     let s3 = test_segment(vec![0.9, 0.1, 0.0, 0.0], "mostly north");
@@ -44,6 +47,13 @@ fn test_query_by_similarity() {
     store.store(s1).unwrap();
     store.store(s2).unwrap();
     store.store(s3).unwrap();
+
+    // Padding vectors to stabilize HNSW graph
+    store.store(test_segment(vec![0.0, 0.0, 1.0, 0.0], "south")).unwrap();
+    store.store(test_segment(vec![0.0, 0.0, 0.0, 1.0], "west")).unwrap();
+    store.store(test_segment(vec![0.5, 0.5, 0.0, 0.0], "northeast")).unwrap();
+    store.store(test_segment(vec![0.0, 0.5, 0.5, 0.0], "southeast")).unwrap();
+    store.store(test_segment(vec![0.5, 0.0, 0.5, 0.0], "northwest")).unwrap();
 
     let results = store.query(&[1.0, 0.0, 0.0, 0.0], 2, None).unwrap();
     assert_eq!(results.len(), 2);

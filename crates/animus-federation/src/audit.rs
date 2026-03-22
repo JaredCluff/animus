@@ -1,9 +1,9 @@
 use animus_core::{GoalId, InstanceId, SegmentId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Actions recorded in the federation audit trail.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,14 +28,26 @@ pub struct FederationAuditEntry {
     pub goal_id: Option<GoalId>,
 }
 
-/// Append-only audit trail backed by a JSON lines file.
+/// Default max file size before rotation: 10 MiB.
+const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Number of rotated files to keep.
+const MAX_ROTATED_FILES: u32 = 5;
+
+/// Append-only audit trail backed by a JSON lines file with size-based rotation.
 pub struct FederationAuditTrail {
+    path: PathBuf,
     file: File,
     count: usize,
+    max_file_size: u64,
 }
 
 impl FederationAuditTrail {
     pub fn open(path: &Path) -> animus_core::Result<Self> {
+        Self::open_with_max_size(path, DEFAULT_MAX_FILE_SIZE)
+    }
+
+    pub fn open_with_max_size(path: &Path, max_file_size: u64) -> animus_core::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -52,7 +64,12 @@ impl FederationAuditTrail {
             .append(true)
             .open(path)?;
 
-        Ok(Self { file, count })
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            count,
+            max_file_size,
+        })
     }
 
     pub fn append(&mut self, entry: &FederationAuditEntry) -> animus_core::Result<()> {
@@ -60,6 +77,43 @@ impl FederationAuditTrail {
         writeln!(self.file, "{json}")?;
         self.file.flush()?;
         self.count += 1;
+
+        if self.needs_rotation() {
+            self.rotate()?;
+        }
+
+        Ok(())
+    }
+
+    fn needs_rotation(&self) -> bool {
+        fs::metadata(&self.path)
+            .map(|m| m.len() >= self.max_file_size)
+            .unwrap_or(false)
+    }
+
+    fn rotate(&mut self) -> animus_core::Result<()> {
+        let oldest = self.path.with_extension(format!("jsonl.{MAX_ROTATED_FILES}"));
+        if oldest.exists() {
+            fs::remove_file(&oldest)?;
+        }
+
+        for i in (1..MAX_ROTATED_FILES).rev() {
+            let from = self.path.with_extension(format!("jsonl.{i}"));
+            let to = self.path.with_extension(format!("jsonl.{}", i + 1));
+            if from.exists() {
+                fs::rename(&from, &to)?;
+            }
+        }
+
+        let rotated = self.path.with_extension("jsonl.1");
+        fs::rename(&self.path, &rotated)?;
+
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.count = 0;
+
         Ok(())
     }
 
