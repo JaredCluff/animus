@@ -39,6 +39,9 @@ struct PendingHandshake {
     created_at: std::time::Instant,
 }
 
+/// Replay window — must match `REPLAY_WINDOW_SECS` in auth.rs.
+const REPLAY_WINDOW_SECS: i64 = 30;
+
 /// Shared state accessible by all axum handlers.
 struct ServerState<S: VectorStore> {
     auth: FederationAuth,
@@ -51,6 +54,8 @@ struct ServerState<S: VectorStore> {
     max_rpm: u32,
     /// Per-peer request timestamps for rate limiting (sliding window).
     rate_limits: Mutex<HashMap<InstanceId, Vec<i64>>>,
+    /// Seen signature hashes within the replay window — prevents replay attacks.
+    seen_signatures: Mutex<HashMap<String, i64>>,
 }
 
 /// Lightweight axum HTTP server for inbound federation requests.
@@ -83,6 +88,7 @@ impl<S: VectorStore + 'static> FederationServer<S> {
             goals_path: None,
             max_rpm,
             rate_limits: Mutex::new(HashMap::new()),
+            seen_signatures: Mutex::new(HashMap::new()),
         });
         Self { state }
     }
@@ -271,6 +277,19 @@ async fn auth_middleware<S: VectorStore + 'static>(
             StatusCode::UNAUTHORIZED,
             &format!("signature verification failed: {e}"),
         );
+    }
+
+    // Replay attack prevention: reject signatures seen within the replay window.
+    {
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - REPLAY_WINDOW_SECS;
+        let mut seen = state.seen_signatures.lock().await;
+        // Prune expired entries first.
+        seen.retain(|_, ts| *ts > cutoff);
+        if seen.contains_key(&signature_hex) {
+            return error_response(StatusCode::UNAUTHORIZED, "replayed request rejected");
+        }
+        seen.insert(signature_hex.clone(), timestamp);
     }
 
     // Rate limiting: enforce max_rpm per peer

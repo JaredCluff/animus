@@ -833,6 +833,13 @@ async fn handle_command(
         }
         "/remember" if !arg.is_empty() => {
             use animus_core::segment::{Content, Segment, Source};
+            const MAX_REMEMBER_BYTES: usize = 10 * 1024; // 10 KiB — consistent with RememberTool
+            if arg.len() > MAX_REMEMBER_BYTES {
+                ctx.interface.display_status(&format!(
+                    "Too large to remember: {} bytes (max {MAX_REMEMBER_BYTES}). Please summarize first.",
+                    arg.len()
+                ));
+            } else {
             let embedding = ctx.embedder.embed_text(arg).await?;
             let mut segment = Segment::new(
                 Content::Text(arg.to_string()),
@@ -848,6 +855,7 @@ async fn handle_command(
                 arg,
                 id.0.to_string().get(..8).unwrap_or("?")
             ));
+            } // end else branch for size check
         }
         "/forget" if !arg.is_empty() => {
             // Match segment by ID prefix
@@ -879,11 +887,15 @@ async fn handle_command(
                     ctx.interface.display_status("No retrieved segments to accept (no knowledge was used in the last response).");
                 } else {
                     let mut updated = 0;
+                    const MAX_BAYES_PARAM: f32 = 100.0;
                     for id in &retrieved {
                         if let Ok(Some(mut seg)) = ctx.store.get_raw(*id) {
                             seg.record_positive_feedback();
+                            // Cap alpha to prevent runaway accumulation (same ceiling as
+                            // update_segment tool and implicit feedback in thread.rs).
+                            let capped_alpha = seg.alpha.min(MAX_BAYES_PARAM);
                             if let Err(e) = ctx.store.update_meta(*id, animus_vectorfs::SegmentUpdate {
-                                alpha: Some(seg.alpha),
+                                alpha: Some(capped_alpha),
                                 confidence: Some(seg.confidence),
                                 ..Default::default()
                             }) {
@@ -909,11 +921,14 @@ async fn handle_command(
                     ctx.interface.display_status("No retrieved segments to correct (no knowledge was used in the last response).");
                 } else {
                     let mut updated = 0;
+                    const MAX_BAYES_PARAM: f32 = 100.0;
                     for id in &retrieved {
                         if let Ok(Some(mut seg)) = ctx.store.get_raw(*id) {
                             seg.record_negative_feedback();
+                            // Cap beta to prevent runaway accumulation.
+                            let capped_beta = seg.beta.min(MAX_BAYES_PARAM);
                             if let Err(e) = ctx.store.update_meta(*id, animus_vectorfs::SegmentUpdate {
-                                beta: Some(seg.beta),
+                                beta: Some(capped_beta),
                                 confidence: Some(seg.confidence),
                                 ..Default::default()
                             }) {
@@ -949,12 +964,24 @@ async fn handle_command(
                 match matches.len() {
                     0 => ctx.interface.display_status(&format!("No segment found matching '{prefix}'")),
                     1 => {
+                        const MAX_TAG_COUNT: usize = 50;
+                        const MAX_TAG_BYTES: usize = 256;
+                        if key.len() > MAX_TAG_BYTES || value.len() > MAX_TAG_BYTES {
+                            ctx.interface.display_status(&format!(
+                                "Tag key or value too long (max {MAX_TAG_BYTES} bytes)"
+                            ));
+                        } else {
                         let id = *matches[0];
                         // Get current tags, add the new one
                         let mut tags = match ctx.store.get_raw(id)? {
                             Some(seg) => seg.tags,
                             None => std::collections::HashMap::new(),
                         };
+                        if tags.len() >= MAX_TAG_COUNT && !tags.contains_key(&key) {
+                            ctx.interface.display_status(&format!(
+                                "Segment already has {MAX_TAG_COUNT} tags — remove one first"
+                            ));
+                        } else {
                         tags.insert(key.clone(), value.clone());
                         ctx.store.update_meta(id, animus_vectorfs::SegmentUpdate {
                             tags: Some(tags),
@@ -964,6 +991,8 @@ async fn handle_command(
                             "Tagged segment {} with {key}={value}",
                             id.0.to_string().get(..8).unwrap_or("?")
                         ));
+                        } // end cap check
+                        } // end key/value length check
                     }
                     n => ctx.interface.display_status(&format!(
                         "{n} segments match '{prefix}' — be more specific"
