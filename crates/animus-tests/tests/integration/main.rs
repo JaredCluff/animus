@@ -28,3 +28,5 @@ mod federation_knowledge;
 mod federation_e2e;
 mod quality_gate;
 mod thompson_sampling;
+mod tool_use;
+mod engine_registry;

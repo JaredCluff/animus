@@ -31,7 +31,7 @@ pub enum GoalSource {
 }
 
 /// Autonomy level — how much freedom the AILF has with this goal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Autonomy {
     Inform,
     Suggest,
