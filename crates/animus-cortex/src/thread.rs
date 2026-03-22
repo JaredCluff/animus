@@ -1,6 +1,7 @@
-use animus_core::error::Result;
+use animus_core::error::{AnimusError, Result};
 use animus_core::identity::{GoalId, SegmentId, ThreadId};
 use animus_core::segment::{Content, Segment, Source};
+use animus_core::threading::{ThreadStatus, Signal};
 use animus_mnemos::assembler::{AssembledContext, ContextAssembler};
 use animus_vectorfs::VectorStore;
 use std::collections::HashSet;
@@ -27,6 +28,10 @@ pub struct ReasoningThread<S: VectorStore> {
     /// Embedding dimensionality (for creating placeholder embeddings).
     #[allow(dead_code)]
     embedding_dim: usize,
+    /// Current thread status.
+    status: ThreadStatus,
+    /// Pending inter-thread signals (inbox).
+    pending_signals: Vec<Signal>,
 }
 
 impl<S: VectorStore> ReasoningThread<S> {
@@ -46,6 +51,8 @@ impl<S: VectorStore> ReasoningThread<S> {
             store,
             assembler,
             embedding_dim,
+            status: ThreadStatus::Active,
+            pending_signals: Vec::new(),
         }
     }
 
@@ -166,5 +173,39 @@ impl<S: VectorStore> ReasoningThread<S> {
     /// Get stored turn segment IDs.
     pub fn stored_turn_ids(&self) -> &[SegmentId] {
         &self.stored_turn_ids
+    }
+
+    /// Get the current thread status.
+    pub fn status(&self) -> ThreadStatus {
+        self.status
+    }
+
+    /// Set thread status, validating the transition.
+    pub fn set_status(&mut self, status: ThreadStatus) -> Result<()> {
+        if !self.status.can_transition_to(status) {
+            return Err(AnimusError::Threading(format!(
+                "invalid status transition from {:?} to {:?}",
+                self.status, status
+            )));
+        }
+        self.status = status;
+        Ok(())
+    }
+
+    /// Deliver a signal to this thread's inbox.
+    pub fn deliver_signal(&mut self, signal: Signal) {
+        self.pending_signals.push(signal);
+    }
+
+    /// Get pending signals.
+    pub fn pending_signals(&self) -> &[Signal] {
+        &self.pending_signals
+    }
+
+    /// Drain all pending signals, sorted by priority (Urgent first).
+    pub fn drain_signals(&mut self) -> Vec<Signal> {
+        let mut signals: Vec<Signal> = self.pending_signals.drain(..).collect();
+        signals.sort_by(|a, b| b.priority.cmp(&a.priority));
+        signals
     }
 }
