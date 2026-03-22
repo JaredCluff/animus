@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use crate::index::HnswIndex;
 use crate::{SegmentUpdate, VectorStore};
 
+/// Maximum serialized segment size: 64 MiB.
+const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// File-backed VectorStore using bincode-serialized segment files and HNSW index.
 pub struct MmapVectorStore {
     /// Base directory for storage.
@@ -35,6 +38,15 @@ impl MmapVectorStore {
             let entry = entry?;
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "bin") {
+                let metadata = fs::metadata(&path)?;
+                if metadata.len() > MAX_SEGMENT_BYTES {
+                    tracing::warn!(
+                        "segment file too large ({} bytes), skipping: {}",
+                        metadata.len(),
+                        path.display()
+                    );
+                    continue;
+                }
                 let data = fs::read(&path)?;
                 match bincode::deserialize::<Segment>(&data) {
                     Ok(segment) => {
@@ -65,24 +77,23 @@ impl MmapVectorStore {
         })
     }
 
-    /// Flush all segments to disk.
+    /// Flush all segments to disk using atomic writes.
     pub fn flush(&self) -> Result<()> {
         let segments = self.segments.read();
-        let segments_dir = self.base_dir.join("segments");
-        for (id, segment) in segments.iter() {
-            let path = segments_dir.join(format!("{}.bin", id.0));
-            let data = bincode::serialize(segment)?;
-            fs::write(&path, &data)?;
+        for segment in segments.values() {
+            self.persist_segment(segment)?;
         }
         Ok(())
     }
 
-    /// Write a single segment to disk.
+    /// Write a single segment to disk atomically (write-to-temp-then-rename).
     fn persist_segment(&self, segment: &Segment) -> Result<()> {
         let segments_dir = self.base_dir.join("segments");
-        let path = segments_dir.join(format!("{}.bin", segment.id.0));
+        let final_path = segments_dir.join(format!("{}.bin", segment.id.0));
+        let tmp_path = segments_dir.join(format!("{}.bin.tmp", segment.id.0));
         let data = bincode::serialize(segment)?;
-        fs::write(&path, &data)?;
+        fs::write(&tmp_path, &data)?;
+        fs::rename(&tmp_path, &final_path)?;
         Ok(())
     }
 
@@ -108,9 +119,18 @@ impl VectorStore for MmapVectorStore {
             });
         }
 
+        // Reject NaN/Inf embeddings
+        if segment.embedding.iter().any(|v| !v.is_finite()) {
+            return Err(AnimusError::Storage(
+                "embedding contains NaN or Inf values".to_string(),
+            ));
+        }
+
         let id = segment.id;
-        self.index.insert(id, &segment.embedding)?;
+        // Persist to disk first — if this fails, no in-memory state is modified.
+        // If HNSW insert fails after persist, the orphan file is benign (reloaded on restart).
         self.persist_segment(&segment)?;
+        self.index.insert(id, &segment.embedding)?;
         self.segments.write().insert(id, segment);
         Ok(id)
     }
@@ -123,7 +143,7 @@ impl VectorStore for MmapVectorStore {
     ) -> Result<Vec<Segment>> {
         // Search more than top_k in case some get filtered by tier
         let search_k = if tier_filter.is_some() {
-            top_k * 3
+            top_k.saturating_mul(3)
         } else {
             top_k
         };
@@ -145,12 +165,23 @@ impl VectorStore for MmapVectorStore {
             .take(top_k)
             .collect();
 
-        // Record access on returned segments
+        // Record access on returned segments and persist
         drop(segments);
         let mut segments = self.segments.write();
         for result in &results {
             if let Some(seg) = segments.get_mut(&result.id) {
                 seg.record_access();
+            }
+        }
+        // Persist access metadata updates
+        let to_persist: Vec<Segment> = results
+            .iter()
+            .filter_map(|r| segments.get(&r.id).cloned())
+            .collect();
+        drop(segments);
+        for seg in &to_persist {
+            if let Err(e) = self.persist_segment(seg) {
+                tracing::warn!("failed to persist access update for {}: {e}", seg.id);
             }
         }
 
@@ -161,7 +192,12 @@ impl VectorStore for MmapVectorStore {
         let mut segments = self.segments.write();
         if let Some(seg) = segments.get_mut(&id) {
             seg.record_access();
-            Ok(Some(seg.clone()))
+            let cloned = seg.clone();
+            drop(segments);
+            if let Err(e) = self.persist_segment(&cloned) {
+                tracing::warn!("failed to persist access update for {id}: {e}");
+            }
+            Ok(Some(cloned))
         } else {
             Ok(None)
         }
@@ -219,7 +255,9 @@ impl VectorStore for MmapVectorStore {
         let merged_id = self.store(merged)?;
 
         for id in source_ids {
-            let _ = self.delete(id);
+            if let Err(e) = self.delete(id) {
+                tracing::warn!("merge: failed to delete source segment {id}: {e}");
+            }
         }
 
         Ok(merged_id)

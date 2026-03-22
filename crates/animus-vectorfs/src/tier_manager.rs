@@ -41,14 +41,18 @@ impl<S: VectorStore> TierManager<S> {
                             .max(0) as u64;
                         if age_secs >= self.config.cold_delay_secs {
                             tracing::debug!("demoting segment {} to Cold (score={score:.3})", id);
-                            let _ = self.store.set_tier(id, Tier::Cold);
+                            if let Err(e) = self.store.set_tier(id, Tier::Cold) {
+                                tracing::warn!("failed to demote segment {id}: {e}");
+                            }
                         }
                     }
                 }
                 Tier::Cold => {
                     if score >= self.config.warm_threshold {
                         tracing::debug!("promoting segment {} to Warm (score={score:.3})", id);
-                        let _ = self.store.set_tier(id, Tier::Warm);
+                        if let Err(e) = self.store.set_tier(id, Tier::Warm) {
+                            tracing::warn!("failed to promote segment {id}: {e}");
+                        }
                     }
                 }
                 Tier::Hot => {} // filtered above
