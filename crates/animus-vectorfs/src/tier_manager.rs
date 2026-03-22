@@ -13,6 +13,16 @@ pub struct TierManager<S: VectorStore> {
 
 impl<S: VectorStore> TierManager<S> {
     pub fn new(store: Arc<S>, config: TierConfig) -> Self {
+        // Guard against inverted thresholds that would cause infinite oscillation.
+        if config.warm_threshold <= config.cold_threshold {
+            tracing::warn!(
+                "TierConfig warm_threshold ({}) <= cold_threshold ({}); \
+                 segments may oscillate between tiers every cycle. \
+                 warm_threshold should be greater than cold_threshold.",
+                config.warm_threshold,
+                config.cold_threshold
+            );
+        }
         Self { store, config }
     }
 

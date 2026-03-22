@@ -248,15 +248,20 @@ impl MmapVectorStore {
                             );
                             continue;
                         }
-                        // Only insert into the HNSW index if this segment ID is not
-                        // already present — duplicate insertions corrupt top_k counts.
-                        let already_exists = self.segments.read().contains_key(&segment.id);
-                        if !already_exists {
-                            self.index.insert(segment.id, &segment.embedding)?;
-                        }
+                        // Persist to disk before acquiring the write lock (I/O outside lock).
                         self.persist_segment(&segment)?;
-                        self.segments.write().insert(segment.id, segment);
-                        count += 1;
+                        // Hold the write lock for the entire check+HNSW-insert+map-insert
+                        // to prevent a TOCTOU race with concurrent store() calls.
+                        {
+                            let mut segs = self.segments.write();
+                            if !segs.contains_key(&segment.id) {
+                                self.index.insert(segment.id, &segment.embedding)?;
+                                segs.insert(segment.id, segment);
+                                count += 1;
+                            }
+                            // If already present, the disk file was refreshed above but
+                            // in-memory state is preserved; no HNSW insertion needed.
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("Skipping corrupt snapshot segment {}: {e}", path.display());

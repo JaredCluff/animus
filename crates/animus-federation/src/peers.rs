@@ -71,12 +71,22 @@ impl PeerRegistry {
     }
 
     pub fn add_peer(&mut self, info: PeerInfo) {
+        /// Maximum number of peers tracked in the registry.
+        const MAX_PEERS: usize = 1000;
         let persist = PeerInfoPersist::from(&info);
         // If the peer already exists (e.g. mDNS rediscovery after reconnect), preserve
         // trust level and accumulated statistics rather than resetting them to defaults.
         if let Some(existing) = self.peers.get_mut(&info.instance_id) {
             existing.info = persist;
             existing.last_seen = Utc::now();
+            return;
+        }
+        // Cap registry size to prevent unbounded growth from mDNS spoofing.
+        if self.peers.len() >= MAX_PEERS {
+            tracing::warn!(
+                "Peer registry at capacity ({MAX_PEERS}), ignoring new peer {}",
+                info.instance_id
+            );
             return;
         }
         let peer = Peer {

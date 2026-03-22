@@ -188,16 +188,20 @@ pub async fn boot_reconstitution<S: VectorStore>(
 ) -> Result<Option<String>> {
     let shutdown_segment = find_shutdown_segment(store);
 
+    let now = Utc::now();
     let shutdown_time = shutdown_segment
         .as_ref()
         .map(|s| s.created)
-        .unwrap_or_else(|| Utc::now() - Duration::hours(24));
+        .unwrap_or_else(|| now - Duration::hours(24));
 
-    let downtime = Utc::now() - shutdown_time;
+    let downtime = now - shutdown_time;
 
+    // On cold boot (no shutdown segment), use `now` as the `before` bound so that
+    // recent segments from the current session are included in the context window.
+    let gather_before = if shutdown_segment.is_some() { shutdown_time } else { now };
     let recent_segments = gather_recent_segments(
         store,
-        shutdown_time,
+        gather_before,
         Duration::minutes(30),
     );
 
