@@ -161,7 +161,7 @@ pub fn gather_recent_segments<S: VectorStore>(
 
     for id in all_ids {
         if let Ok(Some(seg)) = store.get_raw(id) {
-            if seg.created >= cutoff && seg.created <= before {
+            if seg.created >= cutoff && seg.created < before {
                 // Skip reconstitution segments themselves
                 if seg.tags.contains_key("reconstitution") {
                     continue;

@@ -353,11 +353,15 @@ async fn handle_handshake<S: VectorStore + 'static>(
                 counter_nonce,
                 initiator_vk_hex: request.verifying_key_hex.clone(),
             };
-            state
-                .pending_handshakes
-                .lock()
-                .await
-                .insert(request.instance_id, pending);
+            let mut handshakes = state.pending_handshakes.lock().await;
+            if handshakes.len() >= 500 {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many pending handshakes — try again later",
+                );
+            }
+            handshakes.insert(request.instance_id, pending);
+            drop(handshakes);
 
             json_response(StatusCode::OK, &response)
         }
@@ -562,6 +566,30 @@ async fn handle_publish<S: VectorStore + 'static>(
         segment = %announcement.segment_id,
         "Received segment announcement"
     );
+
+    // Validate embedding dimensionality before allocating into the store.
+    let expected_dim = state.store.segment_ids(None).first()
+        .and_then(|id| state.store.get_raw(*id).ok().flatten())
+        .map(|s| s.embedding.len());
+    if let Some(dim) = expected_dim {
+        if announcement.embedding.len() != dim {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "embedding dimension mismatch: expected {dim}, got {}",
+                    announcement.embedding.len()
+                ),
+            );
+        }
+    }
+    // Cap incoming embeddings to a sane maximum (prevent DoS via huge vectors).
+    const MAX_EMBEDDING_DIM: usize = 8192;
+    if announcement.embedding.len() > MAX_EMBEDDING_DIM {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("embedding too large: {} > {MAX_EMBEDDING_DIM}", announcement.embedding.len()),
+        );
+    }
 
     // Store a federation-sourced segment with the announced embedding
     let mut segment = animus_core::Segment::new(

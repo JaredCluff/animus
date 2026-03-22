@@ -218,7 +218,12 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         reg
     };
     let tool_definitions = tool_registry.definitions();
-    let tool_ctx = ToolContext { data_dir: data_dir.clone() };
+    let tool_ctx = ToolContext {
+        data_dir: data_dir.clone(),
+        store: store.clone() as std::sync::Arc<dyn animus_vectorfs::VectorStore>,
+        embedder: embedder.clone(),
+        signal_tx: Some(signal_tx.clone()),
+    };
     tracing::info!("{} tools registered", tool_definitions.len());
 
     // Initialize quality tracker

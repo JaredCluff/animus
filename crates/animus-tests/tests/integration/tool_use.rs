@@ -1,6 +1,23 @@
 use animus_cortex::tools::{self, ToolRegistry, check_autonomy, AutonomyDecision, Tool, ToolContext};
 use animus_cortex::telos::Autonomy;
 use animus_cortex::{TurnContent, Turn, Role, StopReason, ReasoningOutput, ToolCall};
+use animus_vectorfs::store::MmapVectorStore;
+use animus_embed::synthetic::SyntheticEmbedding;
+use std::sync::Arc;
+
+/// Build a minimal ToolContext suitable for unit tests.
+fn test_ctx(dir: &std::path::Path) -> ToolContext {
+    let store_dir = dir.join("vectorfs");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let store = Arc::new(MmapVectorStore::open(&store_dir, 4).unwrap());
+    let embedder = Arc::new(SyntheticEmbedding::new(4));
+    ToolContext {
+        data_dir: dir.to_path_buf(),
+        store: store as Arc<dyn animus_vectorfs::VectorStore>,
+        embedder: embedder as Arc<dyn animus_core::EmbeddingService>,
+        signal_tx: None,
+    }
+}
 
 #[test]
 fn test_tool_registry_definitions_generated() {
@@ -46,8 +63,9 @@ fn test_autonomy_gating_logic() {
 
 #[tokio::test]
 async fn test_read_file_tool_reads_existing_file() {
+    let tmp = tempfile::tempdir().unwrap();
     let tool = tools::read_file::ReadFileTool;
-    let ctx = ToolContext { data_dir: std::path::PathBuf::from("/tmp") };
+    let ctx = test_ctx(tmp.path());
     let result = tool.execute(serde_json::json!({
         "path": "/etc/hostname"
     }), &ctx).await;
@@ -61,8 +79,9 @@ async fn test_read_file_tool_reads_existing_file() {
 
 #[tokio::test]
 async fn test_read_file_tool_handles_missing_file() {
+    let tmp = tempfile::tempdir().unwrap();
     let tool = tools::read_file::ReadFileTool;
-    let ctx = ToolContext { data_dir: std::path::PathBuf::from("/tmp") };
+    let ctx = test_ctx(tmp.path());
     let result = tool.execute(serde_json::json!({
         "path": "/nonexistent/path/file.txt"
     }), &ctx).await.unwrap();
