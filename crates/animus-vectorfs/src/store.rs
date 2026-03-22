@@ -310,13 +310,17 @@ impl VectorStore for MmapVectorStore {
         // Persist to disk first — if this fails, no in-memory state is modified.
         // If HNSW insert fails after persist, the orphan file is benign (reloaded on restart).
         self.persist_segment(&segment)?;
-        // Only insert into the HNSW index if this ID is not already present —
-        // duplicate HNSW entries corrupt top_k counts.
-        let already_exists = self.segments.read().contains_key(&id);
-        if !already_exists {
-            self.index.insert(id, &segment.embedding)?;
+        // Hold the write lock for the entire check+HNSW-insert+map-insert to prevent
+        // a TOCTOU race: without this, two concurrent store() calls for the same ID
+        // could both pass the contains_key check and both insert into HNSW, corrupting
+        // top_k counts.
+        {
+            let mut segments = self.segments.write();
+            if !segments.contains_key(&id) {
+                self.index.insert(id, &segment.embedding)?;
+            }
+            segments.insert(id, segment);
         }
-        self.segments.write().insert(id, segment);
         Ok(id)
     }
 
@@ -326,6 +330,14 @@ impl VectorStore for MmapVectorStore {
         top_k: usize,
         tier_filter: Option<Tier>,
     ) -> Result<Vec<Segment>> {
+        // Reject non-finite query embeddings — NaN/Inf in the query vector would
+        // produce undefined distance values in the HNSW search, corrupting results.
+        if embedding.iter().any(|v| !v.is_finite()) {
+            return Err(AnimusError::Storage(
+                "query embedding contains NaN or Inf values".to_string(),
+            ));
+        }
+
         // Search more than top_k in case some get filtered by tier
         let search_k = if tier_filter.is_some() {
             top_k.saturating_mul(3)
