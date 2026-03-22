@@ -23,7 +23,17 @@ impl Tool for ShellExecTool {
         let command = params["command"].as_str().ok_or("missing 'command' parameter")?;
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(command);
-        if let Some(dir) = params["working_dir"].as_str() { cmd.current_dir(dir); }
+        if let Some(dir) = params["working_dir"].as_str() {
+            use std::path::{Component, Path};
+            let p = Path::new(dir);
+            if !p.is_absolute() {
+                return Ok(ToolResult { content: "working_dir must be absolute".to_string(), is_error: true });
+            }
+            if p.components().any(|c| matches!(c, Component::ParentDir)) {
+                return Ok(ToolResult { content: "path traversal not allowed in working_dir".to_string(), is_error: true });
+            }
+            cmd.current_dir(p);
+        }
         match cmd.output().await {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
