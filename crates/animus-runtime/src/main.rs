@@ -178,18 +178,16 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
         // Handle slash commands
         if input.starts_with('/') {
-            match handle_command(
-                &input,
-                &store,
-                &mut goals,
-                &goals_path,
-                &interface,
-                &embedder,
-                &data_dir,
-                &mut scheduler,
-            )
-            .await?
-            {
+            let mut ctx = CommandContext {
+                store: &store,
+                goals: &mut goals,
+                goals_path: &goals_path,
+                interface: &interface,
+                embedder: &embedder,
+                data_dir: &data_dir,
+                scheduler: &mut scheduler,
+            };
+            match handle_command(&input, &mut ctx).await? {
                 CommandResult::Continue => continue,
                 CommandResult::Quit => break,
             }
@@ -250,15 +248,19 @@ enum CommandResult {
     Quit,
 }
 
+struct CommandContext<'a> {
+    store: &'a Arc<MmapVectorStore>,
+    goals: &'a mut GoalManager,
+    goals_path: &'a std::path::Path,
+    interface: &'a TerminalInterface,
+    embedder: &'a dyn animus_core::EmbeddingService,
+    data_dir: &'a std::path::Path,
+    scheduler: &'a mut ThreadScheduler<MmapVectorStore>,
+}
+
 async fn handle_command(
     input: &str,
-    store: &Arc<MmapVectorStore>,
-    goals: &mut GoalManager,
-    goals_path: &std::path::Path,
-    interface: &TerminalInterface,
-    embedder: &dyn animus_core::EmbeddingService,
-    data_dir: &std::path::Path,
-    scheduler: &mut ThreadScheduler<MmapVectorStore>,
+    ctx: &mut CommandContext<'_>,
 ) -> animus_core::Result<CommandResult> {
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -269,22 +271,22 @@ async fn handle_command(
             return Ok(CommandResult::Quit);
         }
         "/status" => {
-            let total = store.count(None);
-            let warm = store.count(Some(animus_core::Tier::Warm));
-            let cold = store.count(Some(animus_core::Tier::Cold));
-            let hot = store.count(Some(animus_core::Tier::Hot));
-            interface.display_status(&format!(
+            let total = ctx.store.count(None);
+            let warm = ctx.store.count(Some(animus_core::Tier::Warm));
+            let cold = ctx.store.count(Some(animus_core::Tier::Cold));
+            let hot = ctx.store.count(Some(animus_core::Tier::Hot));
+            ctx.interface.display_status(&format!(
                 "Segments: {total} total ({hot} hot, {warm} warm, {cold} cold)"
             ));
-            interface.display_status(&format!("Goals: {} active", goals.active_goals().len()));
+            ctx.interface.display_status(&format!("Goals: {} active", ctx.goals.active_goals().len()));
         }
         "/goals" => {
-            let active = goals.active_goals();
+            let active = ctx.goals.active_goals();
             if active.is_empty() {
-                interface.display_status("No active goals.");
+                ctx.interface.display_status("No active goals.");
             } else {
                 for goal in active {
-                    interface.display_status(&format!(
+                    ctx.interface.display_status(&format!(
                         "[{:?}] {} ({})",
                         goal.priority,
                         goal.description,
@@ -294,9 +296,9 @@ async fn handle_command(
             }
         }
         "/goal" if !arg.is_empty() => {
-            let id = goals.create_goal(arg.to_string(), GoalSource::Human, Priority::Normal);
-            goals.save(goals_path)?;
-            interface.display_status(&format!(
+            let id = ctx.goals.create_goal(arg.to_string(), GoalSource::Human, Priority::Normal);
+            ctx.goals.save(ctx.goals_path)?;
+            ctx.interface.display_status(&format!(
                 "Goal created: {}",
                 id.0.to_string().get(..8).unwrap_or("?")
             ));
@@ -304,7 +306,7 @@ async fn handle_command(
         "/remember" if !arg.is_empty() => {
             use animus_core::segment::{Content, Segment, Source};
             use animus_core::EventId;
-            let embedding = embedder.embed_text(arg).await?;
+            let embedding = ctx.embedder.embed_text(arg).await?;
             let segment = Segment::new(
                 Content::Text(arg.to_string()),
                 embedding,
@@ -313,8 +315,8 @@ async fn handle_command(
                     raw_event_id: EventId::new(),
                 },
             );
-            let id = store.store(segment)?;
-            interface.display_status(&format!(
+            let id = ctx.store.store(segment)?;
+            ctx.interface.display_status(&format!(
                 "Remembered: {} (segment {})",
                 arg,
                 id.0.to_string().get(..8).unwrap_or("?")
@@ -322,29 +324,29 @@ async fn handle_command(
         }
         "/forget" if !arg.is_empty() => {
             // Match segment by ID prefix
-            let all_ids = store.segment_ids(None);
+            let all_ids = ctx.store.segment_ids(None);
             let matches: Vec<_> = all_ids
                 .iter()
                 .filter(|id| id.0.to_string().starts_with(arg))
                 .collect();
             match matches.len() {
-                0 => interface.display_status(&format!("No segment found matching '{arg}'")),
+                0 => ctx.interface.display_status(&format!("No segment found matching '{arg}'")),
                 1 => {
                     let id = *matches[0];
-                    store.delete(id)?;
-                    interface.display_status(&format!(
+                    ctx.store.delete(id)?;
+                    ctx.interface.display_status(&format!(
                         "Forgotten: segment {}",
                         id.0.to_string().get(..8).unwrap_or("?")
                     ));
                 }
-                n => interface.display_status(&format!(
+                n => ctx.interface.display_status(&format!(
                     "{n} segments match '{arg}' — be more specific"
                 )),
             }
         }
         "/sensorium" => {
             let audit_entries = animus_sensorium::audit::AuditTrail::read_all(
-                &data_dir.join("sensorium-audit.jsonl"),
+                &ctx.data_dir.join("sensorium-audit.jsonl"),
             )
             .ok()
             .unwrap_or_default();
@@ -357,33 +359,33 @@ async fn handle_command(
                 .iter()
                 .filter(|e| e.action_taken == AuditAction::Promoted)
                 .count();
-            interface.display_status(&format!(
+            ctx.interface.display_status(&format!(
                 "Sensorium: {total} events observed, {permitted} permitted, {promoted} promoted"
             ));
         }
         "/watch" if !arg.is_empty() => {
             let watch_path = std::path::PathBuf::from(arg);
             if !watch_path.exists() {
-                interface.display_status(&format!("Path does not exist: {arg}"));
+                ctx.interface.display_status(&format!("Path does not exist: {arg}"));
             } else {
-                interface.display_status(&format!(
+                ctx.interface.display_status(&format!(
                     "Watch path noted: {arg}. File watching will be available in a future update."
                 ));
             }
         }
         "/consent" => {
             let loaded = animus_sensorium::policy_store::PolicyStore::load(
-                &data_dir.join("consent-policies.json"),
+                &ctx.data_dir.join("consent-policies.json"),
             )
             .ok()
             .unwrap_or_default();
             if loaded.is_empty() {
-                interface
+                ctx.interface
                     .display_status("No consent policies defined. Use /consent-add to create one.");
             } else {
                 for policy in &loaded {
                     let status = if policy.active { "active" } else { "inactive" };
-                    interface.display_status(&format!(
+                    ctx.interface.display_status(&format!(
                         "[{}] {} — {} rules ({})",
                         policy.id.0.to_string().get(..8).unwrap_or("?"),
                         policy.name,
@@ -394,13 +396,13 @@ async fn handle_command(
             }
         }
         "/threads" => {
-            let threads = scheduler.list_threads();
+            let threads = ctx.scheduler.list_threads();
             if threads.is_empty() {
-                interface.display_status("No threads.");
+                ctx.interface.display_status("No threads.");
             } else {
                 for (id, name, status) in &threads {
-                    let active_marker = if Some(*id) == scheduler.active_thread_id() { " *" } else { "" };
-                    interface.display_status(&format!(
+                    let active_marker = if Some(*id) == ctx.scheduler.active_thread_id() { " *" } else { "" };
+                    ctx.interface.display_status(&format!(
                         "[{}] {} ({:?}){}",
                         id.0.to_string().get(..8).unwrap_or("?"),
                         name,
@@ -413,10 +415,10 @@ async fn handle_command(
         "/thread" if arg.starts_with("new ") => {
             let name = arg.strip_prefix("new ").unwrap().trim();
             if name.is_empty() {
-                interface.display_status("Usage: /thread new <name>");
+                ctx.interface.display_status("Usage: /thread new <name>");
             } else {
-                let id = scheduler.create_thread(name.to_string());
-                interface.display_status(&format!(
+                let id = ctx.scheduler.create_thread(name.to_string());
+                ctx.interface.display_status(&format!(
                     "Thread created: {} ({})",
                     name,
                     id.0.to_string().get(..8).unwrap_or("?")
@@ -425,52 +427,52 @@ async fn handle_command(
         }
         "/thread" if arg.starts_with("switch ") => {
             let prefix = arg.strip_prefix("switch ").unwrap().trim();
-            let threads = scheduler.list_threads();
+            let threads = ctx.scheduler.list_threads();
             let matches: Vec<_> = threads.iter()
                 .filter(|(id, _, _)| id.0.to_string().starts_with(prefix))
                 .collect();
             match matches.len() {
-                0 => interface.display_status(&format!("No thread found matching '{prefix}'")),
+                0 => ctx.interface.display_status(&format!("No thread found matching '{prefix}'")),
                 1 => {
                     let (id, name, _) = matches[0];
-                    scheduler.switch_to(*id)?;
-                    interface.display_status(&format!("Switched to thread: {name}"));
+                    ctx.scheduler.switch_to(*id)?;
+                    ctx.interface.display_status(&format!("Switched to thread: {name}"));
                 }
-                n => interface.display_status(&format!("{n} threads match '{prefix}' — be more specific")),
+                n => ctx.interface.display_status(&format!("{n} threads match '{prefix}' — be more specific")),
             }
         }
         "/thread" if arg.starts_with("complete ") => {
             let prefix = arg.strip_prefix("complete ").unwrap().trim();
-            let threads = scheduler.list_threads();
+            let threads = ctx.scheduler.list_threads();
             let matches: Vec<_> = threads.iter()
                 .filter(|(id, _, _)| id.0.to_string().starts_with(prefix))
                 .collect();
             match matches.len() {
-                0 => interface.display_status(&format!("No thread found matching '{prefix}'")),
+                0 => ctx.interface.display_status(&format!("No thread found matching '{prefix}'")),
                 1 => {
                     let (id, name, _) = matches[0];
-                    scheduler.complete(*id)?;
-                    interface.display_status(&format!("Thread completed: {name}"));
+                    ctx.scheduler.complete(*id)?;
+                    ctx.interface.display_status(&format!("Thread completed: {name}"));
                 }
-                n => interface.display_status(&format!("{n} threads match '{prefix}' — be more specific")),
+                n => ctx.interface.display_status(&format!("{n} threads match '{prefix}' — be more specific")),
             }
         }
         "/help" => {
-            interface.display("/goals         — list active goals");
-            interface.display("/goal <text>   — create a new goal");
-            interface.display("/remember <text> — store knowledge explicitly");
-            interface.display("/forget <id>   — remove a stored segment by ID prefix");
-            interface.display("/status        — show system status");
-            interface.display("/sensorium     — show observation stats");
-            interface.display("/consent       — list consent policies");
-            interface.display("/threads         — list reasoning threads");
-            interface.display("/thread new <n>  — create a new thread");
-            interface.display("/thread switch <id> — switch to a thread");
-            interface.display("/thread complete <id> — mark thread completed");
-            interface.display("/quit          — end session");
+            ctx.interface.display("/goals         — list active goals");
+            ctx.interface.display("/goal <text>   — create a new goal");
+            ctx.interface.display("/remember <text> — store knowledge explicitly");
+            ctx.interface.display("/forget <id>   — remove a stored segment by ID prefix");
+            ctx.interface.display("/status        — show system status");
+            ctx.interface.display("/sensorium     — show observation stats");
+            ctx.interface.display("/consent       — list consent policies");
+            ctx.interface.display("/threads         — list reasoning threads");
+            ctx.interface.display("/thread new <n>  — create a new thread");
+            ctx.interface.display("/thread switch <id> — switch to a thread");
+            ctx.interface.display("/thread complete <id> — mark thread completed");
+            ctx.interface.display("/quit          — end session");
         }
         _ => {
-            interface.display_status(&format!(
+            ctx.interface.display_status(&format!(
                 "Unknown command: {cmd}. Type /help for available commands."
             ));
         }
