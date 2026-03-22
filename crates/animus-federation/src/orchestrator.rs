@@ -9,6 +9,9 @@ use tokio::sync::mpsc;
 
 use crate::auth::FederationAuth;
 use crate::discovery::{DiscoveryEvent, DiscoveryService};
+use crate::knowledge::{
+    FederationPermission, FederationPolicy, FederationRule, FederationScope, KnowledgeSharing,
+};
 use crate::peers::PeerRegistry;
 use crate::server::FederationServer;
 
@@ -95,15 +98,27 @@ impl<S: VectorStore + Send + Sync + 'static> FederationOrchestrator<S> {
                 ))
             })?;
 
-        // Start the HTTP server.
-        // The server gets its own FederationAuth and a fresh PeerRegistry.
-        // Peers discovered via handshakes are managed by the server internally;
-        // peers discovered via mDNS are managed by the orchestrator's registry.
+        // Start the HTTP server with the shared peer registry (H4 fix).
+        // Both the server and orchestrator share the same PeerRegistry via Arc.
         let server_auth = FederationAuth::new(self.identity.clone());
+        let knowledge = KnowledgeSharing::new(
+            vec![FederationPolicy {
+                id: animus_core::PolicyId::new(),
+                name: "default-federation".to_string(),
+                active: true,
+                publish_rules: vec![FederationRule {
+                    scope: FederationScope::AllNonPrivate,
+                    permission: FederationPermission::Allow,
+                }],
+                subscribe_rules: vec![],
+            }],
+            self.config.relevance_threshold,
+        );
         let server = FederationServer::new(
             server_auth,
-            PeerRegistry::new(),
+            self.peers.clone(),
             self.store.clone(),
+            knowledge,
             self.config.max_requests_per_minute,
         );
 
