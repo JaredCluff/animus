@@ -37,6 +37,13 @@ impl Tool for WriteFileTool {
         let path = validate_path(path_str)
             .map_err(|e| format!("invalid path: {e}"))?;
         let content = params["content"].as_str().ok_or("missing 'content' parameter")?;
+        const MAX_WRITE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+        if content.len() > MAX_WRITE_BYTES {
+            return Ok(ToolResult {
+                content: format!("Content too large: {} bytes (max {} bytes)", content.len(), MAX_WRITE_BYTES),
+                is_error: true,
+            });
+        }
         if let Some(parent) = path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return Ok(ToolResult { content: format!("Error creating directory: {e}"), is_error: true });

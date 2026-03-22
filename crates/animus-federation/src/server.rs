@@ -29,10 +29,14 @@ struct AuthenticatedPeer {
     instance_id: InstanceId,
 }
 
+/// Handshakes older than this are expired and removed.
+const HANDSHAKE_TTL_SECS: u64 = 60;
+
 /// Data stored for a pending handshake (between handshake and confirm steps).
 struct PendingHandshake {
     counter_nonce: [u8; 32],
     initiator_vk_hex: String,
+    created_at: std::time::Instant,
 }
 
 /// Shared state accessible by all axum handlers.
@@ -349,17 +353,20 @@ async fn handle_handshake<S: VectorStore + 'static>(
 
     match state.auth.respond_to_handshake(&request) {
         Ok((response, counter_nonce)) => {
-            let pending = PendingHandshake {
-                counter_nonce,
-                initiator_vk_hex: request.verifying_key_hex.clone(),
-            };
             let mut handshakes = state.pending_handshakes.lock().await;
+            // Prune expired handshakes before checking the cap.
+            handshakes.retain(|_, h| h.created_at.elapsed().as_secs() < HANDSHAKE_TTL_SECS);
             if handshakes.len() >= 500 {
                 return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "too many pending handshakes — try again later",
                 );
             }
+            let pending = PendingHandshake {
+                counter_nonce,
+                initiator_vk_hex: request.verifying_key_hex.clone(),
+                created_at: std::time::Instant::now(),
+            };
             handshakes.insert(request.instance_id, pending);
             drop(handshakes);
 
