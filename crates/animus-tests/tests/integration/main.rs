@@ -16,3 +16,6 @@ mod sensorium_process_monitor;
 mod sensorium_policy_store;
 mod sensorium_orchestrator;
 mod sensorium_full_pipeline;
+mod threading_types;
+mod threading_signals;
+mod threading_scheduler;

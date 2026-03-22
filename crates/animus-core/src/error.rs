@@ -44,6 +44,9 @@ pub enum AnimusError {
     #[error("sensorium error: {0}")]
     Sensorium(String),
 
+    #[error("threading error: {0}")]
+    Threading(String),
+
     #[error("{0}")]
     Other(String),
 }
