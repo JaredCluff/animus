@@ -91,6 +91,8 @@ pub struct PerceptionLoop<S: VectorStore> {
     signal_tx: mpsc::Sender<Signal>,
     batch_window: Duration,
     max_batch_size: usize,
+    /// Stable identity for this loop, used as signal source.
+    source_id: ThreadId,
 }
 
 impl<S: VectorStore> PerceptionLoop<S> {
@@ -107,6 +109,7 @@ impl<S: VectorStore> PerceptionLoop<S> {
             signal_tx,
             batch_window: Duration::from_secs(2),
             max_batch_size: 10,
+            source_id: ThreadId::new(),
         }
     }
 
@@ -192,8 +195,8 @@ impl<S: VectorStore> PerceptionLoop<S> {
 
             if let Some(signal) = &perceived.signal {
                 let sig = Signal {
-                    source_thread: ThreadId::new(),
-                    target_thread: ThreadId::new(),
+                    source_thread: self.source_id,
+                    target_thread: ThreadId::default(),
                     priority: signal.priority,
                     summary: signal.reason.clone(),
                     segment_refs: vec![],

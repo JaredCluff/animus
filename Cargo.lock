@@ -58,6 +58,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "chrono",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

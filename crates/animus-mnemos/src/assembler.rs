@@ -153,7 +153,7 @@ fn thompson_sample(alpha: f32, beta: f32) -> f32 {
     }
     let mean = alpha / sum;
     let variance = (alpha * beta) / (sum * sum * (sum + 1.0));
-    let stddev = variance.sqrt();
+    let stddev = variance.max(0.0).sqrt();
 
     let noise: f32 = rand::thread_rng().gen_range(-1.0..1.0);
     // Scale noise by 2 stddevs for meaningful exploration

@@ -146,6 +146,8 @@ pub struct ReflectionLoop<S: VectorStore> {
     pub(crate) last_cycle: DateTime<Utc>,
     pub(crate) last_segment_count: usize,
     signaled_contradictions: HashSet<(SegmentId, SegmentId)>,
+    /// Stable identity for this loop, used as signal source.
+    source_id: ThreadId,
 }
 
 impl<S: VectorStore> ReflectionLoop<S> {
@@ -168,6 +170,7 @@ impl<S: VectorStore> ReflectionLoop<S> {
             last_cycle: Utc::now(),
             last_segment_count,
             signaled_contradictions: HashSet::new(),
+            source_id: ThreadId::new(),
         }
     }
 
@@ -284,8 +287,8 @@ impl<S: VectorStore> ReflectionLoop<S> {
             self.signaled_contradictions.insert(pair);
 
             let sig = Signal {
-                source_thread: ThreadId::new(),
-                target_thread: ThreadId::new(),
+                source_thread: self.source_id,
+                target_thread: ThreadId::default(),
                 priority: SignalPriority::Normal,
                 summary: format!(
                     "Contradiction detected: {}. Suggested resolution: {}",
@@ -303,8 +306,8 @@ impl<S: VectorStore> ReflectionLoop<S> {
         for update in output.goal_updates {
             if update.suggest_complete {
                 let sig = Signal {
-                    source_thread: ThreadId::new(),
-                    target_thread: ThreadId::new(),
+                    source_thread: self.source_id,
+                    target_thread: ThreadId::default(),
                     priority: SignalPriority::Normal,
                     summary: format!(
                         "Goal {} may be complete: {}",
@@ -322,8 +325,8 @@ impl<S: VectorStore> ReflectionLoop<S> {
         // Handle signals from reflection
         for signal in output.signals {
             let sig = Signal {
-                source_thread: ThreadId::new(),
-                target_thread: ThreadId::new(),
+                source_thread: self.source_id,
+                target_thread: ThreadId::default(),
                 priority: signal.priority,
                 summary: signal.insight,
                 segment_refs: signal.relevant_segments,

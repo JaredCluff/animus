@@ -3,6 +3,19 @@ use super::{Tool, ToolResult, ToolContext};
 
 pub struct WriteFileTool;
 
+/// Reject paths that are relative or contain parent-directory traversal.
+fn validate_path(path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, Path};
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err("path must be absolute".to_string());
+    }
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("path traversal not allowed".to_string());
+    }
+    Ok(p.to_path_buf())
+}
+
 #[async_trait::async_trait]
 impl Tool for WriteFileTool {
     fn name(&self) -> &str { "write_file" }
@@ -20,15 +33,17 @@ impl Tool for WriteFileTool {
     fn required_autonomy(&self) -> Autonomy { Autonomy::Act }
 
     async fn execute(&self, params: serde_json::Value, _ctx: &ToolContext) -> Result<ToolResult, String> {
-        let path = params["path"].as_str().ok_or("missing 'path' parameter")?;
+        let path_str = params["path"].as_str().ok_or("missing 'path' parameter")?;
+        let path = validate_path(path_str)
+            .map_err(|e| format!("invalid path: {e}"))?;
         let content = params["content"].as_str().ok_or("missing 'content' parameter")?;
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Some(parent) = path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return Ok(ToolResult { content: format!("Error creating directory: {e}"), is_error: true });
             }
         }
-        match tokio::fs::write(path, content).await {
-            Ok(()) => Ok(ToolResult { content: format!("Wrote {} bytes to {path}", content.len()), is_error: false }),
+        match tokio::fs::write(&path, content).await {
+            Ok(()) => Ok(ToolResult { content: format!("Wrote {} bytes to {}", content.len(), path.display()), is_error: false }),
             Err(e) => Ok(ToolResult { content: format!("Error writing file: {e}"), is_error: true }),
         }
     }

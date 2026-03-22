@@ -375,20 +375,24 @@ impl VectorStore for MmapVectorStore {
         if let Some(score) = update.relevance_score {
             seg.relevance_score = score;
         }
-        if let Some(conf) = update.confidence {
-            seg.confidence = conf;
-        }
         if let Some(assoc) = update.associations {
             seg.associations = assoc;
         }
         if let Some(tags) = update.tags {
             seg.tags = tags;
         }
+        let alpha_beta_changed = update.alpha.is_some() || update.beta.is_some();
         if let Some(alpha) = update.alpha {
             seg.alpha = alpha;
         }
         if let Some(beta) = update.beta {
             seg.beta = beta;
+        }
+        if alpha_beta_changed {
+            // Recompute confidence from updated alpha/beta to keep them in sync.
+            seg.confidence = seg.bayesian_confidence();
+        } else if let Some(conf) = update.confidence {
+            seg.confidence = conf;
         }
         if let Some(decay_class) = update.decay_class {
             seg.decay_class = decay_class;
