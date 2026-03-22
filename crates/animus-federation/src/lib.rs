@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod auth;
+pub mod client;
 pub mod discovery;
 pub mod knowledge;
 pub mod orchestrator;

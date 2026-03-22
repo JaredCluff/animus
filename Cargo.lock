@@ -65,6 +65,9 @@ version = "0.1.0"
 dependencies = [
  "animus-core",
  "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -127,6 +130,7 @@ dependencies = [
  "animus-sensorium",
  "animus-vectorfs",
  "bincode",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",
@@ -184,6 +188,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.5",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

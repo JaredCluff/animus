@@ -4,7 +4,7 @@ use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
 use animus_cortex::ReasoningEngine;
-use animus_embed::{OllamaEmbedding, SyntheticEmbedding};
+use animus_embed::{OllamaEmbedding, ResilientEmbedding, SyntheticEmbedding};
 use animus_federation::orchestrator::FederationOrchestrator;
 use animus_federation::peers::TrustLevel;
 use animus_interface::TerminalInterface;
@@ -87,11 +87,9 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     let (embedder, dimensionality): (Arc<dyn animus_core::EmbeddingService>, usize) =
         match OllamaEmbedding::probe(&ollama_url, &ollama_model).await {
             Ok(dim) => {
-                tracing::info!("Using Ollama embeddings ({ollama_model}, {dim} dims)");
-                (
-                    Arc::new(OllamaEmbedding::new(&ollama_url, &ollama_model, dim)),
-                    dim,
-                )
+                tracing::info!("Using Ollama embeddings ({ollama_model}, {dim} dims) with resilient fallback");
+                let ollama = OllamaEmbedding::new(&ollama_url, &ollama_model, dim);
+                (Arc::new(ResilientEmbedding::new(ollama, dim)), dim)
             }
             Err(e) => {
                 let dim = 128;
@@ -167,9 +165,17 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         }
     });
 
-    // File watcher is not started by default; enabled via /watch command in future updates
-    let _event_bus = event_bus; // retain for future use
-    let _orchestrator = orchestrator; // retain for future use
+    // Start network monitor sensor
+    let mut network_monitor = animus_sensorium::sensors::network_monitor::NetworkMonitor::new(
+        event_bus.clone(),
+        std::time::Duration::from_secs(30),
+    );
+    network_monitor.start();
+    tracing::info!("NetworkMonitor started (30s poll interval)");
+
+    // File watcher (started via /watch command)
+    let file_watcher: Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>> =
+        Arc::new(parking_lot::Mutex::new(None));
 
     tracing::info!("Sensorium initialized (use /consent to manage observation policies)");
 
@@ -188,6 +194,9 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     // Initialize goal manager
     let goals_path = data_dir.join("goals.bin");
     let mut goals = GoalManager::load(&goals_path)?;
+
+    // Compute initial goal embeddings for Tier 2 attention
+    update_goal_embeddings(&goals, &*embedder, &orchestrator).await;
 
     // Initialize thread scheduler
     let token_budget = 8000;
@@ -210,6 +219,30 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         tracing::info!("Federation disabled (default); use ANIMUS_FEDERATION=1 to enable");
         None
     };
+
+    // Start periodic memory consolidation (every 5 minutes)
+    let consolidation_store = store.clone();
+    tokio::spawn(async move {
+        let consolidator = animus_mnemos::consolidator::Consolidator::new(
+            consolidation_store,
+            0.85, // similarity threshold for merging
+        );
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            match consolidator.run_cycle() {
+                Ok(report) if report.segments_merged > 0 => {
+                    tracing::info!(
+                        "Consolidation: scanned {}, merged {} into {} new segments",
+                        report.segments_scanned,
+                        report.segments_merged,
+                        report.segments_created,
+                    );
+                }
+                Ok(_) => {} // nothing to consolidate
+                Err(e) => tracing::warn!("Consolidation cycle failed: {e}"),
+            }
+        }
+    });
 
     // Initialize terminal interface
     let interface = TerminalInterface::new(">> ".to_string());
@@ -238,6 +271,9 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                 data_dir: &data_dir,
                 scheduler: &mut scheduler,
                 federation: federation.as_ref(),
+                event_bus: &event_bus,
+                file_watcher: &file_watcher,
+                sensorium: &orchestrator,
             };
             match handle_command(&input, &mut ctx).await? {
                 CommandResult::Continue => continue,
@@ -262,12 +298,44 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         }
     }
 
-    // Persist state before exit
+    // Graceful shutdown
+    interface.display_status("Shutting down...");
+
+    // Stop sensors
+    network_monitor.stop();
+    if let Some(fw) = file_watcher.lock().take() {
+        fw.stop();
+    }
+
+    // Persist state
     goals.save(&goals_path)?;
     store.flush()?;
     interface.display_status("Session ended. Memory persisted.");
 
     Ok(())
+}
+
+/// Compute embeddings for all active goals and update the Sensorium orchestrator.
+async fn update_goal_embeddings(
+    goals: &GoalManager,
+    embedder: &dyn animus_core::EmbeddingService,
+    sensorium: &SensoriumOrchestrator,
+) {
+    let active = goals.active_goals();
+    if active.is_empty() {
+        sensorium.set_goal_embeddings(Vec::new());
+        return;
+    }
+    let texts: Vec<&str> = active.iter().map(|g| g.description.as_str()).collect();
+    match embedder.embed_texts(&texts).await {
+        Ok(embeddings) => {
+            sensorium.set_goal_embeddings(embeddings);
+            tracing::debug!("Updated Tier 2 attention with {} goal embeddings", active.len());
+        }
+        Err(e) => {
+            tracing::warn!("Failed to compute goal embeddings: {e}");
+        }
+    }
 }
 
 fn build_system_prompt(_scheduler: &ThreadScheduler<MmapVectorStore>, goals: &GoalManager) -> String {
@@ -295,6 +363,9 @@ struct CommandContext<'a> {
     data_dir: &'a std::path::Path,
     scheduler: &'a mut ThreadScheduler<MmapVectorStore>,
     federation: Option<&'a FederationOrchestrator<MmapVectorStore>>,
+    event_bus: &'a Arc<EventBus>,
+    file_watcher: &'a Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>>,
+    sensorium: &'a Arc<SensoriumOrchestrator>,
 }
 
 async fn handle_command(
@@ -337,6 +408,7 @@ async fn handle_command(
         "/goal" if !arg.is_empty() => {
             let id = ctx.goals.create_goal(arg.to_string(), GoalSource::Human, Priority::Normal);
             ctx.goals.save(ctx.goals_path)?;
+            update_goal_embeddings(ctx.goals, ctx.embedder, ctx.sensorium).await;
             ctx.interface.display_status(&format!(
                 "Goal created: {}",
                 id.0.to_string().get(..8).unwrap_or("?")
@@ -408,9 +480,30 @@ async fn handle_command(
             if !watch_path.exists() {
                 ctx.interface.display_status(&format!("Path does not exist: {arg}"));
             } else {
-                ctx.interface.display_status(&format!(
-                    "Watch path noted: {arg}. File watching will be available in a future update."
-                ));
+                let mut fw_guard = ctx.file_watcher.lock();
+                // Stop existing watcher if any
+                if let Some(existing) = fw_guard.take() {
+                    existing.stop();
+                }
+                match animus_sensorium::sensors::file_watcher::FileWatcher::new(
+                    ctx.event_bus.clone(),
+                    vec![watch_path],
+                ) {
+                    Ok(mut watcher) => {
+                        match watcher.start() {
+                            Ok(()) => {
+                                ctx.interface.display_status(&format!("Now watching: {arg}"));
+                                *fw_guard = Some(watcher);
+                            }
+                            Err(e) => {
+                                ctx.interface.display_status(&format!("Failed to start file watcher: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ctx.interface.display_status(&format!("Failed to create file watcher: {e}"));
+                    }
+                }
             }
         }
         "/consent" => {

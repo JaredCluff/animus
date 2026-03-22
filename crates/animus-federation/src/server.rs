@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use animus_cortex::telos::{GoalManager, GoalSource};
 use crate::auth::FederationAuth;
 use crate::knowledge::KnowledgeSharing;
 use crate::peers::{Peer, PeerInfo, PeerRegistry, TrustLevel};
@@ -41,8 +42,11 @@ struct ServerState<S: VectorStore> {
     store: Arc<S>,
     knowledge: KnowledgeSharing,
     pending_handshakes: Mutex<HashMap<InstanceId, PendingHandshake>>,
-    #[allow(dead_code)]
+    goals: Option<Arc<parking_lot::Mutex<GoalManager>>>,
+    goals_path: Option<std::path::PathBuf>,
     max_rpm: u32,
+    /// Per-peer request timestamps for rate limiting (sliding window).
+    rate_limits: Mutex<HashMap<InstanceId, Vec<i64>>>,
 }
 
 /// Lightweight axum HTTP server for inbound federation requests.
@@ -71,9 +75,24 @@ impl<S: VectorStore + 'static> FederationServer<S> {
             store,
             knowledge,
             pending_handshakes: Mutex::new(HashMap::new()),
+            goals: None,
+            goals_path: None,
             max_rpm,
+            rate_limits: Mutex::new(HashMap::new()),
         });
         Self { state }
+    }
+
+    /// Set the goal manager for handling inbound goal announcements.
+    pub fn set_goals(
+        &mut self,
+        goals: Arc<parking_lot::Mutex<GoalManager>>,
+        goals_path: std::path::PathBuf,
+    ) {
+        let state = Arc::get_mut(&mut self.state)
+            .expect("set_goals must be called before start()");
+        state.goals = Some(goals);
+        state.goals_path = Some(goals_path);
     }
 
     /// Start the HTTP server, binding to the given address.
@@ -243,6 +262,23 @@ async fn auth_middleware<S: VectorStore + 'static>(
             StatusCode::UNAUTHORIZED,
             &format!("signature verification failed: {e}"),
         );
+    }
+
+    // Rate limiting: enforce max_rpm per peer
+    if state.max_rpm > 0 {
+        let now = chrono::Utc::now().timestamp();
+        let window_start = now - 60;
+        let mut rate_map = state.rate_limits.lock().await;
+        let timestamps = rate_map.entry(instance_id).or_default();
+        // Remove entries older than 1 minute
+        timestamps.retain(|&t| t > window_start);
+        if timestamps.len() >= state.max_rpm as usize {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded",
+            );
+        }
+        timestamps.push(now);
     }
 
     // Inject authenticated peer identity for downstream handlers
@@ -575,7 +611,7 @@ async fn handle_publish<S: VectorStore + 'static>(
 /// Returns acknowledgement. Goal integration with the local Telos
 /// goal manager happens at the orchestrator level.
 async fn handle_goals<S: VectorStore + 'static>(
-    State(_state): State<Arc<ServerState<S>>>,
+    State(state): State<Arc<ServerState<S>>>,
     Extension(auth_peer): Extension<AuthenticatedPeer>,
     Json(announcement): Json<GoalAnnouncement>,
 ) -> Response {
@@ -587,18 +623,41 @@ async fn handle_goals<S: VectorStore + 'static>(
         announcement.description
     );
 
+    // Create goal in local GoalManager if available
+    let local_goal_id = if let Some(ref goals) = state.goals {
+        let mut goals = goals.lock();
+        let id = goals.create_goal(
+            announcement.description.clone(),
+            GoalSource::Federated {
+                source_ailf: auth_peer.instance_id,
+            },
+            announcement.priority,
+        );
+        // Persist goals
+        if let Some(ref path) = state.goals_path {
+            if let Err(e) = goals.save(path) {
+                tracing::warn!("Failed to persist federated goal: {e}");
+            }
+        }
+        Some(id)
+    } else {
+        None
+    };
+
     #[derive(Serialize)]
     struct GoalResponse {
         status: String,
         goal_id: animus_core::GoalId,
+        local_goal_id: Option<animus_core::GoalId>,
     }
 
     (
         StatusCode::OK,
         Json(
             serde_json::to_value(&GoalResponse {
-                status: "acknowledged".to_string(),
+                status: "accepted".to_string(),
                 goal_id: announcement.goal_id,
+                local_goal_id,
             })
             .unwrap(),
         ),

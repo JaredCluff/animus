@@ -2,6 +2,7 @@ use animus_core::error::{AnimusError, Result};
 use animus_core::identity::SegmentId;
 use animus_core::segment::{Segment, Tier};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,12 @@ use crate::{SegmentUpdate, VectorStore};
 
 /// Maximum serialized segment size: 64 MiB.
 const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Metadata persisted alongside the VectorFS store.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoreMeta {
+    dimensionality: usize,
+}
 
 /// File-backed VectorStore using bincode-serialized segment files and HNSW index.
 pub struct MmapVectorStore {
@@ -26,9 +33,30 @@ pub struct MmapVectorStore {
 
 impl MmapVectorStore {
     /// Open or create a VectorStore at the given directory.
+    ///
+    /// If the store already contains segments with a different dimensionality,
+    /// incompatible segments are removed and the store is re-initialized with
+    /// the new dimensionality.
     pub fn open(dir: &Path, dimensionality: usize) -> Result<Self> {
         let segments_dir = dir.join("segments");
         fs::create_dir_all(&segments_dir)?;
+
+        let meta_path = dir.join("meta.json");
+        let stored_dim = Self::read_meta(&meta_path)?;
+
+        // Handle dimensionality mismatch
+        if let Some(stored) = stored_dim {
+            if stored != dimensionality {
+                tracing::warn!(
+                    "VectorFS dimensionality changed ({stored} -> {dimensionality}); \
+                     clearing incompatible segments"
+                );
+                Self::clear_segments(&segments_dir)?;
+            }
+        }
+
+        // Persist current dimensionality
+        Self::write_meta(&meta_path, dimensionality)?;
 
         let index = HnswIndex::new(dimensionality, 10_000);
         let mut segments = HashMap::new();
@@ -50,6 +78,14 @@ impl MmapVectorStore {
                 let data = fs::read(&path)?;
                 match bincode::deserialize::<Segment>(&data) {
                     Ok(segment) => {
+                        if segment.embedding.len() != dimensionality {
+                            tracing::warn!(
+                                "segment {} has {} dims (expected {}), removing",
+                                segment.id, segment.embedding.len(), dimensionality
+                            );
+                            let _ = fs::remove_file(&path);
+                            continue;
+                        }
                         if let Err(e) = index.insert(segment.id, &segment.embedding) {
                             tracing::warn!("failed to index segment {}: {e}", segment.id);
                             continue;
@@ -64,9 +100,10 @@ impl MmapVectorStore {
         }
 
         tracing::info!(
-            "VectorFS opened at {} with {} segments",
+            "VectorFS opened at {} with {} segments (dim={})",
             dir.display(),
-            segments.len()
+            segments.len(),
+            dimensionality,
         );
 
         Ok(Self {
@@ -75,6 +112,45 @@ impl MmapVectorStore {
             index,
             dimensionality,
         })
+    }
+
+    /// Read stored metadata, returning the persisted dimensionality if available.
+    fn read_meta(meta_path: &Path) -> Result<Option<usize>> {
+        if !meta_path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read_to_string(meta_path)?;
+        let meta: StoreMeta = serde_json::from_str(&data).map_err(|e| {
+            AnimusError::Storage(format!("failed to parse VectorFS meta.json: {e}"))
+        })?;
+        Ok(Some(meta.dimensionality))
+    }
+
+    /// Write metadata to disk.
+    fn write_meta(meta_path: &Path, dimensionality: usize) -> Result<()> {
+        let meta = StoreMeta { dimensionality };
+        let data = serde_json::to_string_pretty(&meta).map_err(|e| {
+            AnimusError::Storage(format!("failed to serialize VectorFS meta.json: {e}"))
+        })?;
+        fs::write(meta_path, data)?;
+        Ok(())
+    }
+
+    /// Remove all segment files from the segments directory.
+    fn clear_segments(segments_dir: &Path) -> Result<()> {
+        for entry in fs::read_dir(segments_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "bin") {
+                fs::remove_file(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the stored dimensionality.
+    pub fn dimensionality(&self) -> usize {
+        self.dimensionality
     }
 
     /// Flush all segments to disk using atomic writes.
