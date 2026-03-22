@@ -891,12 +891,13 @@ async fn handle_command(
                     for id in &retrieved {
                         if let Ok(Some(mut seg)) = ctx.store.get_raw(*id) {
                             seg.record_positive_feedback();
-                            // Cap alpha to prevent runaway accumulation (same ceiling as
-                            // update_segment tool and implicit feedback in thread.rs).
+                            // Cap alpha, then recompute confidence from the capped values
+                            // so the stored confidence is consistent with stored alpha/beta.
                             let capped_alpha = seg.alpha.min(MAX_BAYES_PARAM);
+                            let capped_confidence = capped_alpha / (capped_alpha + seg.beta);
                             if let Err(e) = ctx.store.update_meta(*id, animus_vectorfs::SegmentUpdate {
                                 alpha: Some(capped_alpha),
-                                confidence: Some(seg.confidence),
+                                confidence: Some(capped_confidence),
                                 ..Default::default()
                             }) {
                                 tracing::warn!("Failed to update feedback for {id}: {e}");
@@ -925,11 +926,12 @@ async fn handle_command(
                     for id in &retrieved {
                         if let Ok(Some(mut seg)) = ctx.store.get_raw(*id) {
                             seg.record_negative_feedback();
-                            // Cap beta to prevent runaway accumulation.
+                            // Cap beta, then recompute confidence from capped values.
                             let capped_beta = seg.beta.min(MAX_BAYES_PARAM);
+                            let capped_confidence = seg.alpha / (seg.alpha + capped_beta);
                             if let Err(e) = ctx.store.update_meta(*id, animus_vectorfs::SegmentUpdate {
                                 beta: Some(capped_beta),
-                                confidence: Some(seg.confidence),
+                                confidence: Some(capped_confidence),
                                 ..Default::default()
                             }) {
                                 tracing::warn!("Failed to update feedback for {id}: {e}");
@@ -1325,6 +1327,13 @@ async fn handle_command(
             }
         }
         "/restore" if !arg.is_empty() => {
+            use std::path::{Component, Path};
+            // Reject paths with parent-directory traversal components.
+            let has_traversal = Path::new(arg).components()
+                .any(|c| matches!(c, Component::ParentDir));
+            if has_traversal {
+                ctx.interface.display_status("Invalid snapshot path: parent-directory traversal not allowed");
+            } else {
             let snap_dir = std::path::PathBuf::from(arg);
             if !snap_dir.exists() {
                 // Try relative to snapshots directory
@@ -1351,6 +1360,7 @@ async fn handle_command(
                     }
                 }
             }
+            } // end traversal check
         }
         "/help" => {
             ctx.interface.display("/goals         — list active goals");

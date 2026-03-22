@@ -143,9 +143,15 @@ impl<S: VectorStore> Consolidator<S> {
         // Merge Bayesian evidence: pool observations from all sources.
         // Each segment starts from a Beta(1,1) prior, so summing N alphas
         // counts the prior N times. Subtract N-1 to count it once.
+        const MAX_BAYES_PARAM: f32 = 100.0;
         let n = segments.len() as f32;
-        let merged_alpha: f32 = (segments.iter().map(|s| s.alpha).sum::<f32>() - (n - 1.0)).max(1.0);
-        let merged_beta: f32 = (segments.iter().map(|s| s.beta).sum::<f32>() - (n - 1.0)).max(1.0);
+        // Pool evidence, subtract N-1 redundant priors, clamp to system-wide ceiling.
+        let merged_alpha: f32 = (segments.iter().map(|s| s.alpha).sum::<f32>() - (n - 1.0))
+            .max(1.0)
+            .min(MAX_BAYES_PARAM);
+        let merged_beta: f32 = (segments.iter().map(|s| s.beta).sum::<f32>() - (n - 1.0))
+            .max(1.0)
+            .min(MAX_BAYES_PARAM);
 
         // Use the slowest decay class (most conservative: if any knowledge
         // is factual, the merged segment should decay slowly)
