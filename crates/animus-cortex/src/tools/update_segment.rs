@@ -1,3 +1,5 @@
+use animus_core::SegmentId;
+use animus_vectorfs::SegmentUpdate;
 use crate::telos::Autonomy;
 use super::{Tool, ToolResult, ToolContext};
 
@@ -20,13 +22,41 @@ impl Tool for UpdateSegmentTool {
     fn required_autonomy(&self) -> Autonomy { Autonomy::Suggest }
     fn needs_vectorfs(&self) -> bool { true }
 
-    async fn execute(&self, params: serde_json::Value, _ctx: &ToolContext) -> Result<ToolResult, String> {
-        let segment_id = params["segment_id"].as_str().ok_or("missing 'segment_id' parameter")?;
+    async fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolResult, String> {
+        let segment_id_str = params["segment_id"].as_str().ok_or("missing 'segment_id' parameter")?;
         let feedback = params["feedback"].as_str().ok_or("missing 'feedback' parameter")?;
-        match feedback {
-            "positive" | "negative" => {}
+
+        let uuid = uuid::Uuid::parse_str(segment_id_str)
+            .map_err(|e| format!("invalid segment_id: {e}"))?;
+        let id = SegmentId(uuid);
+
+        let seg = match ctx.store.get_raw(id) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(ToolResult { content: format!("Segment {id} not found"), is_error: true }),
+            Err(e) => return Ok(ToolResult { content: format!("Failed to retrieve segment: {e}"), is_error: true }),
+        };
+
+        let update = match feedback {
+            "positive" => SegmentUpdate {
+                alpha: Some(seg.alpha + 1.0),
+                ..Default::default()
+            },
+            "negative" => SegmentUpdate {
+                beta: Some(seg.beta + 1.0),
+                ..Default::default()
+            },
             other => return Err(format!("invalid feedback type: {other}")),
+        };
+
+        match ctx.store.update_meta(id, update) {
+            Ok(()) => Ok(ToolResult {
+                content: format!("Updated segment {id} with {feedback} feedback"),
+                is_error: false,
+            }),
+            Err(e) => Ok(ToolResult {
+                content: format!("Failed to update segment: {e}"),
+                is_error: true,
+            }),
         }
-        Ok(ToolResult { content: format!("Updated segment {segment_id} with {feedback} feedback"), is_error: false })
     }
 }

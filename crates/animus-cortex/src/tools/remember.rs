@@ -1,3 +1,4 @@
+use animus_core::segment::{Content, DecayClass, Segment, Source};
 use crate::telos::Autonomy;
 use super::{Tool, ToolResult, ToolContext};
 
@@ -20,12 +21,38 @@ impl Tool for RememberTool {
     fn required_autonomy(&self) -> Autonomy { Autonomy::Suggest }
     fn needs_vectorfs(&self) -> bool { true }
 
-    async fn execute(&self, params: serde_json::Value, _ctx: &ToolContext) -> Result<ToolResult, String> {
+    async fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolResult, String> {
         let knowledge = params["knowledge"].as_str().ok_or("missing 'knowledge' parameter")?;
-        let decay_class = params["decay_class"].as_str().unwrap_or("general");
-        Ok(ToolResult {
-            content: format!("Stored knowledge ({decay_class}): {}", &knowledge[..knowledge.len().min(80)]),
-            is_error: false,
-        })
+        let decay_class_str = params["decay_class"].as_str().unwrap_or("general");
+        let decay_class = match decay_class_str {
+            "factual" => DecayClass::Factual,
+            "procedural" => DecayClass::Procedural,
+            "episodic" => DecayClass::Episodic,
+            "opinion" => DecayClass::Opinion,
+            _ => DecayClass::General,
+        };
+
+        let embedding = match ctx.embedder.embed_text(knowledge).await {
+            Ok(e) => e,
+            Err(e) => return Ok(ToolResult { content: format!("Embedding failed: {e}"), is_error: true }),
+        };
+
+        let mut segment = Segment::new(
+            Content::Text(knowledge.to_string()),
+            embedding,
+            Source::Manual { description: "LLM tool-remembered knowledge".to_string() },
+        );
+        segment.decay_class = decay_class;
+
+        match ctx.store.store(segment) {
+            Ok(id) => Ok(ToolResult {
+                content: format!("Knowledge stored (id: {id}, class: {decay_class_str})"),
+                is_error: false,
+            }),
+            Err(e) => Ok(ToolResult {
+                content: format!("Failed to store knowledge: {e}"),
+                is_error: true,
+            }),
+        }
     }
 }

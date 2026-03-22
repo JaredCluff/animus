@@ -1,3 +1,5 @@
+use animus_core::segment::Content;
+use animus_core::Tier;
 use crate::telos::Autonomy;
 use super::{Tool, ToolResult, ToolContext};
 
@@ -19,9 +21,39 @@ impl Tool for ListSegmentsTool {
     fn required_autonomy(&self) -> Autonomy { Autonomy::Inform }
     fn needs_vectorfs(&self) -> bool { true }
 
-    async fn execute(&self, params: serde_json::Value, _ctx: &ToolContext) -> Result<ToolResult, String> {
-        let _tier = params["tier"].as_str().unwrap_or("all");
-        let _limit = params["limit"].as_u64().unwrap_or(20);
-        Ok(ToolResult { content: "Segments listed by runtime".to_string(), is_error: false })
+    async fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolResult, String> {
+        let tier_filter = match params["tier"].as_str().unwrap_or("all") {
+            "hot" => Some(Tier::Hot),
+            "warm" => Some(Tier::Warm),
+            "cold" => Some(Tier::Cold),
+            _ => None,
+        };
+        let limit = params["limit"].as_u64().unwrap_or(20) as usize;
+
+        let ids = ctx.store.segment_ids(tier_filter);
+        let total = ids.len();
+
+        let mut output = if let Some(t) = tier_filter {
+            format!("{total} segment(s) in {t:?} tier:\n")
+        } else {
+            format!("{total} segment(s) total:\n")
+        };
+
+        for id in ids.into_iter().take(limit) {
+            if let Ok(Some(seg)) = ctx.store.get_raw(id) {
+                let preview = match &seg.content {
+                    Content::Text(t) => t.chars().take(60).collect::<String>(),
+                    Content::Structured(_) => "[structured data]".to_string(),
+                    Content::Binary { .. } => "[binary data]".to_string(),
+                    Content::Reference { uri, .. } => format!("[ref: {uri}]"),
+                };
+                output.push_str(&format!(
+                    "- [{id}] conf={:.2} decay={:?}: {preview}\n",
+                    seg.confidence, seg.decay_class
+                ));
+            }
+        }
+
+        Ok(ToolResult { content: output, is_error: false })
     }
 }

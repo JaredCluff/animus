@@ -8,12 +8,22 @@ pub mod update_segment;
 
 use crate::llm::ToolDefinition;
 use crate::telos::Autonomy;
+use animus_core::{EmbeddingService, Signal};
+use animus_vectorfs::VectorStore;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Context provided to tools at execution time by the runtime.
 pub struct ToolContext {
     /// Root data directory for the AILF.
     pub data_dir: PathBuf,
+    /// VectorFS store for memory tools.
+    pub store: Arc<dyn VectorStore>,
+    /// Embedding service for memory tools.
+    pub embedder: Arc<dyn EmbeddingService>,
+    /// Signal channel for inter-thread communication tools.
+    pub signal_tx: Option<mpsc::Sender<Signal>>,
 }
 
 /// A tool the AILF can use to interact with the world.
