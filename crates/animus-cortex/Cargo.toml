@@ -1,0 +1,17 @@
+[package]
+name = "animus-cortex"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+animus-core = { path = "../animus-core" }
+animus-vectorfs = { path = "../animus-vectorfs" }
+animus-mnemos = { path = "../animus-mnemos" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }

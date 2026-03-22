@@ -5,6 +5,7 @@ members = [
     "crates/animus-vectorfs",
     "crates/animus-mnemos",
     "crates/animus-embed",
+    "crates/animus-cortex",
     "crates/animus-tests",
 ]
 
@@ -33,3 +34,4 @@ async-trait = "0.1"
 rand = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 parking_lot = "0.12"
+reqwest = { version = "0.12", features = ["json"] }
