@@ -11,3 +11,5 @@ mod sensorium_bus;
 mod sensorium_consent;
 mod sensorium_audit;
 mod sensorium_attention;
+mod sensorium_file_watcher;
+mod sensorium_process_monitor;
