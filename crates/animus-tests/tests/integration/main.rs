@@ -13,3 +13,5 @@ mod sensorium_audit;
 mod sensorium_attention;
 mod sensorium_file_watcher;
 mod sensorium_process_monitor;
+mod sensorium_policy_store;
+mod sensorium_orchestrator;
