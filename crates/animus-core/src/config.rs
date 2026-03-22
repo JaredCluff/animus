@@ -25,6 +25,9 @@ pub struct AnimusConfig {
 
     /// Terminal interface configuration.
     pub interface: InterfaceConfig,
+
+    /// Sensorium perception layer configuration.
+    pub sensorium: SensoriumConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +94,28 @@ impl Default for CortexConfig {
     }
 }
 
+/// Configuration for the Sensorium perception layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensoriumConfig {
+    pub watch_paths: Vec<PathBuf>,
+    pub process_poll_interval_secs: u64,
+    pub file_watching_enabled: bool,
+    pub process_monitoring_enabled: bool,
+    pub attention_similarity_threshold: f32,
+}
+
+impl Default for SensoriumConfig {
+    fn default() -> Self {
+        Self {
+            watch_paths: Vec::new(),
+            process_poll_interval_secs: 5,
+            file_watching_enabled: false,
+            process_monitoring_enabled: false,
+            attention_similarity_threshold: 0.5,
+        }
+    }
+}
+
 /// Configuration for the terminal interface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceConfig {
@@ -129,6 +154,7 @@ impl Default for AnimusConfig {
             tier: TierConfig::default(),
             cortex: CortexConfig::default(),
             interface: InterfaceConfig::default(),
+            sensorium: SensoriumConfig::default(),
         }
     }
 }

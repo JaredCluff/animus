@@ -41,6 +41,9 @@ pub enum AnimusError {
     #[error("goal error: {0}")]
     Goal(String),
 
+    #[error("sensorium error: {0}")]
+    Sensorium(String),
+
     #[error("{0}")]
     Other(String),
 }
