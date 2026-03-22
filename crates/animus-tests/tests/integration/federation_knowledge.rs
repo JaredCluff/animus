@@ -131,3 +131,51 @@ fn inactive_policy_is_skipped() {
     let target = InstanceId::new();
     assert!(!sharing.can_publish(&segment, &target));
 }
+
+#[test]
+fn publish_check_allows_matching_tag() {
+    let policies = vec![FederationPolicy {
+        id: PolicyId::new(),
+        name: "share-public".to_string(),
+        active: true,
+        publish_rules: vec![FederationRule {
+            scope: FederationScope::ByTag("visibility".to_string(), "public".to_string()),
+            permission: FederationPermission::Allow,
+        }],
+        subscribe_rules: vec![],
+    }];
+
+    let sharing = KnowledgeSharing::new(policies, 0.5);
+    let mut segment = Segment::new(
+        Content::Text("tagged content".to_string()),
+        vec![0.1],
+        Source::Manual { description: "test".to_string() },
+    );
+    segment.tags.insert("visibility".to_string(), "public".to_string());
+    let target = InstanceId::new();
+    assert!(sharing.can_publish(&segment, &target));
+}
+
+#[test]
+fn publish_check_denies_non_matching_tag() {
+    let policies = vec![FederationPolicy {
+        id: PolicyId::new(),
+        name: "share-public".to_string(),
+        active: true,
+        publish_rules: vec![FederationRule {
+            scope: FederationScope::ByTag("visibility".to_string(), "public".to_string()),
+            permission: FederationPermission::Allow,
+        }],
+        subscribe_rules: vec![],
+    }];
+
+    let sharing = KnowledgeSharing::new(policies, 0.5);
+    let mut segment = Segment::new(
+        Content::Text("private content".to_string()),
+        vec![0.1],
+        Source::Manual { description: "test".to_string() },
+    );
+    segment.tags.insert("visibility".to_string(), "private".to_string());
+    let target = InstanceId::new();
+    assert!(!sharing.can_publish(&segment, &target));
+}

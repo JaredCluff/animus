@@ -131,6 +131,7 @@ dependencies = [
  "animus-sensorium",
  "animus-vectorfs",
  "bincode",
+ "chrono",
  "parking_lot",
  "serde",
  "serde_json",

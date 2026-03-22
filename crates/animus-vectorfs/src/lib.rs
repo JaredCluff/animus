@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use animus_core::{Result, Segment, SegmentId, Tier};
 
 /// Metadata update for a segment (partial update without replacing content).
@@ -6,6 +8,7 @@ pub struct SegmentUpdate {
     pub relevance_score: Option<f32>,
     pub confidence: Option<f32>,
     pub associations: Option<Vec<(SegmentId, f32)>>,
+    pub tags: Option<HashMap<String, String>>,
 }
 
 /// The core storage abstraction for VectorFS.

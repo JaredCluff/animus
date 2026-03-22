@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +49,10 @@ pub struct Segment {
 
     /// Who can see this segment.
     pub observable_by: Vec<Principal>,
+
+    /// User-defined key-value labels for categorization and federation scoping.
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
 }
 
 impl Segment {
@@ -68,6 +74,7 @@ impl Segment {
             associations: Vec::new(),
             consent_policy: None,
             observable_by: Vec::new(),
+            tags: HashMap::new(),
         }
     }
 

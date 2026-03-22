@@ -222,3 +222,50 @@ fn test_dimensionality_persisted_across_reopen() {
         assert_eq!(store.dimensionality(), 4);
     }
 }
+
+#[test]
+fn test_snapshot_and_restore() {
+    let dir = TempDir::new().unwrap();
+    let snap_dir = TempDir::new().unwrap();
+
+    let store = MmapVectorStore::open(dir.path(), 4).unwrap();
+    let seg1 = test_segment(vec![1.0, 0.0, 0.0, 0.0], "alpha");
+    let seg2 = test_segment(vec![0.0, 1.0, 0.0, 0.0], "beta");
+    let id1 = store.store(seg1).unwrap();
+    let id2 = store.store(seg2).unwrap();
+
+    // Snapshot
+    let count = store.snapshot(snap_dir.path()).unwrap();
+    assert_eq!(count, 2);
+
+    // Open a fresh store and restore into it
+    let dir2 = TempDir::new().unwrap();
+    let store2 = MmapVectorStore::open(dir2.path(), 4).unwrap();
+    assert_eq!(store2.count(None), 0);
+
+    let restored = store2.restore_from_snapshot(snap_dir.path()).unwrap();
+    assert_eq!(restored, 2);
+    assert_eq!(store2.count(None), 2);
+
+    // Verify segments are accessible
+    assert!(store2.get(id1).unwrap().is_some());
+    assert!(store2.get(id2).unwrap().is_some());
+}
+
+#[test]
+fn test_snapshot_rejects_wrong_dimensionality() {
+    let dir = TempDir::new().unwrap();
+    let snap_dir = TempDir::new().unwrap();
+
+    // Create store with dim=4 and snapshot
+    let store = MmapVectorStore::open(dir.path(), 4).unwrap();
+    let seg = test_segment(vec![1.0, 0.0, 0.0, 0.0], "test");
+    store.store(seg).unwrap();
+    store.snapshot(snap_dir.path()).unwrap();
+
+    // Try to restore into a store with dim=8 — segments should be skipped
+    let dir2 = TempDir::new().unwrap();
+    let store2 = MmapVectorStore::open(dir2.path(), 8).unwrap();
+    let restored = store2.restore_from_snapshot(snap_dir.path()).unwrap();
+    assert_eq!(restored, 0, "dim-mismatched segments should be skipped");
+}

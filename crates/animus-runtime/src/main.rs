@@ -34,9 +34,12 @@ Available commands the human can use:
 - /thread new <name> — create a new reasoning thread
 - /thread switch <id> — switch to a different thread
 - /peers — list discovered federation peers
+- /tag <id> <key>=<value> — label a segment for categorization/federation
 - /trust <id> — upgrade a peer to Trusted
 - /block <id> — block a peer
 - /federate — show federation status
+- /sleep — enter dormancy (sensorium continues in Cold-only mode)
+- /wake — resume from sleep with a summary of what happened
 - /quit — end session
 
 Be concise and helpful. You are not a chatbot — you are a persistent, aware entity."#;
@@ -120,10 +123,14 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         embedder.clone(),
     )?);
 
+    // Shared sleep flag for background tasks
+    let sleeping_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Start background event processing loop
     let orch_clone = orchestrator.clone();
     let store_clone = store.clone();
     let embedder_clone = embedder.clone();
+    let sleeping_bg = sleeping_flag.clone();
     let mut bus_rx = event_bus.subscribe();
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
@@ -140,7 +147,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                                     continue;
                                 }
                             };
-                            let segment = animus_core::Segment::new(
+                            let mut segment = animus_core::Segment::new(
                                 animus_core::Content::Structured(event.data.clone()),
                                 embedding,
                                 animus_core::Source::Observation {
@@ -148,6 +155,10 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                                     raw_event_id: event.id,
                                 },
                             );
+                            // During sleep, observations go to Cold tier only
+                            if sleeping_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                                segment.tier = animus_core::Tier::Cold;
+                            }
                             if let Err(e) = store_clone.store(segment) {
                                 tracing::warn!("Failed to store observation: {e}");
                             }
@@ -279,6 +290,10 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         interface.display_status(&format!("Active thread: {}", thread.name));
     }
 
+    // Sleep/wake state
+    let mut is_sleeping = false;
+    let mut sleep_started: Option<chrono::DateTime<chrono::Utc>> = None;
+
     // Main conversation loop
     loop {
         let input = match interface.read_input()? {
@@ -301,11 +316,20 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                 event_bus: &event_bus,
                 file_watcher: &file_watcher,
                 sensorium: &orchestrator,
+                is_sleeping: &mut is_sleeping,
+                sleep_started: &mut sleep_started,
+                sleeping_flag: &sleeping_flag,
             };
             match handle_command(&input, &mut ctx).await? {
                 CommandResult::Continue => continue,
                 CommandResult::Quit => break,
             }
+        }
+
+        // While sleeping, reject conversational input
+        if is_sleeping {
+            interface.display_status("Sleeping. Use /wake to resume, /status to check, or /quit to exit.");
+            continue;
         }
 
         // Process through reasoning thread
@@ -404,6 +428,9 @@ struct CommandContext<'a> {
     event_bus: &'a Arc<EventBus>,
     file_watcher: &'a Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>>,
     sensorium: &'a Arc<SensoriumOrchestrator>,
+    is_sleeping: &'a mut bool,
+    sleep_started: &'a mut Option<chrono::DateTime<chrono::Utc>>,
+    sleeping_flag: &'a Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn handle_command(
@@ -418,6 +445,72 @@ async fn handle_command(
         "/quit" | "/exit" | "/q" => {
             return Ok(CommandResult::Quit);
         }
+        "/sleep" => {
+            if *ctx.is_sleeping {
+                ctx.interface.display_status("Already sleeping.");
+            } else {
+                *ctx.is_sleeping = true;
+                *ctx.sleep_started = Some(chrono::Utc::now());
+                ctx.sleeping_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                ctx.interface.display_status("Entering sleep mode. Sensorium continues logging to Cold tier.");
+                ctx.interface.display_status("Use /wake to resume, /status to check state.");
+            }
+        }
+        "/wake" => {
+            if !*ctx.is_sleeping {
+                ctx.interface.display_status("Already awake.");
+            } else {
+                let sleep_start = ctx.sleep_started.take().unwrap_or_else(chrono::Utc::now);
+                *ctx.is_sleeping = false;
+                ctx.sleeping_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+
+                // Summarize what happened during sleep
+                let cold_segments = ctx.store.segment_ids(Some(animus_core::Tier::Cold));
+                let created_during_sleep: Vec<_> = cold_segments.iter().filter(|id| {
+                    ctx.store.get_raw(**id).ok().flatten().is_some_and(|s| s.created >= sleep_start)
+                }).collect();
+
+                let duration = chrono::Utc::now() - sleep_start;
+                let hours = duration.num_hours();
+                let minutes = duration.num_minutes() % 60;
+
+                ctx.interface.display_status(&format!(
+                    "Waking up. Slept for {}h {}m.",
+                    hours, minutes
+                ));
+
+                if created_during_sleep.is_empty() {
+                    ctx.interface.display_status("Nothing notable happened while sleeping.");
+                } else {
+                    ctx.interface.display_status(&format!(
+                        "{} observations logged during sleep:",
+                        created_during_sleep.len()
+                    ));
+                    for (i, id) in created_during_sleep.iter().take(10).enumerate() {
+                        if let Ok(Some(seg)) = ctx.store.get_raw(**id) {
+                            let preview = match &seg.content {
+                                animus_core::Content::Text(t) => {
+                                    if t.len() > 80 { format!("{}...", &t[..80]) } else { t.clone() }
+                                }
+                                animus_core::Content::Structured(v) => {
+                                    let s = v.to_string();
+                                    if s.len() > 80 { format!("{}...", &s[..80]) } else { s }
+                                }
+                                animus_core::Content::Binary { mime_type, .. } => format!("[binary: {mime_type}]"),
+                                animus_core::Content::Reference { uri, .. } => format!("[ref: {uri}]"),
+                            };
+                            ctx.interface.display(&format!("  {}. {}", i + 1, preview));
+                        }
+                    }
+                    if created_during_sleep.len() > 10 {
+                        ctx.interface.display(&format!(
+                            "  ... and {} more",
+                            created_during_sleep.len() - 10
+                        ));
+                    }
+                }
+            }
+        }
         "/status" => {
             let total = ctx.store.count(None);
             let warm = ctx.store.count(Some(animus_core::Tier::Warm));
@@ -427,6 +520,15 @@ async fn handle_command(
                 "Segments: {total} total ({hot} hot, {warm} warm, {cold} cold)"
             ));
             ctx.interface.display_status(&format!("Goals: {} active", ctx.goals.active_goals().len()));
+            if *ctx.is_sleeping {
+                let since = ctx.sleep_started.map(|t| {
+                    let d = chrono::Utc::now() - t;
+                    format!("{}h {}m", d.num_hours(), d.num_minutes() % 60)
+                }).unwrap_or_else(|| "unknown".to_string());
+                ctx.interface.display_status(&format!("State: SLEEPING (for {since})"));
+            } else {
+                ctx.interface.display_status("State: AWAKE");
+            }
         }
         "/goals" => {
             let active = ctx.goals.active_goals();
@@ -491,6 +593,46 @@ async fn handle_command(
                 n => ctx.interface.display_status(&format!(
                     "{n} segments match '{arg}' — be more specific"
                 )),
+            }
+        }
+        // /tag <segment-prefix> <key>=<value> — add a tag to a segment
+        "/tag" if !arg.is_empty() => {
+            let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            if parts.len() < 2 || !parts[1].contains('=') {
+                ctx.interface.display_status("Usage: /tag <segment-id-prefix> <key>=<value>");
+            } else {
+                let prefix = parts[0];
+                let kv: Vec<&str> = parts[1].splitn(2, '=').collect();
+                let (key, value) = (kv[0].to_string(), kv[1].to_string());
+
+                let all_ids = ctx.store.segment_ids(None);
+                let matches: Vec<_> = all_ids
+                    .iter()
+                    .filter(|id| id.0.to_string().starts_with(prefix))
+                    .collect();
+                match matches.len() {
+                    0 => ctx.interface.display_status(&format!("No segment found matching '{prefix}'")),
+                    1 => {
+                        let id = *matches[0];
+                        // Get current tags, add the new one
+                        let mut tags = match ctx.store.get_raw(id)? {
+                            Some(seg) => seg.tags,
+                            None => std::collections::HashMap::new(),
+                        };
+                        tags.insert(key.clone(), value.clone());
+                        ctx.store.update_meta(id, animus_vectorfs::SegmentUpdate {
+                            tags: Some(tags),
+                            ..Default::default()
+                        })?;
+                        ctx.interface.display_status(&format!(
+                            "Tagged segment {} with {key}={value}",
+                            id.0.to_string().get(..8).unwrap_or("?")
+                        ));
+                    }
+                    n => ctx.interface.display_status(&format!(
+                        "{n} segments match '{prefix}' — be more specific"
+                    )),
+                }
             }
         }
         "/sensorium" => {
@@ -721,11 +863,55 @@ async fn handle_command(
                 ctx.interface.display_status("Federation: disabled");
             }
         }
+        "/snapshot" => {
+            let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+            let snap_dir = ctx.data_dir.join("snapshots").join(timestamp.to_string());
+            match ctx.store.snapshot(&snap_dir) {
+                Ok(count) => {
+                    ctx.interface.display_status(&format!(
+                        "Snapshot saved: {count} segments at {}",
+                        snap_dir.display()
+                    ));
+                }
+                Err(e) => {
+                    ctx.interface.display_status(&format!("Snapshot failed: {e}"));
+                }
+            }
+        }
+        "/restore" if !arg.is_empty() => {
+            let snap_dir = std::path::PathBuf::from(arg);
+            if !snap_dir.exists() {
+                // Try relative to snapshots directory
+                let relative = ctx.data_dir.join("snapshots").join(arg);
+                if relative.exists() {
+                    match ctx.store.restore_from_snapshot(&relative) {
+                        Ok(count) => {
+                            ctx.interface.display_status(&format!("Restored {count} segments from snapshot"));
+                        }
+                        Err(e) => {
+                            ctx.interface.display_status(&format!("Restore failed: {e}"));
+                        }
+                    }
+                } else {
+                    ctx.interface.display_status(&format!("Snapshot not found: {arg}"));
+                }
+            } else {
+                match ctx.store.restore_from_snapshot(&snap_dir) {
+                    Ok(count) => {
+                        ctx.interface.display_status(&format!("Restored {count} segments from snapshot"));
+                    }
+                    Err(e) => {
+                        ctx.interface.display_status(&format!("Restore failed: {e}"));
+                    }
+                }
+            }
+        }
         "/help" => {
             ctx.interface.display("/goals         — list active goals");
             ctx.interface.display("/goal <text>   — create a new goal");
             ctx.interface.display("/remember <text> — store knowledge explicitly");
             ctx.interface.display("/forget <id>   — remove a stored segment by ID prefix");
+            ctx.interface.display("/tag <id> <k>=<v> — add a tag to a segment");
             ctx.interface.display("/status        — show system status");
             ctx.interface.display("/sensorium     — show observation stats");
             ctx.interface.display("/consent       — list consent policies");
@@ -737,6 +923,10 @@ async fn handle_command(
             ctx.interface.display("/trust <id>      — upgrade peer to Trusted");
             ctx.interface.display("/block <id>      — block a peer");
             ctx.interface.display("/federate        — show federation status");
+            ctx.interface.display("/snapshot         — save VectorFS snapshot");
+            ctx.interface.display("/restore <name>  — restore from a snapshot");
+            ctx.interface.display("/sleep           — enter dormancy (sensorium logs to Cold only)");
+            ctx.interface.display("/wake            — resume from sleep with summary");
             ctx.interface.display("/quit          — end session");
         }
         _ => {

@@ -184,6 +184,88 @@ impl MmapVectorStore {
         }
         Ok(())
     }
+
+    /// Create a snapshot of the entire store at the given directory.
+    /// Copies all segment files and metadata atomically.
+    pub fn snapshot(&self, snapshot_dir: &Path) -> Result<usize> {
+        let snap_segments = snapshot_dir.join("segments");
+        fs::create_dir_all(&snap_segments)?;
+
+        // Copy metadata
+        let meta_src = self.base_dir.join("meta.json");
+        if meta_src.exists() {
+            fs::copy(&meta_src, snapshot_dir.join("meta.json"))?;
+        } else {
+            Self::write_meta(&snapshot_dir.join("meta.json"), self.dimensionality)?;
+        }
+
+        // Copy all segment files
+        let segments = self.segments.read();
+        let mut count = 0;
+        for segment in segments.values() {
+            let data = bincode::serialize(segment)?;
+            let path = snap_segments.join(format!("{}.bin", segment.id.0));
+            fs::write(&path, &data)?;
+            count += 1;
+        }
+
+        tracing::info!(
+            "Snapshot created at {} ({count} segments)",
+            snapshot_dir.display()
+        );
+        Ok(count)
+    }
+
+    /// Restore segments from a snapshot directory into this store.
+    /// Existing segments with the same ID are overwritten.
+    pub fn restore_from_snapshot(&self, snapshot_dir: &Path) -> Result<usize> {
+        let snap_segments = snapshot_dir.join("segments");
+        if !snap_segments.exists() {
+            return Err(AnimusError::Storage(format!(
+                "snapshot directory has no segments: {}",
+                snapshot_dir.display()
+            )));
+        }
+
+        let mut count = 0;
+        for entry in fs::read_dir(&snap_segments)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "bin") {
+                let data = fs::read(&path)?;
+                if data.len() as u64 > MAX_SEGMENT_BYTES {
+                    tracing::warn!("Skipping oversized snapshot segment: {}", path.display());
+                    continue;
+                }
+                match bincode::deserialize::<Segment>(&data) {
+                    Ok(segment) => {
+                        if segment.embedding.len() != self.dimensionality {
+                            tracing::warn!(
+                                "Skipping snapshot segment {} (dim {} != {})",
+                                segment.id.0,
+                                segment.embedding.len(),
+                                self.dimensionality
+                            );
+                            continue;
+                        }
+                        self.index.insert(segment.id, &segment.embedding)?;
+                        self.persist_segment(&segment)?;
+                        self.segments.write().insert(segment.id, segment);
+                        count += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skipping corrupt snapshot segment {}: {e}", path.display());
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "Restored {count} segments from snapshot at {}",
+            snapshot_dir.display()
+        );
+        Ok(count)
+    }
 }
 
 impl VectorStore for MmapVectorStore {
@@ -298,6 +380,9 @@ impl VectorStore for MmapVectorStore {
         }
         if let Some(assoc) = update.associations {
             seg.associations = assoc;
+        }
+        if let Some(tags) = update.tags {
+            seg.tags = tags;
         }
 
         let segment_clone = seg.clone();
