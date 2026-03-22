@@ -34,9 +34,16 @@ Available commands the human can use:
 - /thread new <name> — create a new reasoning thread
 - /thread switch <id> — switch to a different thread
 - /peers — list discovered federation peers
+- /tag <id> <key>=<value> — label a segment for categorization/federation
+- /accept — record that the last response used good knowledge
+- /correct — record that the last response used wrong knowledge
+- /classify <id> <class> — set knowledge decay class (factual/procedural/episodic/opinion/general)
+- /health <id> — show segment health details (Bayesian confidence, decay, access patterns)
 - /trust <id> — upgrade a peer to Trusted
 - /block <id> — block a peer
 - /federate — show federation status
+- /sleep — enter dormancy (sensorium continues in Cold-only mode)
+- /wake — resume from sleep with a summary of what happened
 - /quit — end session
 
 Be concise and helpful. You are not a chatbot — you are a persistent, aware entity."#;
@@ -120,10 +127,14 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         embedder.clone(),
     )?);
 
+    // Shared sleep flag for background tasks
+    let sleeping_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Start background event processing loop
     let orch_clone = orchestrator.clone();
     let store_clone = store.clone();
     let embedder_clone = embedder.clone();
+    let sleeping_bg = sleeping_flag.clone();
     let mut bus_rx = event_bus.subscribe();
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
@@ -140,7 +151,7 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                                     continue;
                                 }
                             };
-                            let segment = animus_core::Segment::new(
+                            let mut segment = animus_core::Segment::new(
                                 animus_core::Content::Structured(event.data.clone()),
                                 embedding,
                                 animus_core::Source::Observation {
@@ -148,6 +159,11 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                                     raw_event_id: event.id,
                                 },
                             );
+                            segment.infer_decay_class();
+                            // During sleep, observations go to Cold tier only
+                            if sleeping_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                                segment.tier = animus_core::Tier::Cold;
+                            }
                             if let Err(e) = store_clone.store(segment) {
                                 tracing::warn!("Failed to store observation: {e}");
                             }
@@ -173,6 +189,22 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     network_monitor.start();
     tracing::info!("NetworkMonitor started (30s poll interval)");
 
+    // Start process monitor sensor
+    let mut process_monitor = animus_sensorium::sensors::process_monitor::ProcessMonitor::new(
+        event_bus.clone(),
+        std::time::Duration::from_secs(30),
+    );
+    process_monitor.start();
+    tracing::info!("ProcessMonitor started (30s poll interval)");
+
+    // Start clipboard monitor sensor
+    let mut clipboard_monitor = animus_sensorium::sensors::clipboard_monitor::ClipboardMonitor::new(
+        event_bus.clone(),
+        std::time::Duration::from_secs(5),
+    );
+    clipboard_monitor.start();
+    tracing::info!("ClipboardMonitor started (5s poll interval)");
+
     // File watcher (started via /watch command)
     let file_watcher: Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>> =
         Arc::new(parking_lot::Mutex::new(None));
@@ -190,6 +222,12 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
             ))
         }
     };
+
+    // Initialize quality tracker
+    let quality_path = data_dir.join("quality.bin");
+    let quality_tracker = Arc::new(parking_lot::Mutex::new(
+        animus_mnemos::quality::QualityTracker::load(&quality_path)?,
+    ));
 
     // Initialize goal manager
     let goals_path = data_dir.join("goals.bin");
@@ -220,6 +258,19 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         None
     };
 
+    // Start periodic tier management (every 10 minutes)
+    let tier_store = store.clone();
+    tokio::spawn(async move {
+        let tier_manager = animus_vectorfs::tier_manager::TierManager::new(
+            tier_store,
+            animus_core::tier::TierConfig::default(),
+        );
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            tier_manager.run_cycle();
+        }
+    });
+
     // Start periodic memory consolidation (every 5 minutes)
     let consolidation_store = store.clone();
     tokio::spawn(async move {
@@ -244,6 +295,32 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
         }
     });
 
+    // Start periodic health sweep (every 15 minutes)
+    // Recomputes health scores and logs segments with severely degraded confidence.
+    let health_store = store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(900)).await;
+            let all_ids = health_store.segment_ids(None);
+            let mut degraded = 0usize;
+            for id in &all_ids {
+                if let Ok(Some(seg)) = health_store.get_raw(*id) {
+                    let health = seg.health_score();
+                    if health < 0.1 && seg.tier != animus_core::Tier::Cold {
+                        tracing::debug!(
+                            "segment {} health={health:.3} — degraded",
+                            id.0.to_string().get(..8).unwrap_or("?")
+                        );
+                        degraded += 1;
+                    }
+                }
+            }
+            if degraded > 0 {
+                tracing::info!("Health sweep: {degraded}/{} segments degraded", all_ids.len());
+            }
+        }
+    });
+
     // Initialize terminal interface
     let interface = TerminalInterface::new(">> ".to_string());
     let instance_str = format!("{}", identity.instance_id);
@@ -251,6 +328,10 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
     if let Some(thread) = scheduler.active_thread() {
         interface.display_status(&format!("Active thread: {}", thread.name));
     }
+
+    // Sleep/wake state
+    let mut is_sleeping = false;
+    let mut sleep_started: Option<chrono::DateTime<chrono::Utc>> = None;
 
     // Main conversation loop
     loop {
@@ -274,11 +355,20 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
                 event_bus: &event_bus,
                 file_watcher: &file_watcher,
                 sensorium: &orchestrator,
+                is_sleeping: &mut is_sleeping,
+                sleep_started: &mut sleep_started,
+                sleeping_flag: &sleeping_flag,
             };
             match handle_command(&input, &mut ctx).await? {
                 CommandResult::Continue => continue,
                 CommandResult::Quit => break,
             }
+        }
+
+        // While sleeping, reject conversational input
+        if is_sleeping {
+            interface.display_status("Sleeping. Use /wake to resume, /status to check, or /quit to exit.");
+            continue;
         }
 
         // Process through reasoning thread
@@ -303,12 +393,16 @@ async fn run(data_dir: PathBuf) -> animus_core::Result<()> {
 
     // Stop sensors
     network_monitor.stop();
+    process_monitor.stop();
     if let Some(fw) = file_watcher.lock().take() {
         fw.stop();
     }
 
     // Persist state
     goals.save(&goals_path)?;
+    if let Err(e) = quality_tracker.lock().save(&quality_path) {
+        tracing::warn!("Failed to save quality tracker: {e}");
+    }
     store.flush()?;
     interface.display_status("Session ended. Memory persisted.");
 
@@ -366,6 +460,9 @@ struct CommandContext<'a> {
     event_bus: &'a Arc<EventBus>,
     file_watcher: &'a Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>>,
     sensorium: &'a Arc<SensoriumOrchestrator>,
+    is_sleeping: &'a mut bool,
+    sleep_started: &'a mut Option<chrono::DateTime<chrono::Utc>>,
+    sleeping_flag: &'a Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn handle_command(
@@ -380,6 +477,72 @@ async fn handle_command(
         "/quit" | "/exit" | "/q" => {
             return Ok(CommandResult::Quit);
         }
+        "/sleep" => {
+            if *ctx.is_sleeping {
+                ctx.interface.display_status("Already sleeping.");
+            } else {
+                *ctx.is_sleeping = true;
+                *ctx.sleep_started = Some(chrono::Utc::now());
+                ctx.sleeping_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                ctx.interface.display_status("Entering sleep mode. Sensorium continues logging to Cold tier.");
+                ctx.interface.display_status("Use /wake to resume, /status to check state.");
+            }
+        }
+        "/wake" => {
+            if !*ctx.is_sleeping {
+                ctx.interface.display_status("Already awake.");
+            } else {
+                let sleep_start = ctx.sleep_started.take().unwrap_or_else(chrono::Utc::now);
+                *ctx.is_sleeping = false;
+                ctx.sleeping_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+
+                // Summarize what happened during sleep
+                let cold_segments = ctx.store.segment_ids(Some(animus_core::Tier::Cold));
+                let created_during_sleep: Vec<_> = cold_segments.iter().filter(|id| {
+                    ctx.store.get_raw(**id).ok().flatten().is_some_and(|s| s.created >= sleep_start)
+                }).collect();
+
+                let duration = chrono::Utc::now() - sleep_start;
+                let hours = duration.num_hours();
+                let minutes = duration.num_minutes() % 60;
+
+                ctx.interface.display_status(&format!(
+                    "Waking up. Slept for {}h {}m.",
+                    hours, minutes
+                ));
+
+                if created_during_sleep.is_empty() {
+                    ctx.interface.display_status("Nothing notable happened while sleeping.");
+                } else {
+                    ctx.interface.display_status(&format!(
+                        "{} observations logged during sleep:",
+                        created_during_sleep.len()
+                    ));
+                    for (i, id) in created_during_sleep.iter().take(10).enumerate() {
+                        if let Ok(Some(seg)) = ctx.store.get_raw(**id) {
+                            let preview = match &seg.content {
+                                animus_core::Content::Text(t) => {
+                                    if t.len() > 80 { format!("{}...", &t[..80]) } else { t.clone() }
+                                }
+                                animus_core::Content::Structured(v) => {
+                                    let s = v.to_string();
+                                    if s.len() > 80 { format!("{}...", &s[..80]) } else { s }
+                                }
+                                animus_core::Content::Binary { mime_type, .. } => format!("[binary: {mime_type}]"),
+                                animus_core::Content::Reference { uri, .. } => format!("[ref: {uri}]"),
+                            };
+                            ctx.interface.display(&format!("  {}. {}", i + 1, preview));
+                        }
+                    }
+                    if created_during_sleep.len() > 10 {
+                        ctx.interface.display(&format!(
+                            "  ... and {} more",
+                            created_during_sleep.len() - 10
+                        ));
+                    }
+                }
+            }
+        }
         "/status" => {
             let total = ctx.store.count(None);
             let warm = ctx.store.count(Some(animus_core::Tier::Warm));
@@ -388,7 +551,52 @@ async fn handle_command(
             ctx.interface.display_status(&format!(
                 "Segments: {total} total ({hot} hot, {warm} warm, {cold} cold)"
             ));
+
+            // Aggregate quality metrics
+            if total > 0 {
+                let all_ids = ctx.store.segment_ids(None);
+                let mut sum_health = 0.0_f32;
+                let mut sum_confidence = 0.0_f32;
+                let mut decay_counts = [0usize; 5]; // Factual, Procedural, Episodic, Opinion, General
+                let mut count = 0usize;
+                for id in &all_ids {
+                    if let Ok(Some(seg)) = ctx.store.get_raw(*id) {
+                        sum_health += seg.health_score();
+                        sum_confidence += seg.bayesian_confidence();
+                        match seg.decay_class {
+                            animus_core::DecayClass::Factual => decay_counts[0] += 1,
+                            animus_core::DecayClass::Procedural => decay_counts[1] += 1,
+                            animus_core::DecayClass::Episodic => decay_counts[2] += 1,
+                            animus_core::DecayClass::Opinion => decay_counts[3] += 1,
+                            animus_core::DecayClass::General => decay_counts[4] += 1,
+                        }
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    let avg_health = sum_health / count as f32;
+                    let avg_conf = sum_confidence / count as f32;
+                    ctx.interface.display_status(&format!(
+                        "Quality: avg health {avg_health:.2}, avg confidence {avg_conf:.2}"
+                    ));
+                    ctx.interface.display_status(&format!(
+                        "Knowledge: {} factual, {} procedural, {} episodic, {} opinion, {} general",
+                        decay_counts[0], decay_counts[1], decay_counts[2],
+                        decay_counts[3], decay_counts[4]
+                    ));
+                }
+            }
+
             ctx.interface.display_status(&format!("Goals: {} active", ctx.goals.active_goals().len()));
+            if *ctx.is_sleeping {
+                let since = ctx.sleep_started.map(|t| {
+                    let d = chrono::Utc::now() - t;
+                    format!("{}h {}m", d.num_hours(), d.num_minutes() % 60)
+                }).unwrap_or_else(|| "unknown".to_string());
+                ctx.interface.display_status(&format!("State: SLEEPING (for {since})"));
+            } else {
+                ctx.interface.display_status("State: AWAKE");
+            }
         }
         "/goals" => {
             let active = ctx.goals.active_goals();
@@ -416,16 +624,15 @@ async fn handle_command(
         }
         "/remember" if !arg.is_empty() => {
             use animus_core::segment::{Content, Segment, Source};
-            use animus_core::EventId;
             let embedding = ctx.embedder.embed_text(arg).await?;
-            let segment = Segment::new(
+            let mut segment = Segment::new(
                 Content::Text(arg.to_string()),
                 embedding,
-                Source::Observation {
-                    event_type: "user-remember".to_string(),
-                    raw_event_id: EventId::new(),
+                Source::Manual {
+                    description: "user-remember".to_string(),
                 },
             );
+            segment.infer_decay_class();
             let id = ctx.store.store(segment)?;
             ctx.interface.display_status(&format!(
                 "Remembered: {} (segment {})",
@@ -449,6 +656,187 @@ async fn handle_command(
                         "Forgotten: segment {}",
                         id.0.to_string().get(..8).unwrap_or("?")
                     ));
+                }
+                n => ctx.interface.display_status(&format!(
+                    "{n} segments match '{arg}' — be more specific"
+                )),
+            }
+        }
+        // /accept — record positive feedback for segments used in the last turn
+        "/accept" => {
+            if let Some(thread) = ctx.scheduler.active_thread() {
+                let retrieved = thread.last_retrieved_ids().to_vec();
+                if retrieved.is_empty() {
+                    ctx.interface.display_status("No retrieved segments to accept (no knowledge was used in the last response).");
+                } else {
+                    let mut updated = 0;
+                    for id in &retrieved {
+                        if let Ok(Some(mut seg)) = ctx.store.get_raw(*id) {
+                            seg.record_positive_feedback();
+                            if let Err(e) = ctx.store.update_meta(*id, animus_vectorfs::SegmentUpdate {
+                                alpha: Some(seg.alpha),
+                                confidence: Some(seg.confidence),
+                                ..Default::default()
+                            }) {
+                                tracing::warn!("Failed to update feedback for {id}: {e}");
+                            } else {
+                                updated += 1;
+                            }
+                        }
+                    }
+                    ctx.interface.display_status(&format!(
+                        "Accepted: positive feedback recorded for {updated} knowledge segment(s)"
+                    ));
+                }
+            } else {
+                ctx.interface.display_status("No active thread.");
+            }
+        }
+        // /correct — record negative feedback for segments used in the last turn
+        "/correct" => {
+            if let Some(thread) = ctx.scheduler.active_thread() {
+                let retrieved = thread.last_retrieved_ids().to_vec();
+                if retrieved.is_empty() {
+                    ctx.interface.display_status("No retrieved segments to correct (no knowledge was used in the last response).");
+                } else {
+                    let mut updated = 0;
+                    for id in &retrieved {
+                        if let Ok(Some(mut seg)) = ctx.store.get_raw(*id) {
+                            seg.record_negative_feedback();
+                            if let Err(e) = ctx.store.update_meta(*id, animus_vectorfs::SegmentUpdate {
+                                beta: Some(seg.beta),
+                                confidence: Some(seg.confidence),
+                                ..Default::default()
+                            }) {
+                                tracing::warn!("Failed to update feedback for {id}: {e}");
+                            } else {
+                                updated += 1;
+                            }
+                        }
+                    }
+                    ctx.interface.display_status(&format!(
+                        "Corrected: negative feedback recorded for {updated} knowledge segment(s)"
+                    ));
+                }
+            } else {
+                ctx.interface.display_status("No active thread.");
+            }
+        }
+        // /tag <segment-prefix> <key>=<value> — add a tag to a segment
+        "/tag" if !arg.is_empty() => {
+            let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            if parts.len() < 2 || !parts[1].contains('=') {
+                ctx.interface.display_status("Usage: /tag <segment-id-prefix> <key>=<value>");
+            } else {
+                let prefix = parts[0];
+                let kv: Vec<&str> = parts[1].splitn(2, '=').collect();
+                let (key, value) = (kv[0].to_string(), kv[1].to_string());
+
+                let all_ids = ctx.store.segment_ids(None);
+                let matches: Vec<_> = all_ids
+                    .iter()
+                    .filter(|id| id.0.to_string().starts_with(prefix))
+                    .collect();
+                match matches.len() {
+                    0 => ctx.interface.display_status(&format!("No segment found matching '{prefix}'")),
+                    1 => {
+                        let id = *matches[0];
+                        // Get current tags, add the new one
+                        let mut tags = match ctx.store.get_raw(id)? {
+                            Some(seg) => seg.tags,
+                            None => std::collections::HashMap::new(),
+                        };
+                        tags.insert(key.clone(), value.clone());
+                        ctx.store.update_meta(id, animus_vectorfs::SegmentUpdate {
+                            tags: Some(tags),
+                            ..Default::default()
+                        })?;
+                        ctx.interface.display_status(&format!(
+                            "Tagged segment {} with {key}={value}",
+                            id.0.to_string().get(..8).unwrap_or("?")
+                        ));
+                    }
+                    n => ctx.interface.display_status(&format!(
+                        "{n} segments match '{prefix}' — be more specific"
+                    )),
+                }
+            }
+        }
+        // /classify <segment-prefix> <class> — set decay class for a segment
+        "/classify" if !arg.is_empty() => {
+            let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                ctx.interface.display_status("Usage: /classify <segment-id-prefix> <factual|procedural|episodic|opinion|general>");
+            } else {
+                let prefix = parts[0];
+                let class_str = parts[1].to_lowercase();
+                let decay_class = match class_str.as_str() {
+                    "factual" => Some(animus_core::DecayClass::Factual),
+                    "procedural" => Some(animus_core::DecayClass::Procedural),
+                    "episodic" => Some(animus_core::DecayClass::Episodic),
+                    "opinion" => Some(animus_core::DecayClass::Opinion),
+                    "general" => Some(animus_core::DecayClass::General),
+                    _ => None,
+                };
+                match decay_class {
+                    None => {
+                        ctx.interface.display_status("Valid classes: factual, procedural, episodic, opinion, general");
+                    }
+                    Some(dc) => {
+                        let all_ids = ctx.store.segment_ids(None);
+                        let matches: Vec<_> = all_ids
+                            .iter()
+                            .filter(|id| id.0.to_string().starts_with(prefix))
+                            .collect();
+                        match matches.len() {
+                            0 => ctx.interface.display_status(&format!("No segment found matching '{prefix}'")),
+                            1 => {
+                                let id = *matches[0];
+                                ctx.store.update_meta(id, animus_vectorfs::SegmentUpdate {
+                                    decay_class: Some(dc),
+                                    ..Default::default()
+                                })?;
+                                ctx.interface.display_status(&format!(
+                                    "Classified segment {} as {class_str} (half-life: {} days)",
+                                    id.0.to_string().get(..8).unwrap_or("?"),
+                                    dc.half_life_secs() / 86400.0
+                                ));
+                            }
+                            n => ctx.interface.display_status(&format!(
+                                "{n} segments match '{prefix}' — be more specific"
+                            )),
+                        }
+                    }
+                }
+            }
+        }
+        // /health <segment-prefix> — show health details for a segment
+        "/health" if !arg.is_empty() => {
+            let all_ids = ctx.store.segment_ids(None);
+            let matches: Vec<_> = all_ids
+                .iter()
+                .filter(|id| id.0.to_string().starts_with(arg))
+                .collect();
+            match matches.len() {
+                0 => ctx.interface.display_status(&format!("No segment found matching '{arg}'")),
+                1 => {
+                    let id = *matches[0];
+                    if let Some(seg) = ctx.store.get_raw(id)? {
+                        let short_id = seg.id.0.to_string();
+                        let short_id = short_id.get(..8).unwrap_or("?");
+                        ctx.interface.display(&format!("Segment {short_id} health:"));
+                        ctx.interface.display(&format!("  Bayesian confidence: {:.3} (alpha={:.1}, beta={:.1})",
+                            seg.bayesian_confidence(), seg.alpha, seg.beta));
+                        ctx.interface.display(&format!("  Temporal decay: {:.3} (class={:?})",
+                            seg.temporal_decay_factor(), seg.decay_class));
+                        ctx.interface.display(&format!("  Health score: {:.3}", seg.health_score()));
+                        ctx.interface.display(&format!("  Relevance: {:.3}", seg.relevance_score));
+                        ctx.interface.display(&format!("  Access count: {}", seg.access_count));
+                        ctx.interface.display(&format!("  Tier: {:?}", seg.tier));
+
+                        let age_days = (chrono::Utc::now() - seg.created).num_hours() as f64 / 24.0;
+                        ctx.interface.display(&format!("  Age: {:.1} days", age_days));
+                    }
                 }
                 n => ctx.interface.display_status(&format!(
                     "{n} segments match '{arg}' — be more specific"
@@ -683,11 +1071,59 @@ async fn handle_command(
                 ctx.interface.display_status("Federation: disabled");
             }
         }
+        "/snapshot" => {
+            let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+            let snap_dir = ctx.data_dir.join("snapshots").join(timestamp.to_string());
+            match ctx.store.snapshot(&snap_dir) {
+                Ok(count) => {
+                    ctx.interface.display_status(&format!(
+                        "Snapshot saved: {count} segments at {}",
+                        snap_dir.display()
+                    ));
+                }
+                Err(e) => {
+                    ctx.interface.display_status(&format!("Snapshot failed: {e}"));
+                }
+            }
+        }
+        "/restore" if !arg.is_empty() => {
+            let snap_dir = std::path::PathBuf::from(arg);
+            if !snap_dir.exists() {
+                // Try relative to snapshots directory
+                let relative = ctx.data_dir.join("snapshots").join(arg);
+                if relative.exists() {
+                    match ctx.store.restore_from_snapshot(&relative) {
+                        Ok(count) => {
+                            ctx.interface.display_status(&format!("Restored {count} segments from snapshot"));
+                        }
+                        Err(e) => {
+                            ctx.interface.display_status(&format!("Restore failed: {e}"));
+                        }
+                    }
+                } else {
+                    ctx.interface.display_status(&format!("Snapshot not found: {arg}"));
+                }
+            } else {
+                match ctx.store.restore_from_snapshot(&snap_dir) {
+                    Ok(count) => {
+                        ctx.interface.display_status(&format!("Restored {count} segments from snapshot"));
+                    }
+                    Err(e) => {
+                        ctx.interface.display_status(&format!("Restore failed: {e}"));
+                    }
+                }
+            }
+        }
         "/help" => {
             ctx.interface.display("/goals         — list active goals");
             ctx.interface.display("/goal <text>   — create a new goal");
             ctx.interface.display("/remember <text> — store knowledge explicitly");
             ctx.interface.display("/forget <id>   — remove a stored segment by ID prefix");
+            ctx.interface.display("/accept        — knowledge in last response was correct");
+            ctx.interface.display("/correct       — knowledge in last response was wrong");
+            ctx.interface.display("/tag <id> <k>=<v> — add a tag to a segment");
+            ctx.interface.display("/classify <id> <class> — set knowledge decay class");
+            ctx.interface.display("/health <id>   — show segment health details");
             ctx.interface.display("/status        — show system status");
             ctx.interface.display("/sensorium     — show observation stats");
             ctx.interface.display("/consent       — list consent policies");
@@ -699,6 +1135,10 @@ async fn handle_command(
             ctx.interface.display("/trust <id>      — upgrade peer to Trusted");
             ctx.interface.display("/block <id>      — block a peer");
             ctx.interface.display("/federate        — show federation status");
+            ctx.interface.display("/snapshot         — save VectorFS snapshot");
+            ctx.interface.display("/restore <name>  — restore from a snapshot");
+            ctx.interface.display("/sleep           — enter dormancy (sensorium logs to Cold only)");
+            ctx.interface.display("/wake            — resume from sleep with summary");
             ctx.interface.display("/quit          — end session");
         }
         _ => {

@@ -1,6 +1,6 @@
 use animus_core::error::Result;
 use animus_core::identity::SegmentId;
-use animus_core::segment::{Content, Segment, Source, Tier};
+use animus_core::segment::{Content, DecayClass, Segment, Source, Tier};
 use animus_vectorfs::VectorStore;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -140,11 +140,22 @@ impl<S: VectorStore> Consolidator<S> {
             .collect::<Vec<_>>()
             .join("\n---\n");
 
-        // Use the highest confidence
-        let max_confidence = segments
+        // Merge Bayesian evidence: sum alpha/beta from all sources.
+        // This preserves total evidence across the consolidation.
+        let merged_alpha: f32 = segments.iter().map(|s| s.alpha).sum();
+        let merged_beta: f32 = segments.iter().map(|s| s.beta).sum();
+
+        // Use the slowest decay class (most conservative: if any knowledge
+        // is factual, the merged segment should decay slowly)
+        let slowest_decay = segments
             .iter()
-            .map(|s| s.confidence)
-            .fold(0.0f32, f32::max);
+            .map(|s| s.decay_class)
+            .max_by(|a, b| {
+                a.half_life_secs()
+                    .partial_cmp(&b.half_life_secs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(DecayClass::General);
 
         let lineage: Vec<SegmentId> = segments.iter().map(|s| s.id).collect();
 
@@ -155,7 +166,10 @@ impl<S: VectorStore> Consolidator<S> {
                 merged_from: lineage.clone(),
             },
         );
-        merged.confidence = max_confidence;
+        merged.alpha = merged_alpha;
+        merged.beta = merged_beta;
+        merged.confidence = merged.bayesian_confidence();
+        merged.decay_class = slowest_decay;
         merged.lineage = lineage;
         merged.tier = Tier::Warm;
 

@@ -12,7 +12,8 @@ pub struct DefaultEvictionStrategy;
 impl EvictionStrategy for DefaultEvictionStrategy {
     fn eviction_score(&self, segment: &Segment, query_embedding: &[f32]) -> f32 {
         let similarity = cosine_similarity(&segment.embedding, query_embedding);
-        0.5 * similarity + 0.3 * segment.relevance_score + 0.2 * segment.confidence
+        // Use health_score which incorporates Bayesian confidence and temporal decay
+        0.5 * similarity + 0.3 * segment.relevance_score + 0.2 * segment.health_score()
     }
 }
 

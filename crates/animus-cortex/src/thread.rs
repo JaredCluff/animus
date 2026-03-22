@@ -32,6 +32,9 @@ pub struct ReasoningThread<S: VectorStore> {
     status: ThreadStatus,
     /// Pending inter-thread signals (inbox).
     pending_signals: Vec<Signal>,
+    /// Segment IDs retrieved (not anchors) in the most recent turn.
+    /// Used for explicit feedback commands (/accept, /correct).
+    last_retrieved_ids: Vec<SegmentId>,
 }
 
 impl<S: VectorStore> ReasoningThread<S> {
@@ -53,6 +56,7 @@ impl<S: VectorStore> ReasoningThread<S> {
             embedding_dim,
             status: ThreadStatus::Active,
             pending_signals: Vec::new(),
+            last_retrieved_ids: Vec::new(),
         }
     }
 
@@ -66,7 +70,7 @@ impl<S: VectorStore> ReasoningThread<S> {
     ) -> Result<String> {
         // Store user input as a segment
         let user_embedding = embedder.embed_text(user_input).await?;
-        let user_segment = Segment::new(
+        let mut user_segment = Segment::new(
             Content::Text(user_input.to_string()),
             user_embedding.clone(),
             Source::Conversation {
@@ -74,6 +78,7 @@ impl<S: VectorStore> ReasoningThread<S> {
                 turn: self.conversation.len() as u64,
             },
         );
+        user_segment.infer_decay_class();
         let user_seg_id = self.store.store(user_segment)?;
         self.stored_turn_ids.push(user_seg_id);
 
@@ -111,9 +116,37 @@ impl<S: VectorStore> ReasoningThread<S> {
         // Call the LLM
         let output = engine.reason(&enriched_system, &self.conversation).await?;
 
+        // Track which knowledge segments were retrieved (not conversation anchors).
+        // Used for implicit feedback now and explicit feedback via /accept, /correct.
+        let anchor_set: std::collections::HashSet<_> =
+            self.stored_turn_ids.iter().copied().collect();
+        self.last_retrieved_ids = context
+            .segments
+            .iter()
+            .filter(|s| !anchor_set.contains(&s.id))
+            .map(|s| s.id)
+            .collect();
+
+        // Implicit Bayesian feedback: retrieved segments get a small positive signal.
+        for seg in &context.segments {
+            if !anchor_set.contains(&seg.id) {
+                let new_alpha = seg.alpha + 0.1;
+                if let Err(e) = self.store.update_meta(
+                    seg.id,
+                    animus_vectorfs::SegmentUpdate {
+                        alpha: Some(new_alpha),
+                        confidence: Some(new_alpha / (new_alpha + seg.beta)),
+                        ..Default::default()
+                    },
+                ) {
+                    tracing::debug!("implicit feedback update failed for {}: {e}", seg.id);
+                }
+            }
+        }
+
         // Store assistant response as a segment
         let response_embedding = embedder.embed_text(&output.content).await?;
-        let response_segment = Segment::new(
+        let mut response_segment = Segment::new(
             Content::Text(output.content.clone()),
             response_embedding,
             Source::Conversation {
@@ -121,6 +154,7 @@ impl<S: VectorStore> ReasoningThread<S> {
                 turn: self.conversation.len() as u64,
             },
         );
+        response_segment.infer_decay_class();
         let response_seg_id = self.store.store(response_segment)?;
         self.stored_turn_ids.push(response_seg_id);
 
@@ -188,6 +222,12 @@ impl<S: VectorStore> ReasoningThread<S> {
     /// Get stored turn segment IDs.
     pub fn stored_turn_ids(&self) -> &[SegmentId] {
         &self.stored_turn_ids
+    }
+
+    /// Get segment IDs that were retrieved (not conversation anchors) in the last turn.
+    /// Empty if no turn has been processed yet.
+    pub fn last_retrieved_ids(&self) -> &[SegmentId] {
+        &self.last_retrieved_ids
     }
 
     /// Get the current thread status.

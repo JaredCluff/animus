@@ -183,6 +183,21 @@ impl AnimusIdentity {
         }
     }
 
+    /// Create a fork of this identity — a new AILF that shares lineage.
+    /// The fork gets a new keypair and instance ID but records this identity as parent.
+    pub fn fork(&self) -> Self {
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+        Self {
+            signing_key,
+            instance_id: InstanceId::new(),
+            parent_id: Some(self.instance_id),
+            born: chrono::Utc::now(),
+            generation: self.generation + 1,
+            base_model: self.base_model.clone(),
+        }
+    }
+
     /// Get the public verifying key.
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()

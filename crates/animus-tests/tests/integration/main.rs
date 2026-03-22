@@ -26,3 +26,5 @@ mod federation_audit;
 mod federation_auth;
 mod federation_knowledge;
 mod federation_e2e;
+mod quality_gate;
+mod thompson_sampling;

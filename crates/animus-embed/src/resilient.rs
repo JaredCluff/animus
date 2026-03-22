@@ -132,3 +132,82 @@ impl EmbeddingService for ResilientEmbedding {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a ResilientEmbedding with Ollama pointed at a dead port.
+    fn make_resilient(dim: usize) -> ResilientEmbedding {
+        let ollama = OllamaEmbedding::new("http://127.0.0.1:1", "fake-model", dim);
+        ResilientEmbedding::new(ollama, dim)
+    }
+
+    #[tokio::test]
+    async fn test_falls_back_to_synthetic_on_failure() {
+        let r = make_resilient(64);
+        assert!(r.is_ollama_active(), "should start healthy");
+
+        let result = r.embed_text("hello world").await;
+        assert!(result.is_ok(), "should succeed via fallback");
+        assert_eq!(result.unwrap().len(), 64);
+        assert!(!r.is_ollama_active(), "should be marked unhealthy after failure");
+    }
+
+    #[tokio::test]
+    async fn test_batch_falls_back_to_synthetic() {
+        let r = make_resilient(32);
+        let result = r.embed_texts(&["a", "b", "c"]).await;
+        assert!(result.is_ok());
+        let vecs = result.unwrap();
+        assert_eq!(vecs.len(), 3);
+        assert!(vecs.iter().all(|v| v.len() == 32));
+    }
+
+    #[tokio::test]
+    async fn test_model_name_reflects_active_backend() {
+        let r = make_resilient(16);
+        assert_eq!(r.model_name(), "fake-model");
+
+        // Trigger failure
+        let _ = r.embed_text("trigger").await;
+        assert_eq!(r.model_name(), "SyntheticEmbedding (fallback)");
+    }
+
+    #[tokio::test]
+    async fn test_retry_not_attempted_before_interval() {
+        let r = make_resilient(16);
+
+        // Trigger failure
+        let _ = r.embed_text("trigger").await;
+        assert!(!r.is_ollama_active());
+
+        // Second call should NOT attempt Ollama retry (interval not elapsed)
+        // It should go straight to fallback
+        let result = r.embed_text("second").await;
+        assert!(result.is_ok());
+        assert!(!r.is_ollama_active(), "still unhealthy — retry interval not elapsed");
+    }
+
+    #[test]
+    fn test_should_retry_ollama_timing() {
+        let r = make_resilient(16);
+
+        // No failure recorded — should_retry returns true
+        assert!(r.should_retry_ollama());
+
+        // Record a failure
+        r.record_failure();
+        assert!(!r.should_retry_ollama(), "just failed — too soon to retry");
+
+        // Simulate old failure by setting last_failure to 0
+        r.last_failure.store(0, Ordering::Relaxed);
+        assert!(r.should_retry_ollama(), "old failure — should retry now");
+    }
+
+    #[test]
+    fn test_dimensionality() {
+        let r = make_resilient(128);
+        assert_eq!(r.dimensionality(), 128);
+    }
+}

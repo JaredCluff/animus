@@ -11,6 +11,6 @@ pub use config::{AnimusConfig, CortexConfig, EmbeddingConfig, EmbeddingTier, Fed
 pub use embedding::EmbeddingService;
 pub use error::{AnimusError, Result};
 pub use identity::{AnimusIdentity, EventId, GoalId, InstanceId, PolicyId, SegmentId, SnapshotId, ThreadId};
-pub use segment::{Content, Principal, Segment, Source, Tier};
+pub use segment::{Content, DecayClass, Principal, Segment, Source, Tier};
 pub use threading::{ThreadStatus, Signal, SignalPriority};
 pub use tier::TierConfig;

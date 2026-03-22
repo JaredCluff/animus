@@ -46,3 +46,30 @@ fn test_identity_verifying_key() {
     let vk = identity.verifying_key();
     assert_eq!(vk, identity.signing_key.verifying_key());
 }
+
+#[test]
+fn test_identity_fork() {
+    let parent = AnimusIdentity::generate("test-model".to_string());
+    let child = parent.fork();
+
+    // Child should have a different instance ID and keypair
+    assert_ne!(child.instance_id, parent.instance_id);
+    assert_ne!(child.signing_key.to_bytes(), parent.signing_key.to_bytes());
+
+    // Child should record parent lineage
+    assert_eq!(child.parent_id, Some(parent.instance_id));
+    assert_eq!(child.generation, parent.generation + 1);
+    assert_eq!(child.base_model, parent.base_model);
+}
+
+#[test]
+fn test_identity_fork_chain() {
+    let gen0 = AnimusIdentity::generate("test-model".to_string());
+    let gen1 = gen0.fork();
+    let gen2 = gen1.fork();
+
+    assert_eq!(gen0.generation, 0);
+    assert_eq!(gen1.generation, 1);
+    assert_eq!(gen2.generation, 2);
+    assert_eq!(gen2.parent_id, Some(gen1.instance_id));
+}

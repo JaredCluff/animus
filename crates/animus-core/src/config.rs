@@ -154,7 +154,7 @@ impl Default for FederationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind_address: "0.0.0.0".to_string(),
+            bind_address: "127.0.0.1".to_string(),
             port: 0,
             static_peers: Vec::new(),
             relevance_threshold: 0.5,

@@ -8,6 +8,7 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
 use crate::auth::FederationAuth;
+use crate::client::FederationClient;
 use crate::discovery::{DiscoveryEvent, DiscoveryService};
 use crate::knowledge::{
     FederationPermission, FederationPolicy, FederationRule, FederationScope, KnowledgeSharing,
@@ -27,6 +28,7 @@ pub struct FederationOrchestrator<S: VectorStore + Send + Sync + 'static> {
     peers: Arc<RwLock<PeerRegistry>>,
     peers_path: PathBuf,
     server_addr: Option<SocketAddr>,
+    client: Option<FederationClient>,
 }
 
 impl<S: VectorStore + Send + Sync + 'static> FederationOrchestrator<S> {
@@ -71,6 +73,7 @@ impl<S: VectorStore + Send + Sync + 'static> FederationOrchestrator<S> {
             peers,
             peers_path,
             server_addr: None,
+            client: None,
         }
     }
 
@@ -125,6 +128,10 @@ impl<S: VectorStore + Send + Sync + 'static> FederationOrchestrator<S> {
         let actual_addr = server.start(bind_addr).await?;
         self.server_addr = Some(actual_addr);
         tracing::info!("Federation server started on {actual_addr}");
+
+        // Create outbound client for publishing to peers
+        let client_auth = FederationAuth::new(self.identity.clone());
+        self.client = Some(FederationClient::new(client_auth));
 
         // Set up discovery
         let (event_tx, event_rx) = mpsc::channel::<DiscoveryEvent>(64);
@@ -208,6 +215,49 @@ impl<S: VectorStore + Send + Sync + 'static> FederationOrchestrator<S> {
     /// Returns the shared peer registry for runtime commands.
     pub fn peers(&self) -> Arc<RwLock<PeerRegistry>> {
         self.peers.clone()
+    }
+
+    /// Returns a reference to the federation client, if started.
+    pub fn client(&self) -> Option<&FederationClient> {
+        self.client.as_ref()
+    }
+
+    /// Broadcast a segment to all trusted peers.
+    /// Returns results per peer (non-fatal: failures are logged, not propagated).
+    pub async fn broadcast_segment(&self, segment: &animus_core::Segment) {
+        let client = match &self.client {
+            Some(c) => c,
+            None => return,
+        };
+
+        let trusted: Vec<_> = {
+            let registry = self.peers.read();
+            registry
+                .trusted_peers()
+                .iter()
+                .map(|p| (p.info.instance_id, p.info.address))
+                .collect()
+        };
+
+        if trusted.is_empty() {
+            return;
+        }
+
+        let results = client.broadcast_segment(&trusted, segment).await;
+        for (peer_id, result) in results {
+            match result {
+                Ok(remote_id) => {
+                    tracing::debug!(
+                        peer = %peer_id,
+                        remote_segment = %remote_id.0,
+                        "segment broadcast accepted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id, "segment broadcast failed: {e}");
+                }
+            }
+        }
     }
 }
 

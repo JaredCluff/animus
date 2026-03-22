@@ -86,10 +86,8 @@ impl KnowledgeSharing {
             FederationScope::AllNonPrivate => {
                 segment.observable_by.is_empty()
             }
-            FederationScope::ByTag(_key, _value) => {
-                // Tags are not currently in the segment model — match by content
-                // For V0.1, this always returns false
-                false
+            FederationScope::ByTag(key, value) => {
+                segment.tags.get(key) == Some(value)
             }
             FederationScope::BySourceType(source_type) => {
                 let actual = match &segment.source {
