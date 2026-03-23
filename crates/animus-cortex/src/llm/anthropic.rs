@@ -4,10 +4,19 @@ use serde::{Deserialize, Serialize};
 
 use super::{ReasoningEngine, ReasoningOutput, Role, StopReason, ToolCall, ToolDefinition, Turn, TurnContent};
 
+/// How to authenticate with the Anthropic API.
+#[derive(Clone)]
+enum Auth {
+    /// `x-api-key` header (standard purchased API key).
+    ApiKey(String),
+    /// `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` (OAuth token).
+    OAuth(String),
+}
+
 /// Anthropic Claude API provider.
 pub struct AnthropicEngine {
     client: reqwest::Client,
-    api_key: String,
+    auth: Auth,
     model: String,
     max_tokens: usize,
 }
@@ -20,7 +29,21 @@ impl AnthropicEngine {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("failed to build HTTP client"),
-            api_key,
+            auth: Auth::ApiKey(api_key),
+            model,
+            max_tokens,
+        }
+    }
+
+    /// Create using an OAuth token (e.g. from Claude Code credentials).
+    pub fn with_oauth(token: String, model: String, max_tokens: usize) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
+            auth: Auth::OAuth(token),
             model,
             max_tokens,
         }
@@ -32,6 +55,51 @@ impl AnthropicEngine {
             AnimusError::Llm("ANTHROPIC_API_KEY environment variable not set".to_string())
         })?;
         Ok(Self::new(api_key, model.to_string(), max_tokens))
+    }
+
+    /// Create from `ANTHROPIC_OAUTH_TOKEN` environment variable.
+    pub fn from_oauth_env(model: &str, max_tokens: usize) -> Result<Self> {
+        let token = std::env::var("ANTHROPIC_OAUTH_TOKEN").map_err(|_| {
+            AnimusError::Llm("ANTHROPIC_OAUTH_TOKEN environment variable not set".to_string())
+        })?;
+        Ok(Self::with_oauth(token, model.to_string(), max_tokens))
+    }
+
+    /// Read OAuth token from Claude Code credentials file (`~/.claude/.credentials.json`).
+    /// Returns `None` if the file doesn't exist or the token is not present.
+    pub fn token_from_claude_code() -> Option<String> {
+        let path = std::env::var("CLAUDE_CREDENTIALS_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join(".claude/.credentials.json")
+            });
+
+        let data = std::fs::read_to_string(&path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+        let token = v["claudeAiOauth"]["accessToken"].as_str()?.to_string();
+        let expires_at = v["claudeAiOauth"]["expiresAt"].as_u64().unwrap_or(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if expires_at < now_ms.saturating_add(60_000) {
+            return None; // Expired — caller should refresh
+        }
+        Some(token)
+    }
+
+    /// Try the best available auth: Claude Code OAuth → ANTHROPIC_OAUTH_TOKEN → ANTHROPIC_API_KEY.
+    pub fn from_best_available(model: &str, max_tokens: usize) -> Result<Self> {
+        if let Some(token) = Self::token_from_claude_code() {
+            return Ok(Self::with_oauth(token, model.to_string(), max_tokens));
+        }
+        if let Ok(token) = std::env::var("ANTHROPIC_OAUTH_TOKEN") {
+            return Ok(Self::with_oauth(token, model.to_string(), max_tokens));
+        }
+        Self::from_env(model, max_tokens)
     }
 }
 
@@ -163,12 +231,20 @@ impl ReasoningEngine for AnthropicEngine {
             tools: api_tools,
         };
 
-        let response = self
+        let mut builder = self
             .client
             .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+
+        builder = match &self.auth {
+            Auth::ApiKey(key) => builder.header("x-api-key", key),
+            Auth::OAuth(token) => builder
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", "oauth-2025-04-20"),
+        };
+
+        let response = builder
             .json(&request)
             .send()
             .await

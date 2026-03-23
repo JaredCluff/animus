@@ -166,13 +166,16 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             .unwrap_or_else(|_| model_id.clone());
 
         let fallback: Box<dyn animus_cortex::ReasoningEngine> =
-            match AnthropicEngine::from_env(&model_id, 4096) {
+            match AnthropicEngine::from_best_available(&model_id, 4096) {
                 Ok(e) => Box::new(e),
                 Err(e) => {
                     eprintln!("Warning: Could not initialize Anthropic engine: {e}");
-                    eprintln!("Running with mock engine (responses will be placeholder text).");
+                    eprintln!("Running with mock engine. To enable reasoning, one of:");
+                    eprintln!("  1. Mount ~/.claude/.credentials.json (uses Claude Code OAuth)");
+                    eprintln!("  2. Set ANTHROPIC_OAUTH_TOKEN env var");
+                    eprintln!("  3. Set ANTHROPIC_API_KEY env var");
                     Box::new(animus_cortex::MockEngine::new(
-                        "I'm running without an LLM connection. Set ANTHROPIC_API_KEY to enable reasoning.",
+                        "I'm running without an LLM connection. Mount your Claude Code credentials or set ANTHROPIC_API_KEY.",
                     ))
                 }
             };
@@ -180,18 +183,18 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         let mut registry = EngineRegistry::new(fallback);
 
         if let Some(model) = perception_model {
-            if let Ok(engine) = AnthropicEngine::from_env(&model, 1024) {
+            if let Ok(engine) = AnthropicEngine::from_best_available(&model, 1024) {
                 registry.set_engine(CognitiveRole::Perception, Box::new(engine));
                 tracing::info!("Perception engine: {model}");
             }
         }
         if let Some(model) = reflection_model {
-            if let Ok(engine) = AnthropicEngine::from_env(&model, 4096) {
+            if let Ok(engine) = AnthropicEngine::from_best_available(&model, 4096) {
                 registry.set_engine(CognitiveRole::Reflection, Box::new(engine));
                 tracing::info!("Reflection engine: {model}");
             }
         }
-        if let Ok(engine) = AnthropicEngine::from_env(&reasoning_model, 4096) {
+        if let Ok(engine) = AnthropicEngine::from_best_available(&reasoning_model, 4096) {
             registry.set_engine(CognitiveRole::Reasoning, Box::new(engine));
         }
 
@@ -301,7 +304,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let perception_embedder = embedder.clone();
     let perception_event_rx = event_bus.subscribe();
     let perception_engine: Box<dyn animus_cortex::ReasoningEngine> = {
-        match AnthropicEngine::from_env(
+        match AnthropicEngine::from_best_available(
             &std::env::var("ANIMUS_PERCEPTION_MODEL").unwrap_or_default(),
             1024,
         ) {
@@ -342,7 +345,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let reflection_embedder = embedder.clone();
     let reflection_goals = goals.clone();
     let reflection_engine: Box<dyn animus_cortex::ReasoningEngine> = {
-        match AnthropicEngine::from_env(
+        match AnthropicEngine::from_best_available(
             &std::env::var("ANIMUS_REFLECTION_MODEL").unwrap_or_default(),
             4096,
         ) {

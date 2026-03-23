@@ -7,9 +7,11 @@ services:
     container_name: animus
     restart: unless-stopped
 
+    # Allow container to reach host services (e.g. Ollama running on the Mac Studio)
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+
     ports:
-      # Health endpoint — expose on localhost only by default.
-      # Set ANIMUS_HEALTH_BIND=0.0.0.0:8080 and change to "8080:8080" for broader access.
       - "127.0.0.1:8080:8080"
 
     environment:
@@ -17,26 +19,27 @@ services:
       ANIMUS_HEALTH_BIND: "0.0.0.0:8080"
       ANIMUS_LOG_LEVEL: "animus=info"
 
-      # LLM provider (default: Anthropic via API key)
+      # ── LLM: Anthropic via Claude Code OAuth (no API key purchase needed) ──
+      # Mount ~/.claude/.credentials.json below; the bridge reads it automatically.
+      # To use API key instead, set ANTHROPIC_API_KEY and remove the volume mount.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
 
-      # OpenAI (used if ANIMUS_LLM_PROVIDER=openai or ANIMUS_EMBED_PROVIDER=openai)
+      # OpenAI (optional, for ANIMUS_LLM_PROVIDER=openai or ANIMUS_EMBED_PROVIDER=openai)
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
 
-      # Embedding provider (default: ollama via service below)
+      # ── Embedding: Ollama running on the host Mac Studio ────────────────────
       ANIMUS_EMBED_PROVIDER: "${ANIMUS_EMBED_PROVIDER:-ollama}"
-      ANIMUS_OLLAMA_URL: "http://ollama:11434"
+      ANIMUS_OLLAMA_URL: "http://host.containers.internal:11434"
       ANIMUS_EMBED_MODEL: "${ANIMUS_EMBED_MODEL:-mxbai-embed-large}"
 
-      # Federation (disabled by default)
+      # ── Federation (disabled by default) ────────────────────────────────────
       ANIMUS_FEDERATION: "${ANIMUS_FEDERATION:-0}"
 
     volumes:
+      # Persistent AILF data (VectorFS, goals, identity)
       - animus-data:/home/animus/.animus
-
-    depends_on:
-      ollama:
-        condition: service_started
+      # Claude Code OAuth credentials — read-only, for OAuth auth without API key
+      - "${HOME}/.claude/.credentials.json:/home/animus/.claude/.credentials.json:ro"
 
     # Healthcheck using the built-in HTTP endpoint
     healthcheck:
@@ -46,35 +49,8 @@ services:
       retries: 3
       start_period: 10s
 
-  # ── Ollama (embedding + optional local LLM) ─────────────────────────────────
-  ollama:
-    image: docker.io/ollama/ollama:latest
-    container_name: animus-ollama
-    restart: unless-stopped
-
-    ports:
-      # Expose on localhost only — animus connects via the internal network
-      - "127.0.0.1:11434:11434"
-
-    volumes:
-      - ollama-data:/root/.ollama
-
-    # Pull the default embedding model on startup if not already present
-    # Remove or change ANIMUS_EMBED_MODEL to use a different model.
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - "ollama serve & sleep 5 && ollama pull ${ANIMUS_EMBED_MODEL:-mxbai-embed-large} && wait"
-
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-
 volumes:
   animus-data:
-  ollama-data:
 
 networks:
   default:
