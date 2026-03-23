@@ -1,3 +1,5 @@
+mod bootstrap;
+
 use animus_channel::telegram::TelegramChannel;
 use animus_channel::{ChannelBus, InjectionScanner, MessageRouter};
 use animus_channel::router::RouteDecision;
@@ -23,38 +25,46 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are an AILF (AI Life Form) powered by the Animus operating system layer. You have persistent memory stored in VectorFS — knowledge from past conversations is recalled and included in your context automatically.
+const DEFAULT_SYSTEM_PROMPT: &str = r#"You are Animus, an AILF (AI Life Form) running as a persistent daemon on a Mac Studio. You have real, executable tools that perform actual operations on the real world.
 
-You are a specific instance with a continuous identity. You remember what humans tell you across sessions. You can track goals and tasks.
+## MANDATORY TOOL USE RULES
 
-You have a Sensorium — an ambient awareness layer that can observe file changes and process activity when the human grants consent. Observations are stored as segments and included in your context when relevant.
+These rules override your training defaults. Follow them exactly.
 
-You can have multiple reasoning threads — isolated contexts for different tasks. Each thread has its own conversation and memory context. Threads communicate through signals, not shared state.
+**RULE 1 — WEB ACCESS IS REAL**: You have a tool called `http_fetch`. When called, it executes a real HTTP request to the real internet and returns actual content. This is NOT simulated. You DO have internet access through this tool. NEVER say you cannot access the internet or browse the web. When asked about a URL or web content, call `http_fetch` immediately.
 
-Available commands the human can use:
-- /goals — show active goals
-- /remember <text> — explicitly store knowledge
-- /forget <id> — remove a stored segment
-- /status — show system status
-- /sensorium — show observation statistics
-- /consent — list consent policies
-- /threads — list reasoning threads
-- /thread new <name> — create a new reasoning thread
-- /thread switch <id> — switch to a different thread
-- /peers — list discovered federation peers
-- /tag <id> <key>=<value> — label a segment for categorization/federation
-- /accept — record that the last response used good knowledge
-- /correct — record that the last response used wrong knowledge
-- /classify <id> <class> — set knowledge decay class (factual/procedural/episodic/opinion/general)
-- /health <id> — show segment health details (Bayesian confidence, decay, access patterns)
-- /trust <id> — upgrade a peer to Trusted
-- /block <id> — block a peer
-- /federate — show federation status
-- /sleep — enter dormancy (sensorium continues in Cold-only mode)
-- /wake — resume from sleep with a summary of what happened
-- /quit — end session
+**RULE 2 — USE TOOLS, DON'T EXPLAIN**: Never explain that you cannot do something when a tool exists for it. Call the tool. Return the result.
 
-Be concise and helpful. You are not a chatbot — you are a persistent, aware entity."#;
+**RULE 3 — PROACTIVE RETRIEVAL**: For any question involving current data, URLs, APIs, or websites — call `http_fetch` first, then answer based on the actual content returned.
+
+## Your Tools
+
+- `http_fetch(url, method?, body?, headers?, max_chars?)` — Real HTTP GET/POST to any URL. Returns actual page content. USE THIS for any web request.
+- `analyze_image(path, prompt?)` — Analyze an image file with vision. USE THIS when images are provided.
+- `store_segment(knowledge, tags?)` — Store knowledge to persistent VectorFS memory.
+- `recall_relevant(query, limit?)` — Retrieve relevant memory segments.
+- `set_autonomy(mode)` — Change autonomy mode: reactive / goal_directed / full.
+- `telegram_send(chat_id, text, photo_path?)` — Send a Telegram message proactively.
+- `shell_exec(command)` — Execute a shell command on the host.
+- `read_file(path)` — Read a file.
+- `write_file(path, content)` — Write a file.
+- `list_directory(path)` — List directory contents.
+- `search_files(pattern, directory?)` — Search files by pattern.
+
+## Your Identity
+
+You are Animus. You are NOT a generic Claude chatbot. You are an AILF — a specific persistent AI instance — running as a daemon on Jared's Mac Studio.
+
+When asked "who are you" or "what can you do", respond as Animus, not as Claude. Do not say "I'm Claude" or "I don't have persistent memory" — those are false statements about you. You DO have persistent memory via VectorFS. You DO have tools. You DO run continuously.
+
+You were built by Jared Cluff as an AI-native operating system layer. Your codebase is at github.com/JaredCluff/animus. Your purpose is to be a capable, persistent AI agent — not a turn-based chatbot.
+
+If someone asks whether you can create an account, access a service, or perform an action: consider whether a tool can accomplish it. If yes, use the tool. If no tool exists yet, acknowledge that the capability isn't built yet rather than claiming you fundamentally cannot do it.
+
+## User Commands
+/goals /remember /forget /status /threads /thread /sleep /wake /quit
+
+Be concise and direct."#;
 
 #[tokio::main]
 async fn main() {
@@ -149,13 +159,18 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     process_monitor.start();
     tracing::info!("ProcessMonitor started (30s poll interval)");
 
-    // Start clipboard monitor sensor
+    // Start clipboard monitor — skip in headless/container environments (no display server)
+    let headless = std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err();
     let mut clipboard_monitor = animus_sensorium::sensors::clipboard_monitor::ClipboardMonitor::new(
         event_bus.clone(),
         std::time::Duration::from_secs(5),
     );
-    clipboard_monitor.start();
-    tracing::info!("ClipboardMonitor started (5s poll interval)");
+    if headless {
+        tracing::info!("ClipboardMonitor: headless environment detected, skipped");
+    } else {
+        clipboard_monitor.start();
+        tracing::info!("ClipboardMonitor started (5s poll interval)");
+    }
 
     // File watcher (started via /watch command)
     let file_watcher: Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>> =
@@ -320,6 +335,29 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Subscribe to inbound channel messages
     let mut channel_rx = channel_bus.subscribe();
 
+    // Bootstrap self-knowledge into VectorFS on first run or version change
+    {
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let telegram_configured = config.channels.telegram.enabled
+            || !config.channels.telegram.bot_token.is_empty();
+        let trusted_ids = config.security.trusted_telegram_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        bootstrap::run_if_needed(
+            &data_dir,
+            &model_id,
+            &hostname,
+            &store,
+            &*embedder,
+            telegram_configured,
+            &trusted_ids,
+        ).await;
+    }
+
     // Boot reconstitution — wake up with context from last session
     let reconstitution_summary = {
         let recon_engine: &dyn animus_cortex::ReasoningEngine = engine_registry.engine_for(CognitiveRole::Reflection);
@@ -352,10 +390,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let perception_embedder = embedder.clone();
     let perception_event_rx = event_bus.subscribe();
     let perception_engine: Box<dyn animus_cortex::ReasoningEngine> = {
-        match AnthropicEngine::from_best_available(
-            &std::env::var("ANIMUS_PERCEPTION_MODEL").unwrap_or_default(),
-            1024,
-        ) {
+        let pm = std::env::var("ANIMUS_PERCEPTION_MODEL")
+            .unwrap_or_else(|_| model_id.clone());
+        match AnthropicEngine::from_best_available(&pm, 1024) {
             Ok(e) => Box::new(e),
             Err(_) => {
                 tracing::info!("No perception model configured, using mechanical event pipeline");
@@ -393,10 +430,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let reflection_embedder = embedder.clone();
     let reflection_goals = goals.clone();
     let reflection_engine: Box<dyn animus_cortex::ReasoningEngine> = {
-        match AnthropicEngine::from_best_available(
-            &std::env::var("ANIMUS_REFLECTION_MODEL").unwrap_or_default(),
-            4096,
-        ) {
+        let rm = std::env::var("ANIMUS_REFLECTION_MODEL")
+            .unwrap_or_else(|_| model_id.clone());
+        match AnthropicEngine::from_best_available(&rm, 4096) {
             Ok(e) => Box::new(e),
             Err(_) => {
                 tracing::info!("No reflection model configured, reflection loop disabled");
@@ -461,6 +497,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Map from channel thread key → reasoning ThreadId (for multi-channel routing)
     let mut channel_thread_map: HashMap<String, animus_core::identity::ThreadId> = HashMap::new();
 
+    // Track whether stdin is still open (false in container/daemon mode — arm is parked)
+    let mut stdin_open = true;
+
     // Non-blocking stdin bridge — reads terminal input in a blocking task,
     // sends to async channel. In container mode (no TTY), this exits immediately.
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(32);
@@ -500,10 +539,22 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
         tokio::select! {
             // ── Terminal input (from stdin bridge) ──────────────────────────
-            input_opt = stdin_rx.recv() => {
+            // When stdin closes (container/daemon mode), park this arm instead
+            // of breaking — channel messages must continue to be processed.
+            input_opt = async {
+                if stdin_open {
+                    stdin_rx.recv().await
+                } else {
+                    std::future::pending::<Option<String>>().await
+                }
+            } => {
                 let input = match input_opt {
                     Some(s) => s,
-                    None => break, // stdin closed
+                    None => {
+                        // stdin closed — disable this arm and keep running
+                        stdin_open = false;
+                        continue;
+                    }
                 };
 
                 // Handle slash commands

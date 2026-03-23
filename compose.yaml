@@ -13,7 +13,7 @@ services:
     environment:
       ANIMUS_DATA_DIR: /home/animus/.animus
       ANIMUS_HEALTH_BIND: "0.0.0.0:8082"
-      ANIMUS_LOG_LEVEL: "animus=info"
+      ANIMUS_LOG_LEVEL: "animus=debug,animus_cortex=debug"
 
       # ── LLM: Anthropic via Claude Code OAuth (no API key purchase needed) ──
       # Option 1 (recommended): Run `podman compose up` from within a Claude Code terminal.

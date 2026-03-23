@@ -453,6 +453,13 @@ impl ReasoningEngine for AnthropicEngine {
             _ => StopReason::EndTurn,
         };
 
+        tracing::debug!(
+            stop_reason = ?api_response.stop_reason,
+            tool_calls = tool_calls.len(),
+            input_tokens = api_response.usage.input_tokens,
+            "LLM response"
+        );
+
         Ok(ReasoningOutput {
             content,
             input_tokens: api_response.usage.input_tokens,
