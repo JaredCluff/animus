@@ -37,6 +37,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -58,7 +59,7 @@ EXPOSE 8080
 # Default environment (override at runtime)
 ENV ANIMUS_DATA_DIR=/home/animus/.animus
 ENV ANIMUS_HEALTH_BIND=0.0.0.0:8080
-ENV ANIMUS_OLLAMA_URL=http://ollama:11434
+ENV ANIMUS_OLLAMA_URL=http://localhost:11434
 ENV ANIMUS_LOG_LEVEL=animus=info
 
 ENTRYPOINT ["/usr/local/bin/animus"]

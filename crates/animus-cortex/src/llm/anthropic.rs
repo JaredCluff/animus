@@ -1,15 +1,150 @@
 use animus_core::error::{AnimusError, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use super::{ReasoningEngine, ReasoningOutput, Role, StopReason, ToolCall, ToolDefinition, Turn, TurnContent};
+
+const TOKEN_REFRESH_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+/// Claude Code's public OAuth client ID (the same one used by the Claude CLI).
+const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// How to authenticate with the Anthropic API.
 #[derive(Clone)]
 enum Auth {
     /// `x-api-key` header (standard purchased API key).
     ApiKey(String),
-    /// `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` (OAuth token).
+    /// `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` (static OAuth token).
+    OAuth(String),
+    /// Read OAuth token from Claude Code credentials file on every request, refreshing if expired.
+    ClaudeCode,
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code credential types (for JSON parsing and refresh)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ClaudeCodeCredentials {
+    #[serde(rename = "claudeAiOauth")]
+    claude_ai_oauth: OAuthCredentials,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct OAuthCredentials {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+    #[serde(rename = "refreshToken")]
+    refresh_token: String,
+    #[serde(rename = "expiresAt")]
+    expires_at: u64, // Unix timestamp in milliseconds
+}
+
+impl OAuthCredentials {
+    fn is_expired(&self) -> bool {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.expires_at < now_ms.saturating_add(60_000)
+    }
+}
+
+#[derive(Serialize)]
+struct RefreshRequest<'a> {
+    grant_type: &'a str,
+    refresh_token: &'a str,
+    client_id: &'a str,
+}
+
+#[derive(Deserialize)]
+struct RefreshResponse {
+    access_token: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+fn claude_credentials_path() -> PathBuf {
+    std::env::var("CLAUDE_CREDENTIALS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".claude/.credentials.json")
+        })
+}
+
+fn claude_credentials_exist() -> bool {
+    claude_credentials_path().exists()
+}
+
+/// Get a valid OAuth token from the Claude Code credentials file.
+/// Refreshes the token automatically if expired and saves the new credentials.
+async fn get_claude_code_token(client: &reqwest::Client) -> Result<String> {
+    let path = claude_credentials_path();
+    let data = std::fs::read_to_string(&path).map_err(|e| {
+        AnimusError::Llm(format!("cannot read Claude Code credentials at {}: {e}", path.display()))
+    })?;
+    let mut creds: ClaudeCodeCredentials = serde_json::from_str(&data).map_err(|e| {
+        AnimusError::Llm(format!("failed to parse Claude Code credentials: {e}"))
+    })?;
+
+    if !creds.claude_ai_oauth.is_expired() {
+        return Ok(creds.claude_ai_oauth.access_token.clone());
+    }
+
+    // Token expired — refresh it
+    tracing::info!("OAuth access token expired — refreshing");
+    let req = RefreshRequest {
+        grant_type: "refresh_token",
+        refresh_token: &creds.claude_ai_oauth.refresh_token,
+        client_id: CLAUDE_CLIENT_ID,
+    };
+    let resp = client
+        .post(TOKEN_REFRESH_URL)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| AnimusError::Llm(format!("token refresh request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AnimusError::Llm(format!("token refresh failed ({status}): {body}")));
+    }
+
+    let refreshed: RefreshResponse = resp.json().await.map_err(|e| {
+        AnimusError::Llm(format!("failed to parse token refresh response: {e}"))
+    })?;
+
+    let expires_in_ms = refreshed.expires_in.unwrap_or(3600) * 1000;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    creds.claude_ai_oauth.access_token = refreshed.access_token.clone();
+    creds.claude_ai_oauth.expires_at = now_ms + expires_in_ms;
+    if let Some(rt) = refreshed.refresh_token {
+        creds.claude_ai_oauth.refresh_token = rt;
+    }
+
+    // Persist refreshed token
+    if let Ok(updated) = serde_json::to_string_pretty(&creds) {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &updated).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+    tracing::info!("OAuth token refreshed successfully");
+    Ok(refreshed.access_token)
+}
+
+/// Resolved auth — ready to apply as HTTP headers.
+enum ResolvedAuth {
+    ApiKey(String),
     OAuth(String),
 }
 
@@ -35,7 +170,7 @@ impl AnthropicEngine {
         }
     }
 
-    /// Create using an OAuth token (e.g. from Claude Code credentials).
+    /// Create using a static OAuth token.
     pub fn with_oauth(token: String, model: String, max_tokens: usize) -> Self {
         Self {
             client: reqwest::Client::builder()
@@ -45,6 +180,20 @@ impl AnthropicEngine {
                 .expect("failed to build HTTP client"),
             auth: Auth::OAuth(token),
             model,
+            max_tokens,
+        }
+    }
+
+    /// Create using Claude Code's stored credentials (auto-refreshes on expiry).
+    pub fn from_claude_code(model: &str, max_tokens: usize) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
+            auth: Auth::ClaudeCode,
+            model: model.to_string(),
             max_tokens,
         }
     }
@@ -65,41 +214,45 @@ impl AnthropicEngine {
         Ok(Self::with_oauth(token, model.to_string(), max_tokens))
     }
 
-    /// Read OAuth token from Claude Code credentials file (`~/.claude/.credentials.json`).
-    /// Returns `None` if the file doesn't exist or the token is not present.
-    pub fn token_from_claude_code() -> Option<String> {
-        let path = std::env::var("CLAUDE_CREDENTIALS_PATH")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::var("HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    .join(".claude/.credentials.json")
-            });
-
-        let data = std::fs::read_to_string(&path).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&data).ok()?;
-        let token = v["claudeAiOauth"]["accessToken"].as_str()?.to_string();
-        let expires_at = v["claudeAiOauth"]["expiresAt"].as_u64().unwrap_or(0);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        if expires_at < now_ms.saturating_add(60_000) {
-            return None; // Expired — caller should refresh
-        }
-        Some(token)
-    }
-
-    /// Try the best available auth: Claude Code OAuth → ANTHROPIC_OAUTH_TOKEN → ANTHROPIC_API_KEY.
+    /// Try the best available auth:
+    /// `CLAUDE_CODE_OAUTH_TOKEN` → credentials file (with refresh) → `ANTHROPIC_OAUTH_TOKEN` → `ANTHROPIC_API_KEY`.
+    ///
+    /// `CLAUDE_CODE_OAUTH_TOKEN` is injected by the Claude Code CLI into child processes and is
+    /// always fresh for the lifetime of the session — the cleanest path for container deployments
+    /// launched from a Claude Code terminal.
     pub fn from_best_available(model: &str, max_tokens: usize) -> Result<Self> {
-        if let Some(token) = Self::token_from_claude_code() {
-            return Ok(Self::with_oauth(token, model.to_string(), max_tokens));
+        // Claude Code CLI injects this per-session token automatically
+        if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+            if !token.is_empty() {
+                return Ok(Self::with_oauth(token, model.to_string(), max_tokens));
+            }
+        }
+        // Also handle the legacy typo variant
+        if let Ok(token) = std::env::var("CLAUDE_CODE_OATH_TOKEN") {
+            if !token.is_empty() {
+                return Ok(Self::with_oauth(token, model.to_string(), max_tokens));
+            }
+        }
+        // Credentials file: reads and refreshes the stored OAuth token automatically
+        if claude_credentials_exist() {
+            return Ok(Self::from_claude_code(model, max_tokens));
         }
         if let Ok(token) = std::env::var("ANTHROPIC_OAUTH_TOKEN") {
             return Ok(Self::with_oauth(token, model.to_string(), max_tokens));
         }
         Self::from_env(model, max_tokens)
+    }
+
+    /// Resolve the current auth to headers-ready values.
+    async fn resolve_auth(&self) -> Result<ResolvedAuth> {
+        match &self.auth {
+            Auth::ApiKey(key) => Ok(ResolvedAuth::ApiKey(key.clone())),
+            Auth::OAuth(token) => Ok(ResolvedAuth::OAuth(token.clone())),
+            Auth::ClaudeCode => {
+                let token = get_claude_code_token(&self.client).await?;
+                Ok(ResolvedAuth::OAuth(token))
+            }
+        }
     }
 }
 
@@ -231,15 +384,16 @@ impl ReasoningEngine for AnthropicEngine {
             tools: api_tools,
         };
 
+        let resolved = self.resolve_auth().await?;
         let mut builder = self
             .client
             .post("https://api.anthropic.com/v1/messages")
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
 
-        builder = match &self.auth {
-            Auth::ApiKey(key) => builder.header("x-api-key", key),
-            Auth::OAuth(token) => builder
+        builder = match resolved {
+            ResolvedAuth::ApiKey(key) => builder.header("x-api-key", key),
+            ResolvedAuth::OAuth(token) => builder
                 .header("Authorization", format!("Bearer {token}"))
                 .header("anthropic-beta", "oauth-2025-04-20"),
         };

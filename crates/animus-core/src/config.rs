@@ -149,7 +149,9 @@ impl Default for MnemosConfig {
 pub struct CortexConfig {
     /// LLM provider name (e.g., "anthropic", "openai", "mock").
     pub llm_provider: String,
-    /// Model identifier (e.g., "claude-sonnet-4-20250514").
+    /// Model identifier.
+    /// With Claude Max OAuth: use "claude-haiku-4-5-20251001".
+    /// With ANTHROPIC_API_KEY: any model works (e.g., "claude-sonnet-4-20250514").
     pub model_id: String,
     /// API key for the LLM provider. Always read from env at runtime; never serialized.
     #[serde(skip)]
@@ -164,7 +166,7 @@ impl Default for CortexConfig {
     fn default() -> Self {
         Self {
             llm_provider: "anthropic".to_string(),
-            model_id: "claude-sonnet-4-20250514".to_string(),
+            model_id: "claude-haiku-4-5-20251001".to_string(),
             api_key: None,
             max_response_tokens: 4096,
             system_prompt: String::new(),

@@ -7,29 +7,34 @@ services:
     container_name: animus
     restart: unless-stopped
 
-    # Allow container to reach host services (e.g. Ollama running on the Mac Studio)
-    extra_hosts:
-      - "host.containers.internal:host-gateway"
-
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8082:8082"
 
     environment:
       ANIMUS_DATA_DIR: /home/animus/.animus
-      ANIMUS_HEALTH_BIND: "0.0.0.0:8080"
+      ANIMUS_HEALTH_BIND: "0.0.0.0:8082"
       ANIMUS_LOG_LEVEL: "animus=info"
 
       # ── LLM: Anthropic via Claude Code OAuth (no API key purchase needed) ──
-      # Mount ~/.claude/.credentials.json below; the bridge reads it automatically.
-      # To use API key instead, set ANTHROPIC_API_KEY and remove the volume mount.
+      # Option 1 (recommended): Run `podman compose up` from within a Claude Code terminal.
+      #   CLAUDE_CODE_OAUTH_TOKEN is automatically injected by the Claude Code CLI.
+      # Option 2: Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN manually.
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+      CLAUDE_CODE_OATH_TOKEN: "${CLAUDE_CODE_OATH_TOKEN:-}"
+      # OAuth tokens (Claude Max subscription) only support Haiku models via API.
+      # For Sonnet/Opus, set ANTHROPIC_API_KEY and ANIMUS_MODEL=claude-sonnet-4-20250514.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      ANIMUS_MODEL: "${ANIMUS_MODEL:-claude-haiku-4-5-20251001}"
 
       # OpenAI (optional, for ANIMUS_LLM_PROVIDER=openai or ANIMUS_EMBED_PROVIDER=openai)
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
 
-      # ── Embedding: Ollama running on the host Mac Studio ────────────────────
+      # ── Embedding: Ollama running on the host machine ────────────────────────
+      # On macOS + Podman, set ANIMUS_OLLAMA_URL to your Mac's LAN IP:
+      #   export ANIMUS_OLLAMA_URL=http://192.168.0.200:11434
+      # On Linux + Docker, host.containers.internal or host-gateway works directly.
       ANIMUS_EMBED_PROVIDER: "${ANIMUS_EMBED_PROVIDER:-ollama}"
-      ANIMUS_OLLAMA_URL: "http://host.containers.internal:11434"
+      ANIMUS_OLLAMA_URL: "${ANIMUS_OLLAMA_URL:-http://localhost:11434}"
       ANIMUS_EMBED_MODEL: "${ANIMUS_EMBED_MODEL:-mxbai-embed-large}"
 
       # ── Federation (disabled by default) ────────────────────────────────────
@@ -38,12 +43,13 @@ services:
     volumes:
       # Persistent AILF data (VectorFS, goals, identity)
       - animus-data:/home/animus/.animus
-      # Claude Code OAuth credentials — read-only, for OAuth auth without API key
-      - "${HOME}/.claude/.credentials.json:/home/animus/.claude/.credentials.json:ro"
+      # Claude Code OAuth credentials — for OAuth auth without purchasing API tokens.
+      # Mounted read-write so the engine can persist refreshed tokens.
+      - "${HOME}/.claude/.credentials.json:/home/animus/.claude/.credentials.json"
 
     # Healthcheck using the built-in HTTP endpoint
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8082/health"]
       interval: 30s
       timeout: 5s
       retries: 3
