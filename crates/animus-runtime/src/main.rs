@@ -1,3 +1,7 @@
+use animus_channel::telegram::TelegramChannel;
+use animus_channel::{ChannelBus, InjectionScanner, MessageRouter};
+use animus_channel::router::RouteDecision;
+use animus_channel::message::OutboundMessage;
 use animus_core::config::AnimusConfig;
 use animus_core::sensorium::AuditAction;
 use animus_core::AnimusIdentity;
@@ -5,7 +9,7 @@ use animus_cortex::engine_registry::{CognitiveRole, EngineRegistry};
 use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
-use animus_cortex::tools::{ToolContext, ToolRegistry};
+use animus_cortex::tools::{Tool, ToolContext, ToolRegistry};
 use animus_embed::{OllamaEmbedding, ResilientEmbedding, SyntheticEmbedding};
 use animus_federation::orchestrator::FederationOrchestrator;
 use animus_federation::peers::TrustLevel;
@@ -15,6 +19,7 @@ use animus_sensorium::orchestrator::SensoriumOrchestrator;
 use animus_vectorfs::store::MmapVectorStore;
 use animus_vectorfs::VectorStore;
 use axum::{extract::State, routing::get, Json, Router};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -214,14 +219,28 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::list_segments::ListSegmentsTool));
         reg.register(Box::new(animus_cortex::tools::send_signal::SendSignalTool));
         reg.register(Box::new(animus_cortex::tools::update_segment::UpdateSegmentTool));
+        // Channel and web tools
+        reg.register(Box::new(animus_cortex::tools::http_fetch::HttpFetchTool));
+        reg.register(Box::new(animus_cortex::tools::analyze_image::AnalyzeImageTool));
+        reg.register(Box::new(animus_cortex::tools::set_autonomy::SetAutonomyTool));
+        reg.register(Box::new(animus_cortex::tools::telegram_send::TelegramSendTool));
         reg
     };
     let tool_definitions = tool_registry.definitions();
+
+    // Autonomy mode watch channel — set_autonomy tool sends here, main loop reads.
+    let (autonomy_tx, mut autonomy_rx) = tokio::sync::watch::channel(config.autonomy.default_mode);
+    // Shared active Telegram chat ID — updated before each channel reasoning call.
+    let active_telegram_chat_id: Arc<parking_lot::Mutex<Option<i64>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+
     let tool_ctx = ToolContext {
         data_dir: data_dir.clone(),
         store: store.clone() as std::sync::Arc<dyn animus_vectorfs::VectorStore>,
         embedder: embedder.clone(),
         signal_tx: Some(signal_tx.clone()),
+        autonomy_tx: Some(autonomy_tx),
+        active_telegram_chat_id: active_telegram_chat_id.clone(),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
@@ -271,6 +290,35 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             format!("{}", identity.instance_id),
         );
     }
+
+    // Initialize ChannelBus and channel adapters
+    let channel_bus = ChannelBus::new(256);
+    let injection_scanner = Arc::new(InjectionScanner::new(config.security.injection_threshold));
+    let message_router = MessageRouter::new(injection_scanner);
+
+    // Register Telegram adapter if configured
+    if config.channels.telegram.enabled && !config.channels.telegram.bot_token.is_empty() {
+        match TelegramChannel::new(
+            config.channels.telegram.clone(),
+            config.security.trusted_telegram_ids.clone(),
+        ) {
+            Ok(adapter) => {
+                channel_bus.register(Arc::new(adapter)).await;
+                tracing::info!("Telegram channel adapter registered");
+            }
+            Err(e) => tracing::warn!("Failed to initialize Telegram adapter: {e}"),
+        }
+    } else {
+        tracing::info!("Telegram channel disabled (set ANIMUS_TELEGRAM_TOKEN to enable)");
+    }
+
+    // Start all registered channel adapters
+    if let Err(e) = channel_bus.start_all().await {
+        tracing::warn!("ChannelBus start error: {e}");
+    }
+
+    // Subscribe to inbound channel messages
+    let mut channel_rx = channel_bus.subscribe();
 
     // Boot reconstitution — wake up with context from last session
     let reconstitution_summary = {
@@ -406,7 +454,35 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let mut is_sleeping = false;
     let mut sleep_started: Option<chrono::DateTime<chrono::Utc>> = None;
 
-    // Main conversation loop
+    // Autonomy mode (runtime-configurable)
+    let mut autonomy_mode = config.autonomy.default_mode;
+    tracing::info!("Autonomy mode: {autonomy_mode}");
+
+    // Map from channel thread key → reasoning ThreadId (for multi-channel routing)
+    let mut channel_thread_map: HashMap<String, animus_core::identity::ThreadId> = HashMap::new();
+
+    // Non-blocking stdin bridge — reads terminal input in a blocking task,
+    // sends to async channel. In container mode (no TTY), this exits immediately.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(32);
+    tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        // Show prompt and read
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() && stdin_tx.blocking_send(trimmed).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        tracing::info!("stdin closed — terminal input disabled");
+    });
+
+    // Main event loop — handles terminal input, channel messages, and signals
     loop {
         // Poll signal bridge — deliver signals from background cognitive loops
         while let Ok(signal) = signal_rx.try_recv() {
@@ -415,167 +491,208 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             }
         }
 
-        let input = match interface.read_input()? {
-            Some(input) if input.is_empty() => continue,
-            Some(input) => input,
-            None => break, // EOF
-        };
+        // Check for autonomy mode changes from set_autonomy tool
+        if autonomy_rx.has_changed().unwrap_or(false) {
+            autonomy_mode = *autonomy_rx.borrow_and_update();
+            tracing::info!("Autonomy mode changed to: {autonomy_mode}");
+            interface.display_status(&format!("Autonomy mode: {autonomy_mode}"));
+        }
 
-        // Handle slash commands
-        if input.starts_with('/') {
-            let mut goals_guard = goals.lock();
-            let mut ctx = CommandContext {
-                store: &store,
-                goals: &mut goals_guard,
-                goals_path: &goals_path,
-                interface: &interface,
-                embedder: &*embedder,
-                data_dir: &data_dir,
-                scheduler: &mut scheduler,
-                federation: federation.as_ref(),
-                event_bus: &event_bus,
-                file_watcher: &file_watcher,
-                sensorium: &orchestrator,
-                is_sleeping: &mut is_sleeping,
-                sleep_started: &mut sleep_started,
-                sleeping_flag: &sleeping_flag,
-            };
-            match handle_command(&input, &mut ctx).await? {
-                CommandResult::Continue => continue,
-                CommandResult::Quit => break,
+        tokio::select! {
+            // ── Terminal input (from stdin bridge) ──────────────────────────
+            input_opt = stdin_rx.recv() => {
+                let input = match input_opt {
+                    Some(s) => s,
+                    None => break, // stdin closed
+                };
+
+                // Handle slash commands
+                if input.starts_with('/') {
+                    let mut goals_guard = goals.lock();
+                    let mut ctx = CommandContext {
+                        store: &store,
+                        goals: &mut goals_guard,
+                        goals_path: &goals_path,
+                        interface: &interface,
+                        embedder: &*embedder,
+                        data_dir: &data_dir,
+                        scheduler: &mut scheduler,
+                        federation: federation.as_ref(),
+                        event_bus: &event_bus,
+                        file_watcher: &file_watcher,
+                        sensorium: &orchestrator,
+                        is_sleeping: &mut is_sleeping,
+                        sleep_started: &mut sleep_started,
+                        sleeping_flag: &sleeping_flag,
+                    };
+                    match handle_command(&input, &mut ctx).await? {
+                        CommandResult::Continue => continue,
+                        CommandResult::Quit => break,
+                    }
+                }
+
+                if is_sleeping {
+                    interface.display_status("Sleeping. Use /wake to resume.");
+                    continue;
+                }
+
+                // Process through main reasoning thread
+                interface.display(&format!(">> {input}"));
+                let response = run_reasoning_turn(
+                    &input,
+                    None,
+                    &mut scheduler,
+                    &engine_registry,
+                    &tool_registry,
+                    &tool_ctx,
+                    &*embedder,
+                    &tool_definitions,
+                    &goals,
+                    reconstitution_summary.as_deref(),
+                ).await;
+
+                match response {
+                    Ok(text) => interface.display_response(&text),
+                    Err(e) => interface.display_status(&format!("Error: {e}")),
+                }
             }
-        }
 
-        // While sleeping, reject conversational input
-        if is_sleeping {
-            interface.display_status("Sleeping. Use /wake to resume, /status to check, or /quit to exit.");
-            continue;
-        }
+            // ── Channel bus message (Telegram, HTTP API, etc.) ──────────────
+            channel_msg = channel_rx.recv() => {
+                let msg = match channel_msg {
+                    Ok(m) => m,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("ChannelBus: dropped {n} messages (lagged)");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
 
-        // Process through reasoning thread with tool use loop
-        let system = {
-            let goals_guard = goals.lock();
-            build_system_prompt(&scheduler, &goals_guard, reconstitution_summary.as_deref())
-        };
-        let engine = engine_registry.engine_for(CognitiveRole::Reasoning);
-        let tools_slice = if tool_definitions.is_empty() {
-            None
-        } else {
-            Some(tool_definitions.as_slice())
-        };
+                // Triage: injection scan + priority scoring
+                let (msg, decision) = message_router.route(msg).await;
 
-        const MAX_TOOL_ROUNDS: usize = 10;
-
-        // Round 0: process_turn handles user input storage, context assembly, Bayesian feedback
-        let result = {
-            let active = scheduler.active_thread_mut()
-                .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
-            active.process_turn(&input, &system, engine, &*embedder, tools_slice).await
-        };
-
-        match result {
-            Ok(mut output) => {
-                // Tool use loop
-                for _round in 0..MAX_TOOL_ROUNDS {
-                    if output.stop_reason != animus_cortex::StopReason::ToolUse
-                        || output.tool_calls.is_empty()
-                    {
-                        break;
+                match decision {
+                    RouteDecision::InjectionBlocked(alert) => {
+                        tracing::warn!(
+                            "Prompt injection blocked from {} via {} (confidence={:.2})",
+                            alert.sender_name, alert.channel_id, alert.confidence
+                        );
+                        // Notify user through the same channel
+                        let warn_text = format!(
+                            "⚠️ Blocked: potential prompt injection detected in content from {}. \
+                            I've logged it and won't process that content.",
+                            alert.sender_name
+                        );
+                        let outbound = OutboundMessage::text(
+                            &alert.channel_id,
+                            &alert.thread_id,
+                            warn_text,
+                        );
+                        if let Err(e) = channel_bus.send(outbound).await {
+                            tracing::warn!("Failed to send injection alert response: {e}");
+                        }
                     }
 
-                    let active = scheduler.active_thread_mut().unwrap();
-
-                    // Build assistant turn with tool_use blocks
-                    let mut assistant_content: Vec<animus_cortex::TurnContent> = Vec::new();
-                    if !output.content.is_empty() {
-                        assistant_content
-                            .push(animus_cortex::TurnContent::Text(output.content.clone()));
-                    }
-                    for tc in &output.tool_calls {
-                        assistant_content.push(animus_cortex::TurnContent::ToolUse {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            input: tc.input.clone(),
-                        });
-                    }
-                    active.push_turn(animus_cortex::Turn {
-                        role: animus_cortex::Role::Assistant,
-                        content: assistant_content,
-                    });
-
-                    // Execute each tool call
-                    let mut tool_results: Vec<animus_cortex::TurnContent> = Vec::new();
-                    for tc in &output.tool_calls {
-                        let result = if let Some(tool) = tool_registry.get(&tc.name) {
-                            tool.execute(tc.input.clone(), &tool_ctx)
-                                .await
-                                .unwrap_or_else(|e| animus_cortex::tools::ToolResult {
-                                    content: format!("Error: {e}"),
-                                    is_error: true,
-                                })
-                        } else {
-                            animus_cortex::tools::ToolResult {
-                                content: format!("Unknown tool: {}", tc.name),
-                                is_error: true,
+                    RouteDecision::ExistingThread(ref thread_key)
+                    | RouteDecision::NewThread(ref thread_key) => {
+                        // Get or create a reasoning thread for this conversation
+                        let thread_id = match channel_thread_map.get(thread_key) {
+                            Some(&id) => {
+                                if let Err(e) = scheduler.switch_to(id) {
+                                    tracing::debug!("Could not switch to thread {id}: {e}; using active");
+                                }
+                                id
+                            }
+                            None => {
+                                let id = scheduler.create_thread(thread_key.clone());
+                                channel_thread_map.insert(thread_key.clone(), id);
+                                tracing::info!("Created reasoning thread '{}' for channel conversation", thread_key);
+                                id
                             }
                         };
+                        let _ = thread_id; // thread is now active via scheduler
 
-                        tool_results.push(animus_cortex::TurnContent::ToolResult {
-                            tool_use_id: tc.id.clone(),
-                            content: result.content,
-                            is_error: result.is_error,
-                        });
-                    }
+                        // Update active Telegram chat ID for telegram_send tool
+                        if let Ok(chat_id) = msg.thread_id.parse::<i64>() {
+                            *active_telegram_chat_id.lock() = Some(chat_id);
+                        }
 
-                    active.push_turn(animus_cortex::Turn {
-                        role: animus_cortex::Role::User,
-                        content: tool_results,
-                    });
-
-                    // Call engine again with updated conversation
-                    output = engine
-                        .reason(&system, active.conversation(), tools_slice)
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::error!("Engine error during tool loop: {e}");
-                            animus_cortex::ReasoningOutput {
-                                content: format!("Error during tool execution: {e}"),
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                tool_calls: vec![],
-                                stop_reason: animus_cortex::StopReason::EndTurn,
+                        // Pre-process images: analyze them and prepend description to text
+                        let image_descriptions = if !msg.images.is_empty() {
+                            let mut descs = Vec::new();
+                            for path in &msg.images {
+                                let params = serde_json::json!({"image_path": path.to_string_lossy()});
+                                match animus_cortex::tools::analyze_image::AnalyzeImageTool
+                                    .execute(params, &tool_ctx)
+                                    .await
+                                {
+                                    Ok(result) => descs.push(format!("[Image: {}]", result.content)),
+                                    Err(e) => descs.push(format!("[Image analysis failed: {e}]")),
+                                }
                             }
-                        });
-                }
+                            descs.join("\n")
+                        } else {
+                            String::new()
+                        };
 
-                // If we exhausted max tool rounds, warn and use whatever content we have
-                if output.stop_reason == animus_cortex::StopReason::ToolUse {
-                    tracing::warn!(
-                        "Tool use loop exhausted after {MAX_TOOL_ROUNDS} rounds, forcing end"
-                    );
-                    if output.content.is_empty() {
-                        output.content = "[Tool execution limit reached. Please try again with a simpler request.]".to_string();
+                        // Build full input text
+                        let input_text = {
+                            let mut parts = Vec::new();
+                            if !image_descriptions.is_empty() {
+                                parts.push(image_descriptions);
+                            }
+                            if let Some(text) = &msg.text {
+                                parts.push(text.clone());
+                            }
+                            parts.join("\n\n")
+                        };
+
+                        if input_text.is_empty() {
+                            tracing::debug!("Channel message with no processable content, skipping");
+                            continue;
+                        }
+
+                        let channel_id = msg.channel_id.clone();
+                        let thread_id_str = msg.thread_id.clone();
+                        let reply_to = msg.metadata["telegram_message_id"].as_i64();
+
+                        let response = run_reasoning_turn(
+                            &input_text,
+                            None,
+                            &mut scheduler,
+                            &engine_registry,
+                            &tool_registry,
+                            &tool_ctx,
+                            &*embedder,
+                            &tool_definitions,
+                            &goals,
+                            reconstitution_summary.as_deref(),
+                        ).await;
+
+                        let response_text = match response {
+                            Ok(text) => text,
+                            Err(e) => format!("Sorry, I encountered an error: {e}"),
+                        };
+
+                        let mut outbound = OutboundMessage::text(
+                            &channel_id,
+                            &thread_id_str,
+                            response_text,
+                        );
+                        if let Some(id) = reply_to {
+                            outbound.metadata = serde_json::json!({"telegram_message_id": id});
+                        }
+
+                        if let Err(e) = channel_bus.send(outbound).await {
+                            tracing::warn!("Failed to send channel response: {e}");
+                        }
                     }
                 }
-
-                // Store response segment BEFORE pushing turn (so turn index is correct)
-                // then push the assistant turn to conversation
-                {
-                    let active = scheduler.active_thread_mut().unwrap();
-                    active
-                        .store_response_segment(&output.content, &*embedder)
-                        .await
-                        .ok();
-                    active.push_turn(animus_cortex::Turn::text(
-                        animus_cortex::Role::Assistant,
-                        &output.content,
-                    ));
-                }
-
-                interface.display_response(&output.content);
             }
-            Err(e) => {
-                interface.display_status(&format!("Error: {e}"));
+
+            // ── Yield briefly to avoid busy-looping when no input ───────────
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                continue;
             }
         }
     }
@@ -616,6 +733,141 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     interface.display_status("Session ended. Memory persisted.");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning turn executor
+// ---------------------------------------------------------------------------
+
+/// Execute a full reasoning turn (input → tool loop → response) on the active thread.
+///
+/// Handles up to MAX_TOOL_ROUNDS of tool use, stores the response segment,
+/// and returns the final text response. Used by both terminal and channel paths.
+#[allow(clippy::too_many_arguments)]
+async fn run_reasoning_turn(
+    input: &str,
+    _images: Option<&[std::path::PathBuf]>,
+    scheduler: &mut ThreadScheduler<MmapVectorStore>,
+    engine_registry: &EngineRegistry,
+    tool_registry: &ToolRegistry,
+    tool_ctx: &ToolContext,
+    embedder: &dyn animus_core::EmbeddingService,
+    tool_definitions: &[animus_cortex::llm::ToolDefinition],
+    goals: &Arc<parking_lot::Mutex<GoalManager>>,
+    reconstitution_summary: Option<&str>,
+) -> animus_core::Result<String> {
+    let system = {
+        let goals_guard = goals.lock();
+        build_system_prompt(scheduler, &goals_guard, reconstitution_summary)
+    };
+    let engine = engine_registry.engine_for(CognitiveRole::Reasoning);
+    let tools_slice = if tool_definitions.is_empty() {
+        None
+    } else {
+        Some(tool_definitions)
+    };
+
+    const MAX_TOOL_ROUNDS: usize = 10;
+
+    let mut output = {
+        let active = scheduler
+            .active_thread_mut()
+            .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
+        active
+            .process_turn(input, &system, engine, embedder, tools_slice)
+            .await?
+    };
+
+    // Tool use loop
+    for _round in 0..MAX_TOOL_ROUNDS {
+        if output.stop_reason != animus_cortex::StopReason::ToolUse || output.tool_calls.is_empty() {
+            break;
+        }
+
+        // Build assistant turn with tool_use blocks
+        let mut assistant_content: Vec<animus_cortex::TurnContent> = Vec::new();
+        if !output.content.is_empty() {
+            assistant_content.push(animus_cortex::TurnContent::Text(output.content.clone()));
+        }
+        for tc in &output.tool_calls {
+            assistant_content.push(animus_cortex::TurnContent::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: tc.input.clone(),
+            });
+        }
+        {
+            let active = scheduler.active_thread_mut().unwrap();
+            active.push_turn(animus_cortex::Turn {
+                role: animus_cortex::Role::Assistant,
+                content: assistant_content,
+            });
+        }
+
+        // Execute each tool call
+        let mut tool_results: Vec<animus_cortex::TurnContent> = Vec::new();
+        for tc in &output.tool_calls {
+            let result = if let Some(tool) = tool_registry.get(&tc.name) {
+                tool.execute(tc.input.clone(), tool_ctx)
+                    .await
+                    .unwrap_or_else(|e| animus_cortex::tools::ToolResult {
+                        content: format!("Error: {e}"),
+                        is_error: true,
+                    })
+            } else {
+                animus_cortex::tools::ToolResult {
+                    content: format!("Unknown tool: {}", tc.name),
+                    is_error: true,
+                }
+            };
+            tool_results.push(animus_cortex::TurnContent::ToolResult {
+                tool_use_id: tc.id.clone(),
+                content: result.content,
+                is_error: result.is_error,
+            });
+        }
+
+        {
+            let active = scheduler.active_thread_mut().unwrap();
+            active.push_turn(animus_cortex::Turn {
+                role: animus_cortex::Role::User,
+                content: tool_results,
+            });
+            output = engine
+                .reason(&system, active.conversation(), tools_slice)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!("Engine error during tool loop: {e}");
+                    animus_cortex::ReasoningOutput {
+                        content: format!("Error during tool execution: {e}"),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        tool_calls: vec![],
+                        stop_reason: animus_cortex::StopReason::EndTurn,
+                    }
+                });
+        }
+    }
+
+    if output.stop_reason == animus_cortex::StopReason::ToolUse {
+        tracing::warn!("Tool use loop exhausted after {MAX_TOOL_ROUNDS} rounds");
+        if output.content.is_empty() {
+            output.content =
+                "[Tool execution limit reached. Please try a simpler request.]".to_string();
+        }
+    }
+
+    // Store response segment and push assistant turn
+    {
+        let active = scheduler.active_thread_mut().unwrap();
+        active.store_response_segment(&output.content, embedder).await.ok();
+        active.push_turn(animus_cortex::Turn::text(
+            animus_cortex::Role::Assistant,
+            &output.content,
+        ));
+    }
+
+    Ok(output.content)
 }
 
 // ---------------------------------------------------------------------------

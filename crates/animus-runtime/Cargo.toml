@@ -16,6 +16,7 @@ animus-cortex = { path = "../animus-cortex" }
 animus-interface = { path = "../animus-interface" }
 animus-sensorium = { workspace = true }
 animus-federation = { workspace = true }
+animus-channel = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

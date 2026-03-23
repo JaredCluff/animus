@@ -37,6 +37,18 @@ services:
       ANIMUS_OLLAMA_URL: "${ANIMUS_OLLAMA_URL:-http://localhost:11434}"
       ANIMUS_EMBED_MODEL: "${ANIMUS_EMBED_MODEL:-mxbai-embed-large}"
 
+      # ── Telegram bot (set ANIMUS_TELEGRAM_TOKEN to enable) ─────────────────
+      # Create a bot via @BotFather, copy the token here or export it:
+      #   export ANIMUS_TELEGRAM_TOKEN=123456789:ABCdef...
+      ANIMUS_TELEGRAM_TOKEN: "${ANIMUS_TELEGRAM_TOKEN:-}"
+
+      # ── Autonomy mode (reactive | goal_directed | full) ──────────────────
+      ANIMUS_AUTONOMY_MODE: "${ANIMUS_AUTONOMY_MODE:-reactive}"
+
+      # ── Security: trusted Telegram user IDs (comma-separated) ───────────
+      # Your Telegram user ID (get it from @userinfobot). Bypasses heavy scan.
+      ANIMUS_TRUSTED_TELEGRAM_IDS: "${ANIMUS_TRUSTED_TELEGRAM_IDS:-}"
+
       # ── Federation (disabled by default) ────────────────────────────────────
       ANIMUS_FEDERATION: "${ANIMUS_FEDERATION:-0}"
 

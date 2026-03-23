@@ -5,6 +5,10 @@ pub mod remember;
 pub mod list_segments;
 pub mod send_signal;
 pub mod update_segment;
+pub mod http_fetch;
+pub mod analyze_image;
+pub mod set_autonomy;
+pub mod telegram_send;
 
 use crate::llm::ToolDefinition;
 use crate::telos::Autonomy;
@@ -24,6 +28,11 @@ pub struct ToolContext {
     pub embedder: Arc<dyn EmbeddingService>,
     /// Signal channel for inter-thread communication tools.
     pub signal_tx: Option<mpsc::Sender<Signal>>,
+    /// Watch sender for runtime autonomy mode changes (set_autonomy tool).
+    pub autonomy_tx: Option<tokio::sync::watch::Sender<animus_core::config::AutonomyMode>>,
+    /// Active Telegram chat_id for the current conversation (for proactive sends).
+    /// Wrapped in Arc<Mutex> so the runtime can update it between calls without rebuilding ToolContext.
+    pub active_telegram_chat_id: Arc<parking_lot::Mutex<Option<i64>>>,
 }
 
 /// A tool the AILF can use to interact with the world.
