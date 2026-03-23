@@ -135,12 +135,13 @@ impl<S: VectorStore> PerceptionLoop<S> {
 
         match self.engine.reason(PERCEPTION_SYSTEM_PROMPT, &messages, None).await {
             Ok(output) => {
-                match serde_json::from_str::<PerceptionOutput>(&output.content) {
+                let json = strip_json_fence(&output.content);
+                match serde_json::from_str::<PerceptionOutput>(json) {
                     Ok(perception) => {
                         self.handle_perception_output(perception, &events).await;
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to parse perception output: {e}");
+                        tracing::warn!("Failed to parse perception output: {e}\nRaw: {}", &output.content[..output.content.len().min(200)]);
                         self.fallback_store(&events).await;
                     }
                 }
@@ -277,6 +278,19 @@ impl<S: VectorStore> PerceptionLoop<S> {
             self.process_batch(batch).await;
         }
     }
+}
+
+/// Strip markdown code fences (` ```json ... ``` ` or ` ``` ... ``` `) from LLM output.
+fn strip_json_fence(s: &str) -> &str {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix("```json")
+        .or_else(|| s.strip_prefix("```"))
+        .unwrap_or(s);
+    inner
+        .trim()
+        .trim_end_matches("```")
+        .trim()
 }
 
 #[cfg(test)]

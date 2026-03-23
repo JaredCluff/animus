@@ -228,12 +228,13 @@ impl<S: VectorStore> ReflectionLoop<S> {
 
         match self.engine.reason(REFLECTION_SYSTEM_PROMPT, &messages, None).await {
             Ok(output) => {
-                match serde_json::from_str::<ReflectionOutput>(&output.content) {
+                let json = strip_json_fence(&output.content);
+                match serde_json::from_str::<ReflectionOutput>(json) {
                     Ok(reflection) => {
                         self.handle_reflection_output(reflection).await;
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to parse reflection output: {e}");
+                        tracing::warn!("Failed to parse reflection output: {e}\nRaw: {}", &output.content[..output.content.len().min(200)]);
                     }
                 }
             }
@@ -378,6 +379,20 @@ impl<S: VectorStore> ReflectionLoop<S> {
 
         triggered || max_interval
     }
+}
+
+/// Strip markdown code fences (` ```json ... ``` ` or ` ``` ... ``` `) from LLM output.
+fn strip_json_fence(s: &str) -> &str {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix("```json")
+        .or_else(|| s.strip_prefix("```"))
+        .unwrap_or(s);
+    // Strip trailing fence if present
+    inner
+        .trim()
+        .trim_end_matches("```")
+        .trim()
 }
 
 #[cfg(test)]
