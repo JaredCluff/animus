@@ -1,0 +1,7 @@
+target/
+.worktrees/
+.git/
+.claude/
+docs/
+*.md
+*.tar.gz
