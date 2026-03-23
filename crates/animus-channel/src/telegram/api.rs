@@ -194,19 +194,39 @@ impl TelegramClient {
 
             if !api_resp.ok {
                 // Try plain text if Markdown failed
+                tracing::warn!(
+                    chat_id,
+                    reason = ?api_resp.description,
+                    "Telegram: Markdown send failed, falling back to plain text"
+                );
                 let plain = SendMessageParams {
                     chat_id,
                     text: &chunk,
                     parse_mode: None,
                     reply_to_message_id: reply_to,
                 };
-                let _ = self
+                let plain_resp = self
                     .http
                     .post(self.url("sendMessage"))
                     .json(&plain)
                     .send()
-                    .await;
+                    .await
+                    .map_err(|e| AnimusError::Llm(format!("sendMessage plain fallback request failed: {e}")))?;
+
+                let plain_api_resp: ApiResponse<serde_json::Value> = plain_resp
+                    .json()
+                    .await
+                    .map_err(|e| AnimusError::Llm(format!("sendMessage plain fallback parse failed: {e}")))?;
+
+                if !plain_api_resp.ok {
+                    return Err(AnimusError::Llm(format!(
+                        "sendMessage failed (plain text): {}",
+                        plain_api_resp.description.unwrap_or_default()
+                    )));
+                }
             }
+
+            tracing::info!(chat_id, chars = chunk.len(), "Telegram: sent message");
         }
         Ok(())
     }

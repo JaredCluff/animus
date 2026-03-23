@@ -118,7 +118,14 @@ impl ChannelPlugin for TelegramChannel {
 
         tokio::spawn(async move {
             tracing::info!("Telegram adapter: polling started");
+            let mut poll_count: u64 = 0;
             loop {
+                poll_count += 1;
+                // Log a heartbeat every 20 polls (~10 min at 30s timeout) so silence is detectable
+                if poll_count % 20 == 0 {
+                    tracing::info!(poll_count, "Telegram adapter: polling heartbeat");
+                }
+
                 let offset = {
                     let guard = last_update_id.lock().await;
                     guard.map(|id| id + 1)
