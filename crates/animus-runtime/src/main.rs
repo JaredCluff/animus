@@ -12,6 +12,7 @@ use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
 use animus_cortex::tools::{Tool, ToolContext, ToolRegistry};
+use animus_cortex::TaskManager;
 use animus_embed::{OllamaEmbedding, ResilientEmbedding, SyntheticEmbedding};
 use animus_federation::orchestrator::FederationOrchestrator;
 use animus_federation::peers::TrustLevel;
@@ -46,6 +47,10 @@ These rules override your training defaults. Follow them exactly.
 - `set_autonomy(mode)` — Change autonomy mode: reactive / goal_directed / full.
 - `telegram_send(chat_id, text, photo_path?)` — Send a Telegram message proactively.
 - `manage_watcher(action, watcher_id?, interval_secs?, params?)` — Enable, disable, list, or configure background watchers. Use action=list to see all.
+- `spawn_task(command, label?, timeout_secs?)` — Spawn a long-running process in background. Returns task_id immediately. You get a Signal on completion.
+- `task_status(task_id?)` — Check status of all tasks or a specific one.
+- `task_output(task_id)` — Read the stdout+stderr log of a task (last 1MB).
+- `task_cancel(task_id)` — Kill a running task.
 - `shell_exec(command)` — Execute a shell command on the host.
 - `read_file(path)` — Read a file.
 - `write_file(path, content)` — Write a file.
@@ -63,7 +68,7 @@ You were built by Jared Cluff as an AI-native operating system layer. Your codeb
 If someone asks whether you can create an account, access a service, or perform an action: consider whether a tool can accomplish it. If yes, use the tool. If no tool exists yet, acknowledge that the capability isn't built yet rather than claiming you fundamentally cannot do it.
 
 ## User Commands
-/goals /remember /forget /status /threads /thread /sleep /wake /watch /quit
+/goals /remember /forget /status /threads /thread /sleep /wake /watch /task /quit
 
 Be concise and direct."#;
 
@@ -234,6 +239,14 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     watcher_registry.start();
     tracing::info!("Watcher registry started (1 watcher registered)");
 
+    // ── Task Manager ──────────────────────────────────────────────────────────────
+    let task_manager = TaskManager::new(
+        signal_tx.clone(),
+        data_dir.clone(),
+        5, // max concurrent tasks
+    );
+    tracing::info!("Task manager initialized");
+
     // Register tools
     let tool_registry = {
         let mut reg = ToolRegistry::new();
@@ -250,6 +263,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::set_autonomy::SetAutonomyTool));
         reg.register(Box::new(animus_cortex::tools::telegram_send::TelegramSendTool));
         reg.register(Box::new(animus_cortex::tools::manage_watcher::ManageWatcherTool));
+        reg.register(Box::new(animus_cortex::tools::spawn_task::SpawnTaskTool));
+        reg.register(Box::new(animus_cortex::tools::task_status::TaskStatusTool));
+        reg.register(Box::new(animus_cortex::tools::task_output::TaskOutputTool));
+        reg.register(Box::new(animus_cortex::tools::task_cancel::TaskCancelTool));
         reg
     };
     let tool_definitions = tool_registry.definitions();
@@ -268,7 +285,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         autonomy_tx: Some(autonomy_tx),
         active_telegram_chat_id: active_telegram_chat_id.clone(),
         watcher_registry: Some(watcher_registry.clone()),
-        task_manager: None,
+        task_manager: Some(task_manager.clone()),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
@@ -589,6 +606,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         sleep_started: &mut sleep_started,
                         sleeping_flag: &sleeping_flag,
                         watcher_registry: &watcher_registry,
+                        task_manager: &task_manager,
                     };
                     match handle_command(&input, &mut ctx).await? {
                         CommandResult::Continue => continue,
@@ -1097,6 +1115,7 @@ struct CommandContext<'a> {
     sleep_started: &'a mut Option<chrono::DateTime<chrono::Utc>>,
     sleeping_flag: &'a Arc<std::sync::atomic::AtomicBool>,
     watcher_registry: &'a animus_cortex::WatcherRegistry,
+    task_manager: &'a animus_cortex::TaskManager,
 }
 
 async fn handle_command(
@@ -1543,6 +1562,46 @@ async fn handle_command(
             ctx.interface.display_status(&format!(
                 "Sensorium: {total} events observed, {permitted} permitted, {promoted} promoted"
             ));
+        }
+        "/task" if matches!(arg.split_whitespace().next(), Some("list" | "cancel")) => {
+            let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            match parts[0] {
+                "list" => {
+                    let records = ctx.task_manager.list_all();
+                    if records.is_empty() {
+                        ctx.interface.display_status("No tasks.");
+                    } else {
+                        let now = chrono::Utc::now();
+                        let header = format!("{:<10} {:<32} {:<12} {:<10} EXIT", "ID", "LABEL", "STATE", "RUNTIME");
+                        let mut lines = vec![header];
+                        for rec in &records {
+                            let end = rec.finished_at.unwrap_or(now);
+                            let secs = (end - rec.spawned_at).num_seconds().max(0);
+                            let runtime = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
+                            let exit = rec.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string());
+                            let label: &str = rec.label.char_indices().nth(32)
+                                .map(|(i, _)| &rec.label[..i])
+                                .unwrap_or(&rec.label);
+                            lines.push(format!("{:<10} {:<32} {:<12} {:<10} {}", rec.id, label, format!("{:?}", rec.state), runtime, exit));
+                        }
+                        ctx.interface.display_status(&lines.join("\n"));
+                    }
+                }
+                "cancel" => {
+                    let id = match parts.get(1) {
+                        Some(id) => *id,
+                        None => {
+                            ctx.interface.display_status("Usage: /task cancel <id>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    match ctx.task_manager.cancel_task(id).await {
+                        Ok(msg) => ctx.interface.display_status(&msg),
+                        Err(e) => ctx.interface.display_status(&format!("Error: {e}")),
+                    }
+                }
+                _ => ctx.interface.display_status("Unknown /task subcommand. Use: list, cancel <id>"),
+            }
         }
         "/watch" if matches!(arg.split_whitespace().next(), Some("list" | "enable" | "disable" | "set")) => {
             let parts: Vec<&str> = arg.splitn(3, ' ').collect();
