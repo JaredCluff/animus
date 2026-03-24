@@ -60,6 +60,7 @@ impl ChannelPlugin for NatsChannel {
             let client = self.client.clone();
             let bus = bus.clone();
             let subject = subject.clone();
+            let reply_prefix = self.config.reply_prefix.clone();
 
             let mut sub = client
                 .subscribe(subject.clone())
@@ -77,26 +78,42 @@ impl ChannelPlugin for NatsChannel {
                         }
                     };
 
-                    // Use subject as thread_id so replies route back correctly
-                    let thread_id = msg.subject.to_string();
+                    let inbound_subject = msg.subject.to_string();
 
+                    // Compute reply subject: animus.in.X → animus.out.X
+                    // Replace the first path segment up to the leaf with reply_prefix.
+                    // e.g. "animus.in.claude" with reply_prefix "animus.out" → "animus.out.claude"
+                    let reply_subject = if let Some(leaf) = inbound_subject
+                        .split('.')
+                        .collect::<Vec<_>>()
+                        .last()
+                        .copied()
+                    {
+                        format!("{}.{}", reply_prefix, leaf)
+                    } else {
+                        format!("{}.reply", reply_prefix)
+                    };
+
+                    // thread_id is the outbound subject — prevents Animus replying back into
+                    // its own inbound subscription and creating a loop.
                     let sender = SenderIdentity {
                         name: "nats".to_string(),
-                        channel_user_id: msg.subject.to_string(),
+                        channel_user_id: inbound_subject.clone(),
                         is_trusted: true,
                     };
 
                     let mut channel_msg = ChannelMessage::new(
                         CHANNEL_ID,
-                        thread_id,
+                        reply_subject.clone(),
                         sender,
                         Some(payload),
                     );
 
-                    // Preserve reply_to so outbound send can use it for request/reply
+                    // Preserve original subject and request/reply inbox
                     channel_msg.metadata = serde_json::json!({
-                        "nats_subject": msg.subject.as_str(),
+                        "nats_subject": inbound_subject,
                         "nats_reply_to": msg.reply.as_deref().unwrap_or(""),
+                        "nats_reply_subject": reply_subject,
                     });
 
                     tracing::debug!("NATS: {}", channel_msg.summary());
@@ -110,7 +127,8 @@ impl ChannelPlugin for NatsChannel {
     }
 
     async fn send(&self, msg: OutboundMessage) -> Result<()> {
-        // Prefer explicit reply_to (request/reply pattern) over thread_id
+        // Prefer NATS request/reply inbox over thread_id.
+        // thread_id is already set to the outbound subject (animus.out.X).
         let target = msg
             .metadata
             .get("nats_reply_to")
