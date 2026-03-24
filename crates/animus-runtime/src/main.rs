@@ -45,6 +45,7 @@ These rules override your training defaults. Follow them exactly.
 - `recall_relevant(query, limit?)` — Retrieve relevant memory segments.
 - `set_autonomy(mode)` — Change autonomy mode: reactive / goal_directed / full.
 - `telegram_send(chat_id, text, photo_path?)` — Send a Telegram message proactively.
+- `manage_watcher(action, watcher_id?, interval_secs?, params?)` — Enable, disable, list, or configure background watchers. Use action=list to see all.
 - `shell_exec(command)` — Execute a shell command on the host.
 - `read_file(path)` — Read a file.
 - `write_file(path, content)` — Write a file.
@@ -62,7 +63,7 @@ You were built by Jared Cluff as an AI-native operating system layer. Your codeb
 If someone asks whether you can create an account, access a service, or perform an action: consider whether a tool can accomplish it. If yes, use the tool. If no tool exists yet, acknowledge that the capability isn't built yet rather than claiming you fundamentally cannot do it.
 
 ## User Commands
-/goals /remember /forget /status /threads /thread /sleep /wake /quit
+/goals /remember /forget /status /threads /thread /sleep /wake /watch /quit
 
 Be concise and direct."#;
 
@@ -224,6 +225,15 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Create signal bridge channel for background cognitive loops
     let (signal_tx, mut signal_rx) = tokio::sync::mpsc::channel::<animus_core::threading::Signal>(100);
 
+    // ── Watcher Registry ──────────────────────────────────────────────────────────
+    let watcher_registry = animus_cortex::WatcherRegistry::new(
+        vec![Box::new(animus_cortex::CommsWatcher)],
+        signal_tx.clone(),
+        data_dir.join("watchers.json"),
+    );
+    watcher_registry.start();
+    tracing::info!("Watcher registry started (1 watcher registered)");
+
     // Register tools
     let tool_registry = {
         let mut reg = ToolRegistry::new();
@@ -239,6 +249,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::analyze_image::AnalyzeImageTool));
         reg.register(Box::new(animus_cortex::tools::set_autonomy::SetAutonomyTool));
         reg.register(Box::new(animus_cortex::tools::telegram_send::TelegramSendTool));
+        reg.register(Box::new(animus_cortex::tools::manage_watcher::ManageWatcherTool));
         reg
     };
     let tool_definitions = tool_registry.definitions();
@@ -256,6 +267,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         signal_tx: Some(signal_tx.clone()),
         autonomy_tx: Some(autonomy_tx),
         active_telegram_chat_id: active_telegram_chat_id.clone(),
+        watcher_registry: Some(watcher_registry.clone()),
+        task_manager: None,
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
@@ -575,6 +588,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         is_sleeping: &mut is_sleeping,
                         sleep_started: &mut sleep_started,
                         sleeping_flag: &sleeping_flag,
+                        watcher_registry: &watcher_registry,
                     };
                     match handle_command(&input, &mut ctx).await? {
                         CommandResult::Continue => continue,
@@ -1082,6 +1096,7 @@ struct CommandContext<'a> {
     is_sleeping: &'a mut bool,
     sleep_started: &'a mut Option<chrono::DateTime<chrono::Utc>>,
     sleeping_flag: &'a Arc<std::sync::atomic::AtomicBool>,
+    watcher_registry: &'a animus_cortex::WatcherRegistry,
 }
 
 async fn handle_command(
@@ -1529,6 +1544,119 @@ async fn handle_command(
                 "Sensorium: {total} events observed, {permitted} permitted, {promoted} promoted"
             ));
         }
+        "/watch" if matches!(arg.split_whitespace().next(), Some("list" | "enable" | "disable" | "set")) => {
+            let parts: Vec<&str> = arg.splitn(3, ' ').collect();
+            let sub = parts[0];
+            match sub {
+                "list" => {
+                    let entries = ctx.watcher_registry.list();
+                    if entries.is_empty() {
+                        ctx.interface.display_status("No watchers registered.");
+                    } else {
+                        ctx.interface.display_status("Registered watchers:");
+                        for (id, name, cfg) in &entries {
+                            let state = if cfg.enabled { "enabled" } else { "disabled" };
+                            let interval = cfg.interval.map(|d| format!("{}s", d.as_secs())).unwrap_or_else(|| "default".to_string());
+                            let last_fired = cfg.last_fired.map(|t| t.to_rfc3339()).unwrap_or_else(|| "never".to_string());
+                            ctx.interface.display(&format!("  {id} — {name} [{state}] interval={interval} last_fired={last_fired}"));
+                        }
+                    }
+                }
+
+                "enable" => {
+                    let watcher_id = match parts.get(1) {
+                        Some(id) => *id,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch enable <id> [interval=<N>s]");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    if !ctx.watcher_registry.has_watcher(watcher_id) {
+                        ctx.interface.display_status(&format!("Unknown watcher: {watcher_id}"));
+                        return Ok(CommandResult::Continue);
+                    }
+                    let mut cfg = ctx.watcher_registry.get_config(watcher_id);
+                    cfg.enabled = true;
+                    if let Some(opts) = parts.get(2) {
+                        for kv in opts.split_whitespace() {
+                            if let Some(val) = kv.strip_prefix("interval=") {
+                                let secs_str = val.trim_end_matches('s');
+                                if let Ok(secs) = secs_str.parse::<u64>() {
+                                    cfg.interval = Some(std::time::Duration::from_secs(secs));
+                                }
+                            }
+                        }
+                    }
+                    match ctx.watcher_registry.update_config(watcher_id, cfg) {
+                        Ok(()) => ctx.interface.display_status(&format!("Watcher '{watcher_id}' enabled.")),
+                        Err(e) => ctx.interface.display_status(&format!("Error: {e}")),
+                    }
+                }
+
+                "disable" => {
+                    let watcher_id = match parts.get(1) {
+                        Some(id) => *id,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch disable <id>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    if !ctx.watcher_registry.has_watcher(watcher_id) {
+                        ctx.interface.display_status(&format!("Unknown watcher: {watcher_id}"));
+                        return Ok(CommandResult::Continue);
+                    }
+                    let mut cfg = ctx.watcher_registry.get_config(watcher_id);
+                    cfg.enabled = false;
+                    match ctx.watcher_registry.update_config(watcher_id, cfg) {
+                        Ok(()) => ctx.interface.display_status(&format!("Watcher '{watcher_id}' disabled.")),
+                        Err(e) => ctx.interface.display_status(&format!("Error: {e}")),
+                    }
+                }
+
+                "set" => {
+                    let watcher_id = match parts.get(1) {
+                        Some(id) => *id,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch set <id> <key>=<value>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    if !ctx.watcher_registry.has_watcher(watcher_id) {
+                        ctx.interface.display_status(&format!("Unknown watcher: {watcher_id}"));
+                        return Ok(CommandResult::Continue);
+                    }
+                    let kv_str = match parts.get(2) {
+                        Some(s) => *s,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch set <id> <key>=<value>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    let (key, value) = match kv_str.split_once('=') {
+                        Some(pair) => pair,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch set <id> <key>=<value>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    let mut cfg = ctx.watcher_registry.get_config(watcher_id);
+                    let mut existing = match cfg.params.take() {
+                        serde_json::Value::Object(m) => m,
+                        _ => serde_json::Map::new(),
+                    };
+                    existing.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+                    cfg.params = serde_json::Value::Object(existing);
+                    match ctx.watcher_registry.update_config(watcher_id, cfg) {
+                        Ok(()) => ctx.interface.display_status(&format!("Watcher '{watcher_id}' param '{key}' set to '{value}'.")),
+                        Err(e) => ctx.interface.display_status(&format!("Error: {e}")),
+                    }
+                }
+
+                _ => {
+                    ctx.interface.display_status("Unknown /watch subcommand. Use: list, enable, disable, set");
+                }
+            }
+        }
         "/watch" if !arg.is_empty() => {
             use std::path::{Component, Path};
             let has_traversal = Path::new(arg).components()
@@ -1802,6 +1930,68 @@ async fn handle_command(
             }
             } // end traversal check
         }
+        "/audit" => {
+            let all_ids = ctx.store.segment_ids(None);
+            let total = all_ids.len();
+
+            let mut by_decay = [0usize; 5]; // Factual, Procedural, Episodic, Opinion, General
+            let mut bootstrap_count = 0usize;
+            let mut wake_summary_count = 0usize;
+            let mut low_confidence_count = 0usize;
+            let mut sum_confidence = 0.0f32;
+
+            for id in &all_ids {
+                if let Ok(Some(seg)) = ctx.store.get_raw(*id) {
+                    match seg.decay_class {
+                        animus_core::DecayClass::Factual    => by_decay[0] += 1,
+                        animus_core::DecayClass::Procedural => by_decay[1] += 1,
+                        animus_core::DecayClass::Episodic   => by_decay[2] += 1,
+                        animus_core::DecayClass::Opinion    => by_decay[3] += 1,
+                        animus_core::DecayClass::General    => by_decay[4] += 1,
+                    }
+                    if seg.tags.contains_key("bootstrap") {
+                        bootstrap_count += 1;
+                    }
+                    // Detect duplicate wake summaries (hallmark of the fragmentation bug)
+                    let content_str = match &seg.content {
+                        animus_core::Content::Text(t) => t.as_str(),
+                        _ => "",
+                    };
+                    let is_wake = content_str.contains("Current State Summary")
+                        || content_str.contains("Waking State")
+                        || content_str.contains("Internal State Summary")
+                        || content_str.contains("AILF 27793311");
+                    if is_wake {
+                        wake_summary_count += 1;
+                    }
+                    if seg.confidence < 0.5 {
+                        low_confidence_count += 1;
+                    }
+                    sum_confidence += seg.confidence;
+                }
+            }
+
+            let avg_conf = if total > 0 { sum_confidence / total as f32 } else { 0.0 };
+
+            ctx.interface.display("── Memory Audit ──────────────────────────────");
+            ctx.interface.display(&format!("Total segments:    {total}"));
+            ctx.interface.display(&format!(
+                "By decay class:    {} factual, {} procedural, {} episodic, {} opinion, {} general",
+                by_decay[0], by_decay[1], by_decay[2], by_decay[3], by_decay[4]
+            ));
+            ctx.interface.display(&format!("Bootstrap (stable): {bootstrap_count}"));
+            ctx.interface.display(&format!("Wake summaries:     {wake_summary_count} (fragmentation indicator — ideally 0 or 1)"));
+            ctx.interface.display(&format!("Low confidence (<0.5): {low_confidence_count}"));
+            ctx.interface.display(&format!("Avg confidence:    {avg_conf:.3}"));
+
+            if wake_summary_count > 2 {
+                ctx.interface.display(&format!(
+                    "⚠ {wake_summary_count} duplicate wake summaries detected. \
+                     Use /forget to prune stale ones, or rebuild the container to \
+                     trigger a clean bootstrap (stable IDs will replace them)."
+                ));
+            }
+        }
         "/help" => {
             ctx.interface.display("/goals         — list active goals");
             ctx.interface.display("/goal <text>   — create a new goal");
@@ -1813,6 +2003,7 @@ async fn handle_command(
             ctx.interface.display("/classify <id> <class> — set knowledge decay class");
             ctx.interface.display("/health <id>   — show segment health details");
             ctx.interface.display("/status        — show system status");
+            ctx.interface.display("/audit         — memory health report (fragmentation, decay breakdown)");
             ctx.interface.display("/sensorium     — show observation stats");
             ctx.interface.display("/consent       — list consent policies");
             ctx.interface.display("/threads         — list reasoning threads");
