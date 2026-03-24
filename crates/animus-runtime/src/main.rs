@@ -1,5 +1,6 @@
 mod bootstrap;
 
+use animus_channel::nats::NatsChannel;
 use animus_channel::telegram::TelegramChannel;
 use animus_channel::{ChannelBus, InjectionScanner, MessageRouter};
 use animus_channel::router::RouteDecision;
@@ -355,6 +356,19 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         }
     } else {
         tracing::info!("Telegram channel disabled (set ANIMUS_TELEGRAM_TOKEN to enable)");
+    }
+
+    // Register NATS adapter if configured
+    if config.channels.nats.enabled {
+        match NatsChannel::connect(config.channels.nats.clone()).await {
+            Ok(adapter) => {
+                channel_bus.register(Arc::new(adapter)).await;
+                tracing::info!("NATS channel adapter registered");
+            }
+            Err(e) => tracing::warn!("Failed to initialize NATS adapter: {e}"),
+        }
+    } else {
+        tracing::info!("NATS channel disabled (set channels.nats.enabled = true to enable)");
     }
 
     // Start all registered channel adapters

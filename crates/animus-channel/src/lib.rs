@@ -6,6 +6,7 @@
 
 pub mod bus;
 pub mod message;
+pub mod nats;
 pub mod plugin;
 pub mod router;
 pub mod scanner;
