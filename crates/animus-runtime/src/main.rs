@@ -1564,6 +1564,7 @@ async fn handle_command(
             ));
         }
         "/task" if matches!(arg.split_whitespace().next(), Some("list" | "cancel")) => {
+            let arg = arg.trim_start();
             let parts: Vec<&str> = arg.splitn(2, ' ').collect();
             match parts[0] {
                 "list" => {
