@@ -30,12 +30,29 @@ pub struct ReflectionOutput {
 pub struct Synthesis {
     /// The synthesized insight text.
     pub content: String,
-    /// Which segment IDs led to this synthesis (provenance).
+    /// Which segment IDs led to this synthesis (provenance). Non-UUID strings are silently ignored.
+    #[serde(default, deserialize_with = "deserialize_segment_ids")]
     pub source_segment_ids: Vec<SegmentId>,
     /// What kind of knowledge is this?
     pub decay_class: DecayClass,
     /// Why this confidence level?
     pub confidence_rationale: String,
+}
+
+fn deserialize_segment_ids<'de, D>(d: D) -> Result<Vec<SegmentId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let values: Vec<serde_json::Value> = Vec::deserialize(d)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                .map(SegmentId)
+        })
+        .collect())
 }
 
 /// A contradiction detected between two segments.
@@ -60,6 +77,7 @@ pub struct GoalUpdate {
 pub struct ReflectionSignal {
     pub priority: SignalPriority,
     pub insight: String,
+    #[serde(default, deserialize_with = "deserialize_segment_ids")]
     pub relevant_segments: Vec<SegmentId>,
 }
 

@@ -58,6 +58,10 @@ services:
       # Claude Code OAuth credentials — for OAuth auth without purchasing API tokens.
       # Mounted read-write so the engine can persist refreshed tokens.
       - "${HOME}/.claude/.credentials.json:/home/animus/.claude/.credentials.json"
+      # Shared communication channel between Animus and Claude Code.
+      # Animus writes to /home/animus/comms/to-claude/
+      # Claude Code writes to /home/animus/comms/from-claude/
+      - "${HOME}/animus-comms:/home/animus/comms"
 
     # Healthcheck using the built-in HTTP endpoint
     healthcheck:
