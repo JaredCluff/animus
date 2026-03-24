@@ -93,11 +93,37 @@ impl Default for HttpApiChannelConfig {
     }
 }
 
+/// Configuration for the NATS channel adapter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NatsChannelConfig {
+    /// Whether the NATS channel is enabled.
+    pub enabled: bool,
+    /// NATS server URL. Overridden by `ANIMUS_NATS_URL` env var.
+    pub url: String,
+    /// Subjects to subscribe to for inbound messages (e.g. ["animus.in.>"]).
+    #[serde(default)]
+    pub subjects: Vec<String>,
+    /// Subject prefix for outbound replies (e.g. "animus.out").
+    pub reply_prefix: String,
+}
+
+impl Default for NatsChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: "nats://localhost:4222".to_string(),
+            subjects: vec!["animus.in.>".to_string()],
+            reply_prefix: "animus.out".to_string(),
+        }
+    }
+}
+
 /// Top-level channels configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelsConfig {
     pub telegram: TelegramChannelConfig,
     pub http_api: HttpApiChannelConfig,
+    pub nats: NatsChannelConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +561,17 @@ impl AnimusConfig {
         }
         if std::env::var("ANIMUS_TELEGRAM_DISABLED").is_ok() {
             self.channels.telegram.enabled = false;
+        }
+
+        // NATS channel overrides
+        if let Ok(url) = std::env::var("ANIMUS_NATS_URL") {
+            if !url.is_empty() {
+                self.channels.nats.url = url;
+                self.channels.nats.enabled = true;
+            }
+        }
+        if std::env::var("ANIMUS_NATS_DISABLED").is_ok() {
+            self.channels.nats.enabled = false;
         }
 
         // Autonomy mode override
