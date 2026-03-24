@@ -39,8 +39,13 @@ impl Tool for TaskOutputTool {
             Err(_) => Ok(ToolResult { content: "(no output yet)".to_string(), is_error: false }),
             Ok(bytes) => {
                 let content = if bytes.len() > MAX_OUTPUT_BYTES {
-                    let offset = bytes.len() - MAX_OUTPUT_BYTES;
-                    format!("[...truncated, showing last 1MB]\n{}", String::from_utf8_lossy(&bytes[offset..]))
+                    let s = String::from_utf8_lossy(&bytes);
+                    // Find a char boundary at or after the byte offset so we don't split a codepoint
+                    let byte_offset = bytes.len() - MAX_OUTPUT_BYTES;
+                    let char_offset = s[byte_offset..].char_indices().next()
+                        .map(|(i, _)| byte_offset + i)
+                        .unwrap_or(s.len());
+                    format!("[...truncated, showing last 1MB]\n{}", &s[char_offset..])
                 } else {
                     String::from_utf8_lossy(&bytes).into_owned()
                 };

@@ -36,17 +36,17 @@ impl Tool for SpawnTaskTool {
             None => return Ok(ToolResult { content: "Task manager not available".to_string(), is_error: true }),
         };
 
-        match manager.spawn_task(command.clone(), label.clone(), timeout_secs).await {
-            Ok(id) => {
-                let display_label = label.as_deref().unwrap_or(&command);
-                let display_label = display_label.char_indices().nth(40)
-                    .map(|(i, _)| &display_label[..i])
-                    .unwrap_or(display_label);
-                Ok(ToolResult {
-                    content: format!("Task spawned: id={id} label=\"{display_label}\""),
-                    is_error: false,
-                })
-            }
+        let display_label = {
+            let base = label.as_deref().unwrap_or(&command);
+            base.char_indices().nth(40)
+                .map(|(i, _)| base[..i].to_string())
+                .unwrap_or_else(|| base.to_string())
+        };
+        match manager.spawn_task(command, label, timeout_secs).await {
+            Ok(id) => Ok(ToolResult {
+                content: format!("Task spawned: id={id} label=\"{display_label}\""),
+                is_error: false,
+            }),
             Err(e) => Ok(ToolResult { content: e, is_error: true }),
         }
     }

@@ -32,7 +32,7 @@ impl Tool for TaskStatusTool {
                 Some(rec) => {
                     let now = chrono::Utc::now();
                     let end = rec.finished_at.unwrap_or(now);
-                    let secs = (end - rec.spawned_at).num_seconds();
+                    let secs = (end - rec.spawned_at).num_seconds().max(0);
                     let runtime = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
                     let exit = rec.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string());
                     Ok(ToolResult {
@@ -56,7 +56,7 @@ impl Tool for TaskStatusTool {
         let mut lines = vec![header];
         for rec in &records {
             let end = rec.finished_at.unwrap_or(now);
-            let secs = (end - rec.spawned_at).num_seconds();
+            let secs = (end - rec.spawned_at).num_seconds().max(0);
             let runtime = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
             let exit = rec.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string());
             let label: &str = rec.label.char_indices().nth(32)
