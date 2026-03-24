@@ -40,6 +40,149 @@ pub struct AnimusConfig {
 
     /// Health endpoint configuration.
     pub health: HealthConfig,
+
+    /// Communication channel configuration.
+    pub channels: ChannelsConfig,
+
+    /// Autonomy mode configuration.
+    pub autonomy: AutonomyConfig,
+
+    /// Security and prompt injection protection configuration.
+    pub security: SecurityConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Channels
+// ---------------------------------------------------------------------------
+
+/// Configuration for the Telegram bot channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramChannelConfig {
+    /// Whether the Telegram channel is enabled.
+    pub enabled: bool,
+    /// Bot token from @BotFather. Overridden by `ANIMUS_TELEGRAM_TOKEN` env var.
+    #[serde(default)]
+    pub bot_token: String,
+    /// Long-poll timeout in seconds.
+    pub poll_timeout_secs: u64,
+    /// Download directory for received files/photos.
+    pub download_dir: String,
+}
+
+impl Default for TelegramChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            poll_timeout_secs: 30,
+            download_dir: "/tmp/animus-downloads".to_string(),
+        }
+    }
+}
+
+/// Configuration for the HTTP API channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpApiChannelConfig {
+    /// Whether the HTTP API channel is enabled (extends the health endpoint).
+    pub enabled: bool,
+}
+
+impl Default for HttpApiChannelConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Top-level channels configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChannelsConfig {
+    pub telegram: TelegramChannelConfig,
+    pub http_api: HttpApiChannelConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Autonomy
+// ---------------------------------------------------------------------------
+
+/// Runtime-configurable autonomy mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyMode {
+    /// Only acts when messaged. No background actions.
+    Reactive,
+    /// Has standing goals, acts on them independently. Responds to messages.
+    GoalDirected,
+    /// Acts on own judgment 24/7 within configured permissions.
+    Full,
+}
+
+impl Default for AutonomyMode {
+    fn default() -> Self {
+        AutonomyMode::Reactive
+    }
+}
+
+impl std::fmt::Display for AutonomyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AutonomyMode::Reactive => write!(f, "reactive"),
+            AutonomyMode::GoalDirected => write!(f, "goal_directed"),
+            AutonomyMode::Full => write!(f, "full"),
+        }
+    }
+}
+
+impl std::str::FromStr for AutonomyMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "reactive" | "a" => Ok(AutonomyMode::Reactive),
+            "goal_directed" | "goal-directed" | "b" => Ok(AutonomyMode::GoalDirected),
+            "full" | "c" => Ok(AutonomyMode::Full),
+            other => Err(format!("unknown autonomy mode: {other}")),
+        }
+    }
+}
+
+/// Autonomy configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutonomyConfig {
+    /// Default autonomy mode at boot.
+    pub default_mode: AutonomyMode,
+}
+
+impl Default for AutonomyConfig {
+    fn default() -> Self {
+        Self { default_mode: AutonomyMode::Reactive }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Security / Prompt Injection Protection
+// ---------------------------------------------------------------------------
+
+/// Configuration for prompt injection protection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Whether injection scanning is enabled.
+    pub injection_scanning_enabled: bool,
+    /// Confidence threshold above which content is quarantined (0.0–1.0).
+    pub injection_threshold: f32,
+    /// Trusted Telegram user IDs (bypass heavy scanning).
+    pub trusted_telegram_ids: Vec<i64>,
+    /// Trusted email addresses (bypass heavy scanning).
+    pub trusted_email_addresses: Vec<String>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            injection_scanning_enabled: true,
+            injection_threshold: 0.7,
+            trusted_telegram_ids: Vec::new(),
+            trusted_email_addresses: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +436,9 @@ impl Default for AnimusConfig {
             sensorium: SensoriumConfig::default(),
             federation: FederationConfig::default(),
             health: HealthConfig::default(),
+            channels: ChannelsConfig::default(),
+            autonomy: AutonomyConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -378,6 +524,39 @@ impl AnimusConfig {
         // Federation overrides
         if std::env::var("ANIMUS_FEDERATION").as_deref() == Ok("1") {
             self.federation.enabled = true;
+        }
+
+        // Channel overrides
+        if let Ok(token) = std::env::var("ANIMUS_TELEGRAM_TOKEN") {
+            if !token.is_empty() {
+                self.channels.telegram.bot_token = token;
+                self.channels.telegram.enabled = true;
+            }
+        }
+        if std::env::var("ANIMUS_TELEGRAM_DISABLED").is_ok() {
+            self.channels.telegram.enabled = false;
+        }
+
+        // Autonomy mode override
+        if let Ok(mode) = std::env::var("ANIMUS_AUTONOMY_MODE") {
+            match mode.parse::<AutonomyMode>() {
+                Ok(m) => self.autonomy.default_mode = m,
+                Err(e) => eprintln!("Warning: invalid ANIMUS_AUTONOMY_MODE value: {e}"),
+            }
+        }
+
+        // Security overrides
+        if std::env::var("ANIMUS_INJECTION_SCAN_DISABLED").is_ok() {
+            self.security.injection_scanning_enabled = false;
+        }
+        if let Ok(ids) = std::env::var("ANIMUS_TRUSTED_TELEGRAM_IDS") {
+            for id_str in ids.split(',') {
+                if let Ok(id) = id_str.trim().parse::<i64>() {
+                    if !self.security.trusted_telegram_ids.contains(&id) {
+                        self.security.trusted_telegram_ids.push(id);
+                    }
+                }
+            }
         }
     }
 

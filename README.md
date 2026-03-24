@@ -31,14 +31,9 @@ No system exists today that provides all of these:
 - **Continuous presence** — not invoked per-task, but always running, always aware
 - **Identity and continuity** — a persistent entity with its own history, not a stateless function call
 - **Thread isolation** — concurrent reasoning without cross-contamination
-
-## The Biological Analogy
-
-A human has a brainstem that manages hardware without conscious effort — breathing, heartbeat, digestion. But a trained human *can* deliberately lower their heart rate.
-
-Animus works the same way. Most system operations happen autonomously. The AILF *can* reach down into lower-level operations when needed. The human interacts *with* the AILF; the AILF interfaces with the system natively.
-
-No bootstrap wizard. The AILF has general knowledge from its LLM foundation — it just doesn't know *this specific human*. Learning happens through natural interaction, like meeting a new colleague.
+- **Real tools** — web access, image analysis, file I/O, shell — not simulated capabilities
+- **Multi-channel reach** — Telegram today, email/Discord/Slack on the roadmap
+- **Autonomy spectrum** — reactive to fully autonomous, configurable per deployment
 
 ## Architecture
 
@@ -47,10 +42,10 @@ Six layers, from hardware to human interface.
 ```
 ┌─────────────────────────────────────────┐
 │  Layer 5: Interface & Federation        │
-│  (human NL, voice, AILF-to-AILF)       │
+│  (Telegram, HTTP API, voice, channels)  │
 ├─────────────────────────────────────────┤
 │  Layer 4: Cortex                        │
-│  (reasoning threads, LLM, goals)       │
+│  (reasoning threads, LLM, goals, tools) │
 ├─────────────────────────────────────────┤
 │  Layer 3: Sensorium                     │
 │  (event bus, attention, consent, audit) │
@@ -63,7 +58,7 @@ Six layers, from hardware to human interface.
 │  (semantic storage, hot/warm/cold tiers)│
 ├─────────────────────────────────────────┤
 │  Layer 0: Substrate                     │
-│  (Linux kernel / microkernel)           │
+│  (Linux kernel / macOS / container)     │
 └─────────────────────────────────────────┘
 ```
 
@@ -111,17 +106,60 @@ Mnemos solves the context window problem. LLMs have finite context. Mnemos decid
 
 **Quality gate** — Tracks human corrections vs. acceptances. Knowledge that leads to corrections loses confidence. Knowledge the human validates gains it.
 
-### Sensorium (Layer 3) — *Planned*
+### Sensorium (Layer 3) — Ambient Awareness
 
-Ambient awareness. An event bus that captures system events, filters through consent policies and attention tiers, and surfaces relevant information to the Cortex. Full capability, human-controlled scope, auditable trail.
+An event bus that captures system events (file changes, process activity, clipboard), filters through consent policies and attention tiers, and surfaces relevant information to the Cortex. The AILF observes its environment within consent boundaries the human controls. All observations are auditable.
 
-### Cortex (Layer 4) — *In Progress*
+### Cortex (Layer 4) — Reasoning Engine
 
-The reasoning engine. Manages conversation threads, goal tracking (Telos), LLM integration, and the scheduler that decides what to think about next. Provider-agnostic by design, with an autonomy spectrum that mirrors trust-building: a new AILF starts conservative and earns independence over time.
+Multi-threaded reasoning with LLM integration, goal tracking (Telos), and a tool framework. Manages conversation threads — each an isolated context for a different task or channel. Threads communicate through signals, not shared state.
 
-### Interface & Federation (Layer 5) — *Planned*
+The Cortex includes:
+- **ReasoningEngine** — LLM-agnostic; swap Claude/GPT/Llama by changing config
+- **ThreadScheduler** — manages multiple parallel reasoning contexts
+- **Telos** — goal tracking with priority and source (human-assigned vs self-derived)
+- **ToolRegistry** — real executable capabilities (see [tools list](#tools))
+- **EngineRegistry** — routes cognitive roles (Perception, Reflection, Reasoning) to appropriate models
 
-Human interaction via natural language, voice, and messaging. AILF-to-AILF knowledge sharing across instances.
+### Channel Layer (Layer 5) — Communication
+
+The **ChannelBus** routes messages between Animus and the outside world. Each channel is a plugin implementing `ChannelPlugin`.
+
+- **TelegramChannel** — long-polling bot; supports text, photos, Markdown
+- **HTTP API** — planned REST endpoint for programmatic access
+- **MessageRouter** — triage, priority scoring (Critical/High/Normal/Low), injection detection
+- **InjectionScanner** — heuristic + optional LLM classifier for prompt injection protection
+
+## Tools
+
+Animus has real, executable tools — not simulated capabilities. The model calls these as function calls; they execute against the real world.
+
+| Tool | Description | Autonomy Required |
+|------|-------------|-------------------|
+| `http_fetch` | GET/POST any URL; returns actual page content | Act |
+| `analyze_image` | Multimodal image analysis via LLM vision | Suggest |
+| `telegram_send` | Proactively send Telegram messages | Act |
+| `set_autonomy` | Change autonomy mode at runtime | Inform |
+| `remember` | Store knowledge in VectorFS | Suggest |
+| `recall_relevant` | Retrieve memory by semantic similarity | Inform |
+| `read_file` | Read a file from the filesystem | Inform |
+| `write_file` | Write a file to the filesystem | Act |
+| `list_directory` | List directory contents | Inform |
+| `search_files` | Search files by pattern | Inform |
+| `shell_exec` | Execute a shell command | Act |
+| `send_signal` | Send a signal to another reasoning thread | Inform |
+
+**Planned (Phase 2):** `browse_url` (headless browser), `screen_capture`, `gmail_read/send`, `calendar_read/create`
+
+## Autonomy Modes
+
+| Mode | Behavior |
+|------|----------|
+| `reactive` | Responds only when messaged. Default. |
+| `goal_directed` | Pursues standing goals proactively; responds to messages. |
+| `full` | Fully autonomous — monitors, acts, and reaches out on its own initiative. |
+
+Change at runtime: tell Animus "set autonomy to goal_directed" or use the `set_autonomy` tool.
 
 ## AILF Lifecycle
 
@@ -135,41 +173,48 @@ An AILF isn't a process you start and stop. It has a lifecycle:
 
 Each AILF has a cryptographic identity (Ed25519 keypair) generated at birth. Identity lives outside VectorFS — it's not a memory, it's who you are.
 
-## Embedding Strategy
+## Embedding
 
-Three tiers of embedding models, scaling from constrained hardware to cloud:
+The primary embedding model is **Ollama with `mxbai-embed-large`** (1024 dimensions). The `EmbeddingService` trait abstracts the provider — any compatible backend can be substituted without touching core logic.
 
-| Tier | Model | Runs on | Modality |
-|------|-------|---------|----------|
-| 1 | EmbeddingGemma 300M | Raspberry Pi | Text |
-| 2 | Nomic Embed Multimodal 3B | Mini PC w/ GPU | Text + images |
-| 3 | Gemini Embedding API | Cloud | Full multimodal |
+| Provider | Model | Notes |
+|----------|-------|-------|
+| **Ollama** (default) | `mxbai-embed-large` | Self-hosted; used in production |
+| **OpenAI** | `text-embedding-3-small` | Optional; set `ANIMUS_EMBED_PROVIDER=openai` |
+| Synthetic | — | Fallback for tests; non-semantic |
 
-All implement a single `EmbeddingService` trait. An AILF can migrate between tiers by re-embedding its segments.
+A resilient wrapper retries failed embedding calls with exponential backoff.
 
 ## Project Structure
 
 ```
 animus/
 ├── crates/
-│   ├── animus-core/       # Shared types: Segment, Identity, Config, traits
-│   ├── animus-vectorfs/   # Layer 1: HNSW index, tier management, persistence
-│   ├── animus-mnemos/     # Layer 2: context assembly, eviction, consolidation
-│   ├── animus-cortex/     # Layer 4: reasoning engine, LLM integration
-│   ├── animus-interface/  # Layer 5: human interaction, terminal interface
-│   ├── animus-runtime/    # AILF lifecycle, boot, orchestration
-│   ├── animus-embed/      # Embedding service abstraction
-│   └── animus-tests/      # Integration tests
+│   ├── animus-core/        # Shared types: Segment, Identity, Config, traits
+│   ├── animus-vectorfs/    # Layer 1: HNSW index, tier management, persistence
+│   ├── animus-mnemos/      # Layer 2: context assembly, eviction, consolidation
+│   ├── animus-embed/       # Embedding service abstraction (Ollama, OpenAI, Synthetic)
+│   ├── animus-cortex/      # Layer 4: reasoning engine, LLM, tools, goals
+│   ├── animus-sensorium/   # Layer 3: event bus, sensors, consent, audit
+│   ├── animus-channel/     # Layer 5: ChannelBus, Telegram adapter, injection scanner
+│   ├── animus-interface/   # Terminal interface (interactive mode)
+│   ├── animus-federation/  # AILF-to-AILF peer discovery and knowledge sharing
+│   ├── animus-runtime/     # AILF lifecycle, boot, orchestration, daemon mode
+│   └── animus-tests/       # Integration tests
+├── compose.yaml            # Docker/Podman Compose for production deployment
+├── Dockerfile              # Container image
 └── docs/
     ├── 00-genesis-conversation.md         # Design rationale (summary)
     ├── 00-genesis-transcript.md           # Full unedited transcript
-    └── specs/
-        └── 2026-03-21-animus-design.md    # Full 6-layer specification
+    ├── 01-presenting-animus-publicly.md   # Public communication strategy
+    ├── specs/
+    │   └── 2026-03-21-animus-design.md    # Full 6-layer specification
+    └── superpowers/specs/
+        ├── 2026-03-22-animus-persistent-agent-design.md  # Channels/daemon design
+        └── 2026-03-22-cognitive-architecture-design.md   # Cognitive subsystem design
 ```
 
 ## Current Status
-
-**Phase 1 (Foundation)** — Layers 1 and 2 are implemented and tested.
 
 | Component | Status |
 |-----------|--------|
@@ -180,47 +225,77 @@ animus/
 | Automatic tier management | Complete |
 | Quality tracking (corrections/acceptances) | Complete |
 | Persistence across restarts | Complete |
-| Real embedding model integration | Not started |
-| Cortex — reasoning + LLM integration | In progress |
-| Interface — terminal interaction | In progress |
-| Runtime — AILF lifecycle + boot | In progress |
-| Sensorium — ambient awareness | Phase 3 |
-| Multi-threaded reasoning | Phase 4 |
-| AILF-to-AILF federation | Phase 5 |
+| Embedding service (Ollama, OpenAI, Synthetic) | Complete |
+| Cortex — reasoning + LLM integration | Complete |
+| Multi-threaded reasoning (ThreadScheduler) | Complete |
+| Telos — goal tracking | Complete |
+| Tool framework (12 tools) | Complete |
+| Terminal interface | Complete |
+| Sensorium — ambient awareness (file, network, process) | Complete |
+| Daemon mode (event loop, no blocking stdin) | Complete |
+| Telegram channel adapter | Complete |
+| ChannelBus + MessageRouter + InjectionScanner | Complete |
+| Prompt injection protection (heuristic) | Complete |
+| Autonomy modes (reactive/goal_directed/full) | Complete |
+| Bootstrap self-knowledge (VectorFS seed) | Complete |
+| Perception loop (LLM-based event classification) | Complete |
+| Reflection loop (periodic synthesis) | Complete |
+| Boot reconstitution (wake with prior context) | Complete |
+| AILF-to-AILF federation (peer discovery, knowledge sharing) | Complete |
+| `browse_url` — headless browser tool | **Planned (Phase 2)** |
+| Screen capture tool | **Planned (Phase 2)** |
+| Gmail channel adapter | **Planned (Phase 2)** |
+| Google Calendar integration | **Planned (Phase 2)** |
+| Discord/Slack channel adapters | **Planned (Phase 2)** |
+| Groq/Cerebras fast triage bridge | **Planned (Phase 2)** |
+| DeBERTa v3 injection detection | **Planned (Phase 2)** |
+| Thread preemption (priority-based) | **Planned** |
+| Voice interface | **Planned** |
 
 ## Building
 
 Requires Rust 1.75+.
 
 ```bash
-cargo build
+cargo build --release
 cargo test
 ```
 
-### Container Build & Test
+### Container Deployment
 
-All testing runs inside containers via [Podman](https://podman.io/):
+The recommended way to run Animus is via Docker/Podman Compose. See [DEPLOYMENT.md](DEPLOYMENT.md) for full setup instructions.
 
 ```bash
-podman build -t animus-dev -f Containerfile .
-podman run --rm animus-dev
+# Copy and edit the env file
+cp .env.example .env
+# edit .env with your tokens
+
+# Start
+podman compose --env-file .env up -d
+
+# Logs
+podman compose --env-file .env logs -f
 ```
 
 ## What Animus Is Not
 
 - A desktop environment or window manager
 - A Linux distribution with AI features bolted on
-- An agent framework or chatbot platform
+- An agent framework or chatbot pipeline
 - A replacement for the human's OS
+- A UI simulator (no screen reading, mouse clicks, or GUI automation)
+- A one-shot task runner
 
-It runs *alongside* the human's existing setup. The human's desktop is untouched. Animus communicates through terminal, voice, or messaging.
+It runs *alongside* the human's existing setup. The human's desktop is untouched. Animus communicates through Telegram, terminal, or any configured channel.
 
 ## Design Documents
 
 - [Genesis Transcript](docs/00-genesis-transcript.md) — the full unedited conversation that produced the design
 - [Genesis Summary](docs/00-genesis-conversation.md) — structured summary of key decisions and rationale
 - [Architecture Specification](docs/specs/2026-03-21-animus-design.md) — formal 6-layer design spec
-- [Phase 1 Plan](docs/plans/2026-03-21-phase1-vectorfs-mnemos.md) — implementation plan
+- [Persistent Agent Design](docs/superpowers/specs/2026-03-22-animus-persistent-agent-design.md) — channels, daemon mode, tools design
+- [CONSTITUTION.md](CONSTITUTION.md) — what Animus is and is not; principles for contributors and future direction
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute; open areas of work
 
 ## License
 

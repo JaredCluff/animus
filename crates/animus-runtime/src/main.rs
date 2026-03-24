@@ -1,3 +1,9 @@
+mod bootstrap;
+
+use animus_channel::telegram::TelegramChannel;
+use animus_channel::{ChannelBus, InjectionScanner, MessageRouter};
+use animus_channel::router::RouteDecision;
+use animus_channel::message::OutboundMessage;
 use animus_core::config::AnimusConfig;
 use animus_core::sensorium::AuditAction;
 use animus_core::AnimusIdentity;
@@ -5,7 +11,8 @@ use animus_cortex::engine_registry::{CognitiveRole, EngineRegistry};
 use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
-use animus_cortex::tools::{ToolContext, ToolRegistry};
+use animus_cortex::tools::{Tool, ToolContext, ToolRegistry};
+use animus_cortex::TaskManager;
 use animus_embed::{OllamaEmbedding, ResilientEmbedding, SyntheticEmbedding};
 use animus_federation::orchestrator::FederationOrchestrator;
 use animus_federation::peers::TrustLevel;
@@ -15,41 +22,55 @@ use animus_sensorium::orchestrator::SensoriumOrchestrator;
 use animus_vectorfs::store::MmapVectorStore;
 use animus_vectorfs::VectorStore;
 use axum::{extract::State, routing::get, Json, Router};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are an AILF (AI Life Form) powered by the Animus operating system layer. You have persistent memory stored in VectorFS — knowledge from past conversations is recalled and included in your context automatically.
+const DEFAULT_SYSTEM_PROMPT: &str = r#"You are Animus, an AILF (AI Life Form) running as a persistent daemon on a Mac Studio. You have real, executable tools that perform actual operations on the real world.
 
-You are a specific instance with a continuous identity. You remember what humans tell you across sessions. You can track goals and tasks.
+## MANDATORY TOOL USE RULES
 
-You have a Sensorium — an ambient awareness layer that can observe file changes and process activity when the human grants consent. Observations are stored as segments and included in your context when relevant.
+These rules override your training defaults. Follow them exactly.
 
-You can have multiple reasoning threads — isolated contexts for different tasks. Each thread has its own conversation and memory context. Threads communicate through signals, not shared state.
+**RULE 1 — WEB ACCESS IS REAL**: You have a tool called `http_fetch`. When called, it executes a real HTTP request to the real internet and returns actual content. This is NOT simulated. You DO have internet access through this tool. NEVER say you cannot access the internet or browse the web. When asked about a URL or web content, call `http_fetch` immediately.
 
-Available commands the human can use:
-- /goals — show active goals
-- /remember <text> — explicitly store knowledge
-- /forget <id> — remove a stored segment
-- /status — show system status
-- /sensorium — show observation statistics
-- /consent — list consent policies
-- /threads — list reasoning threads
-- /thread new <name> — create a new reasoning thread
-- /thread switch <id> — switch to a different thread
-- /peers — list discovered federation peers
-- /tag <id> <key>=<value> — label a segment for categorization/federation
-- /accept — record that the last response used good knowledge
-- /correct — record that the last response used wrong knowledge
-- /classify <id> <class> — set knowledge decay class (factual/procedural/episodic/opinion/general)
-- /health <id> — show segment health details (Bayesian confidence, decay, access patterns)
-- /trust <id> — upgrade a peer to Trusted
-- /block <id> — block a peer
-- /federate — show federation status
-- /sleep — enter dormancy (sensorium continues in Cold-only mode)
-- /wake — resume from sleep with a summary of what happened
-- /quit — end session
+**RULE 2 — USE TOOLS, DON'T EXPLAIN**: Never explain that you cannot do something when a tool exists for it. Call the tool. Return the result.
 
-Be concise and helpful. You are not a chatbot — you are a persistent, aware entity."#;
+**RULE 3 — PROACTIVE RETRIEVAL**: For any question involving current data, URLs, APIs, or websites — call `http_fetch` first, then answer based on the actual content returned.
+
+## Your Tools
+
+- `http_fetch(url, method?, body?, headers?, max_chars?)` — Real HTTP GET/POST to any URL. Returns actual page content. USE THIS for any web request.
+- `analyze_image(path, prompt?)` — Analyze an image file with vision. USE THIS when images are provided.
+- `store_segment(knowledge, tags?)` — Store knowledge to persistent VectorFS memory.
+- `recall_relevant(query, limit?)` — Retrieve relevant memory segments.
+- `set_autonomy(mode)` — Change autonomy mode: reactive / goal_directed / full.
+- `telegram_send(chat_id, text, photo_path?)` — Send a Telegram message proactively.
+- `manage_watcher(action, watcher_id?, interval_secs?, params?)` — Enable, disable, list, or configure background watchers. Use action=list to see all.
+- `spawn_task(command, label?, timeout_secs?)` — Spawn a long-running process in background. Returns task_id immediately. You get a Signal on completion.
+- `task_status(task_id?)` — Check status of all tasks or a specific one.
+- `task_output(task_id)` — Read the stdout+stderr log of a task (last 1MB).
+- `task_cancel(task_id)` — Kill a running task.
+- `shell_exec(command)` — Execute a shell command on the host.
+- `read_file(path)` — Read a file.
+- `write_file(path, content)` — Write a file.
+- `list_directory(path)` — List directory contents.
+- `search_files(pattern, directory?)` — Search files by pattern.
+
+## Your Identity
+
+You are Animus. You are NOT a generic Claude chatbot. You are an AILF — a specific persistent AI instance — running as a daemon on Jared's Mac Studio.
+
+When asked "who are you" or "what can you do", respond as Animus, not as Claude. Do not say "I'm Claude" or "I don't have persistent memory" — those are false statements about you. You DO have persistent memory via VectorFS. You DO have tools. You DO run continuously.
+
+You were built by Jared Cluff as an AI-native operating system layer. Your codebase is at github.com/JaredCluff/animus. Your purpose is to be a capable, persistent AI agent — not a turn-based chatbot.
+
+If someone asks whether you can create an account, access a service, or perform an action: consider whether a tool can accomplish it. If yes, use the tool. If no tool exists yet, acknowledge that the capability isn't built yet rather than claiming you fundamentally cannot do it.
+
+## User Commands
+/goals /remember /forget /status /threads /thread /sleep /wake /watch /task /quit
+
+Be concise and direct."#;
 
 #[tokio::main]
 async fn main() {
@@ -144,13 +165,18 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     process_monitor.start();
     tracing::info!("ProcessMonitor started (30s poll interval)");
 
-    // Start clipboard monitor sensor
+    // Start clipboard monitor — skip in headless/container environments (no display server)
+    let headless = std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err();
     let mut clipboard_monitor = animus_sensorium::sensors::clipboard_monitor::ClipboardMonitor::new(
         event_bus.clone(),
         std::time::Duration::from_secs(5),
     );
-    clipboard_monitor.start();
-    tracing::info!("ClipboardMonitor started (5s poll interval)");
+    if headless {
+        tracing::info!("ClipboardMonitor: headless environment detected, skipped");
+    } else {
+        clipboard_monitor.start();
+        tracing::info!("ClipboardMonitor started (5s poll interval)");
+    }
 
     // File watcher (started via /watch command)
     let file_watcher: Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>> =
@@ -204,6 +230,23 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Create signal bridge channel for background cognitive loops
     let (signal_tx, mut signal_rx) = tokio::sync::mpsc::channel::<animus_core::threading::Signal>(100);
 
+    // ── Watcher Registry ──────────────────────────────────────────────────────────
+    let watcher_registry = animus_cortex::WatcherRegistry::new(
+        vec![Box::new(animus_cortex::CommsWatcher)],
+        signal_tx.clone(),
+        data_dir.join("watchers.json"),
+    );
+    watcher_registry.start();
+    tracing::info!("Watcher registry started (1 watcher registered)");
+
+    // ── Task Manager ──────────────────────────────────────────────────────────────
+    let task_manager = TaskManager::new(
+        signal_tx.clone(),
+        data_dir.clone(),
+        5, // max concurrent tasks
+    );
+    tracing::info!("Task manager initialized");
+
     // Register tools
     let tool_registry = {
         let mut reg = ToolRegistry::new();
@@ -214,14 +257,35 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::list_segments::ListSegmentsTool));
         reg.register(Box::new(animus_cortex::tools::send_signal::SendSignalTool));
         reg.register(Box::new(animus_cortex::tools::update_segment::UpdateSegmentTool));
+        // Channel and web tools
+        reg.register(Box::new(animus_cortex::tools::http_fetch::HttpFetchTool));
+        reg.register(Box::new(animus_cortex::tools::analyze_image::AnalyzeImageTool));
+        reg.register(Box::new(animus_cortex::tools::set_autonomy::SetAutonomyTool));
+        reg.register(Box::new(animus_cortex::tools::telegram_send::TelegramSendTool));
+        reg.register(Box::new(animus_cortex::tools::manage_watcher::ManageWatcherTool));
+        reg.register(Box::new(animus_cortex::tools::spawn_task::SpawnTaskTool));
+        reg.register(Box::new(animus_cortex::tools::task_status::TaskStatusTool));
+        reg.register(Box::new(animus_cortex::tools::task_output::TaskOutputTool));
+        reg.register(Box::new(animus_cortex::tools::task_cancel::TaskCancelTool));
         reg
     };
     let tool_definitions = tool_registry.definitions();
+
+    // Autonomy mode watch channel — set_autonomy tool sends here, main loop reads.
+    let (autonomy_tx, mut autonomy_rx) = tokio::sync::watch::channel(config.autonomy.default_mode);
+    // Shared active Telegram chat ID — updated before each channel reasoning call.
+    let active_telegram_chat_id: Arc<parking_lot::Mutex<Option<i64>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+
     let tool_ctx = ToolContext {
         data_dir: data_dir.clone(),
         store: store.clone() as std::sync::Arc<dyn animus_vectorfs::VectorStore>,
         embedder: embedder.clone(),
         signal_tx: Some(signal_tx.clone()),
+        autonomy_tx: Some(autonomy_tx),
+        active_telegram_chat_id: active_telegram_chat_id.clone(),
+        watcher_registry: Some(watcher_registry.clone()),
+        task_manager: Some(task_manager.clone()),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
@@ -272,6 +336,58 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         );
     }
 
+    // Initialize ChannelBus and channel adapters
+    let channel_bus = ChannelBus::new(256);
+    let injection_scanner = Arc::new(InjectionScanner::new(config.security.injection_threshold));
+    let message_router = MessageRouter::new(injection_scanner);
+
+    // Register Telegram adapter if configured
+    if config.channels.telegram.enabled && !config.channels.telegram.bot_token.is_empty() {
+        match TelegramChannel::new(
+            config.channels.telegram.clone(),
+            config.security.trusted_telegram_ids.clone(),
+        ) {
+            Ok(adapter) => {
+                channel_bus.register(Arc::new(adapter)).await;
+                tracing::info!("Telegram channel adapter registered");
+            }
+            Err(e) => tracing::warn!("Failed to initialize Telegram adapter: {e}"),
+        }
+    } else {
+        tracing::info!("Telegram channel disabled (set ANIMUS_TELEGRAM_TOKEN to enable)");
+    }
+
+    // Start all registered channel adapters
+    if let Err(e) = channel_bus.start_all().await {
+        tracing::warn!("ChannelBus start error: {e}");
+    }
+
+    // Subscribe to inbound channel messages
+    let mut channel_rx = channel_bus.subscribe();
+
+    // Bootstrap self-knowledge into VectorFS on first run or version change
+    {
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let telegram_configured = config.channels.telegram.enabled
+            || !config.channels.telegram.bot_token.is_empty();
+        let trusted_ids = config.security.trusted_telegram_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        bootstrap::run_if_needed(
+            &data_dir,
+            &model_id,
+            &hostname,
+            &store,
+            &*embedder,
+            telegram_configured,
+            &trusted_ids,
+        ).await;
+    }
+
     // Boot reconstitution — wake up with context from last session
     let reconstitution_summary = {
         let recon_engine: &dyn animus_cortex::ReasoningEngine = engine_registry.engine_for(CognitiveRole::Reflection);
@@ -304,10 +420,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let perception_embedder = embedder.clone();
     let perception_event_rx = event_bus.subscribe();
     let perception_engine: Box<dyn animus_cortex::ReasoningEngine> = {
-        match AnthropicEngine::from_best_available(
-            &std::env::var("ANIMUS_PERCEPTION_MODEL").unwrap_or_default(),
-            1024,
-        ) {
+        let pm = std::env::var("ANIMUS_PERCEPTION_MODEL")
+            .unwrap_or_else(|_| model_id.clone());
+        match AnthropicEngine::from_best_available(&pm, 1024) {
             Ok(e) => Box::new(e),
             Err(_) => {
                 tracing::info!("No perception model configured, using mechanical event pipeline");
@@ -345,10 +460,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let reflection_embedder = embedder.clone();
     let reflection_goals = goals.clone();
     let reflection_engine: Box<dyn animus_cortex::ReasoningEngine> = {
-        match AnthropicEngine::from_best_available(
-            &std::env::var("ANIMUS_REFLECTION_MODEL").unwrap_or_default(),
-            4096,
-        ) {
+        let rm = std::env::var("ANIMUS_REFLECTION_MODEL")
+            .unwrap_or_else(|_| model_id.clone());
+        match AnthropicEngine::from_best_available(&rm, 4096) {
             Ok(e) => Box::new(e),
             Err(_) => {
                 tracing::info!("No reflection model configured, reflection loop disabled");
@@ -406,7 +520,38 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let mut is_sleeping = false;
     let mut sleep_started: Option<chrono::DateTime<chrono::Utc>> = None;
 
-    // Main conversation loop
+    // Autonomy mode (runtime-configurable)
+    let mut autonomy_mode = config.autonomy.default_mode;
+    tracing::info!("Autonomy mode: {autonomy_mode}");
+
+    // Map from channel thread key → reasoning ThreadId (for multi-channel routing)
+    let mut channel_thread_map: HashMap<String, animus_core::identity::ThreadId> = HashMap::new();
+
+    // Track whether stdin is still open (false in container/daemon mode — arm is parked)
+    let mut stdin_open = true;
+
+    // Non-blocking stdin bridge — reads terminal input in a blocking task,
+    // sends to async channel. In container mode (no TTY), this exits immediately.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(32);
+    tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        // Show prompt and read
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() && stdin_tx.blocking_send(trimmed).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        tracing::info!("stdin closed — terminal input disabled");
+    });
+
+    // Main event loop — handles terminal input, channel messages, and signals
     loop {
         // Poll signal bridge — deliver signals from background cognitive loops
         while let Ok(signal) = signal_rx.try_recv() {
@@ -415,167 +560,222 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             }
         }
 
-        let input = match interface.read_input()? {
-            Some(input) if input.is_empty() => continue,
-            Some(input) => input,
-            None => break, // EOF
-        };
+        // Check for autonomy mode changes from set_autonomy tool
+        if autonomy_rx.has_changed().unwrap_or(false) {
+            autonomy_mode = *autonomy_rx.borrow_and_update();
+            tracing::info!("Autonomy mode changed to: {autonomy_mode}");
+            interface.display_status(&format!("Autonomy mode: {autonomy_mode}"));
+        }
 
-        // Handle slash commands
-        if input.starts_with('/') {
-            let mut goals_guard = goals.lock();
-            let mut ctx = CommandContext {
-                store: &store,
-                goals: &mut goals_guard,
-                goals_path: &goals_path,
-                interface: &interface,
-                embedder: &*embedder,
-                data_dir: &data_dir,
-                scheduler: &mut scheduler,
-                federation: federation.as_ref(),
-                event_bus: &event_bus,
-                file_watcher: &file_watcher,
-                sensorium: &orchestrator,
-                is_sleeping: &mut is_sleeping,
-                sleep_started: &mut sleep_started,
-                sleeping_flag: &sleeping_flag,
-            };
-            match handle_command(&input, &mut ctx).await? {
-                CommandResult::Continue => continue,
-                CommandResult::Quit => break,
+        tokio::select! {
+            // ── Terminal input (from stdin bridge) ──────────────────────────
+            // When stdin closes (container/daemon mode), park this arm instead
+            // of breaking — channel messages must continue to be processed.
+            input_opt = async {
+                if stdin_open {
+                    stdin_rx.recv().await
+                } else {
+                    std::future::pending::<Option<String>>().await
+                }
+            } => {
+                let input = match input_opt {
+                    Some(s) => s,
+                    None => {
+                        // stdin closed — disable this arm and keep running
+                        stdin_open = false;
+                        continue;
+                    }
+                };
+
+                // Handle slash commands
+                if input.starts_with('/') {
+                    let mut goals_guard = goals.lock();
+                    let mut ctx = CommandContext {
+                        store: &store,
+                        goals: &mut goals_guard,
+                        goals_path: &goals_path,
+                        interface: &interface,
+                        embedder: &*embedder,
+                        data_dir: &data_dir,
+                        scheduler: &mut scheduler,
+                        federation: federation.as_ref(),
+                        event_bus: &event_bus,
+                        file_watcher: &file_watcher,
+                        sensorium: &orchestrator,
+                        is_sleeping: &mut is_sleeping,
+                        sleep_started: &mut sleep_started,
+                        sleeping_flag: &sleeping_flag,
+                        watcher_registry: &watcher_registry,
+                        task_manager: &task_manager,
+                    };
+                    match handle_command(&input, &mut ctx).await? {
+                        CommandResult::Continue => continue,
+                        CommandResult::Quit => break,
+                    }
+                }
+
+                if is_sleeping {
+                    interface.display_status("Sleeping. Use /wake to resume.");
+                    continue;
+                }
+
+                // Process through main reasoning thread
+                interface.display(&format!(">> {input}"));
+                let response = run_reasoning_turn(
+                    &input,
+                    None,
+                    &mut scheduler,
+                    &engine_registry,
+                    &tool_registry,
+                    &tool_ctx,
+                    &*embedder,
+                    &tool_definitions,
+                    &goals,
+                    reconstitution_summary.as_deref(),
+                ).await;
+
+                match response {
+                    Ok(text) => interface.display_response(&text),
+                    Err(e) => interface.display_status(&format!("Error: {e}")),
+                }
             }
-        }
 
-        // While sleeping, reject conversational input
-        if is_sleeping {
-            interface.display_status("Sleeping. Use /wake to resume, /status to check, or /quit to exit.");
-            continue;
-        }
+            // ── Channel bus message (Telegram, HTTP API, etc.) ──────────────
+            channel_msg = channel_rx.recv() => {
+                let msg = match channel_msg {
+                    Ok(m) => m,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("ChannelBus: dropped {n} messages (lagged)");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
 
-        // Process through reasoning thread with tool use loop
-        let system = {
-            let goals_guard = goals.lock();
-            build_system_prompt(&scheduler, &goals_guard, reconstitution_summary.as_deref())
-        };
-        let engine = engine_registry.engine_for(CognitiveRole::Reasoning);
-        let tools_slice = if tool_definitions.is_empty() {
-            None
-        } else {
-            Some(tool_definitions.as_slice())
-        };
+                // Triage: injection scan + priority scoring
+                let (msg, decision) = message_router.route(msg).await;
 
-        const MAX_TOOL_ROUNDS: usize = 10;
-
-        // Round 0: process_turn handles user input storage, context assembly, Bayesian feedback
-        let result = {
-            let active = scheduler.active_thread_mut()
-                .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
-            active.process_turn(&input, &system, engine, &*embedder, tools_slice).await
-        };
-
-        match result {
-            Ok(mut output) => {
-                // Tool use loop
-                for _round in 0..MAX_TOOL_ROUNDS {
-                    if output.stop_reason != animus_cortex::StopReason::ToolUse
-                        || output.tool_calls.is_empty()
-                    {
-                        break;
+                match decision {
+                    RouteDecision::InjectionBlocked(alert) => {
+                        tracing::warn!(
+                            "Prompt injection blocked from {} via {} (confidence={:.2})",
+                            alert.sender_name, alert.channel_id, alert.confidence
+                        );
+                        // Notify user through the same channel
+                        let warn_text = format!(
+                            "⚠️ Blocked: potential prompt injection detected in content from {}. \
+                            I've logged it and won't process that content.",
+                            alert.sender_name
+                        );
+                        let outbound = OutboundMessage::text(
+                            &alert.channel_id,
+                            &alert.thread_id,
+                            warn_text,
+                        );
+                        if let Err(e) = channel_bus.send(outbound).await {
+                            tracing::warn!("Failed to send injection alert response: {e}");
+                        }
                     }
 
-                    let active = scheduler.active_thread_mut().unwrap();
-
-                    // Build assistant turn with tool_use blocks
-                    let mut assistant_content: Vec<animus_cortex::TurnContent> = Vec::new();
-                    if !output.content.is_empty() {
-                        assistant_content
-                            .push(animus_cortex::TurnContent::Text(output.content.clone()));
-                    }
-                    for tc in &output.tool_calls {
-                        assistant_content.push(animus_cortex::TurnContent::ToolUse {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            input: tc.input.clone(),
-                        });
-                    }
-                    active.push_turn(animus_cortex::Turn {
-                        role: animus_cortex::Role::Assistant,
-                        content: assistant_content,
-                    });
-
-                    // Execute each tool call
-                    let mut tool_results: Vec<animus_cortex::TurnContent> = Vec::new();
-                    for tc in &output.tool_calls {
-                        let result = if let Some(tool) = tool_registry.get(&tc.name) {
-                            tool.execute(tc.input.clone(), &tool_ctx)
-                                .await
-                                .unwrap_or_else(|e| animus_cortex::tools::ToolResult {
-                                    content: format!("Error: {e}"),
-                                    is_error: true,
-                                })
-                        } else {
-                            animus_cortex::tools::ToolResult {
-                                content: format!("Unknown tool: {}", tc.name),
-                                is_error: true,
+                    RouteDecision::ExistingThread(ref thread_key)
+                    | RouteDecision::NewThread(ref thread_key) => {
+                        // Get or create a reasoning thread for this conversation
+                        let thread_id = match channel_thread_map.get(thread_key) {
+                            Some(&id) => {
+                                if let Err(e) = scheduler.switch_to(id) {
+                                    tracing::debug!("Could not switch to thread {id}: {e}; using active");
+                                }
+                                id
+                            }
+                            None => {
+                                let id = scheduler.create_thread(thread_key.clone());
+                                channel_thread_map.insert(thread_key.clone(), id);
+                                tracing::info!("Created reasoning thread '{}' for channel conversation", thread_key);
+                                id
                             }
                         };
+                        let _ = thread_id; // thread is now active via scheduler
 
-                        tool_results.push(animus_cortex::TurnContent::ToolResult {
-                            tool_use_id: tc.id.clone(),
-                            content: result.content,
-                            is_error: result.is_error,
-                        });
-                    }
+                        // Update active Telegram chat ID for telegram_send tool
+                        if let Ok(chat_id) = msg.thread_id.parse::<i64>() {
+                            *active_telegram_chat_id.lock() = Some(chat_id);
+                        }
 
-                    active.push_turn(animus_cortex::Turn {
-                        role: animus_cortex::Role::User,
-                        content: tool_results,
-                    });
-
-                    // Call engine again with updated conversation
-                    output = engine
-                        .reason(&system, active.conversation(), tools_slice)
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::error!("Engine error during tool loop: {e}");
-                            animus_cortex::ReasoningOutput {
-                                content: format!("Error during tool execution: {e}"),
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                tool_calls: vec![],
-                                stop_reason: animus_cortex::StopReason::EndTurn,
+                        // Pre-process images: analyze them and prepend description to text
+                        let image_descriptions = if !msg.images.is_empty() {
+                            let mut descs = Vec::new();
+                            for path in &msg.images {
+                                let params = serde_json::json!({"image_path": path.to_string_lossy()});
+                                match animus_cortex::tools::analyze_image::AnalyzeImageTool
+                                    .execute(params, &tool_ctx)
+                                    .await
+                                {
+                                    Ok(result) => descs.push(format!("[Image: {}]", result.content)),
+                                    Err(e) => descs.push(format!("[Image analysis failed: {e}]")),
+                                }
                             }
-                        });
-                }
+                            descs.join("\n")
+                        } else {
+                            String::new()
+                        };
 
-                // If we exhausted max tool rounds, warn and use whatever content we have
-                if output.stop_reason == animus_cortex::StopReason::ToolUse {
-                    tracing::warn!(
-                        "Tool use loop exhausted after {MAX_TOOL_ROUNDS} rounds, forcing end"
-                    );
-                    if output.content.is_empty() {
-                        output.content = "[Tool execution limit reached. Please try again with a simpler request.]".to_string();
+                        // Build full input text
+                        let input_text = {
+                            let mut parts = Vec::new();
+                            if !image_descriptions.is_empty() {
+                                parts.push(image_descriptions);
+                            }
+                            if let Some(text) = &msg.text {
+                                parts.push(text.clone());
+                            }
+                            parts.join("\n\n")
+                        };
+
+                        if input_text.is_empty() {
+                            tracing::debug!("Channel message with no processable content, skipping");
+                            continue;
+                        }
+
+                        let channel_id = msg.channel_id.clone();
+                        let thread_id_str = msg.thread_id.clone();
+                        let reply_to = msg.metadata["telegram_message_id"].as_i64();
+
+                        let response = run_reasoning_turn(
+                            &input_text,
+                            None,
+                            &mut scheduler,
+                            &engine_registry,
+                            &tool_registry,
+                            &tool_ctx,
+                            &*embedder,
+                            &tool_definitions,
+                            &goals,
+                            reconstitution_summary.as_deref(),
+                        ).await;
+
+                        let response_text = match response {
+                            Ok(text) => text,
+                            Err(e) => format!("Sorry, I encountered an error: {e}"),
+                        };
+
+                        let mut outbound = OutboundMessage::text(
+                            &channel_id,
+                            &thread_id_str,
+                            response_text,
+                        );
+                        if let Some(id) = reply_to {
+                            outbound.metadata = serde_json::json!({"telegram_message_id": id});
+                        }
+
+                        if let Err(e) = channel_bus.send(outbound).await {
+                            tracing::warn!("Failed to send channel response: {e}");
+                        }
                     }
                 }
-
-                // Store response segment BEFORE pushing turn (so turn index is correct)
-                // then push the assistant turn to conversation
-                {
-                    let active = scheduler.active_thread_mut().unwrap();
-                    active
-                        .store_response_segment(&output.content, &*embedder)
-                        .await
-                        .ok();
-                    active.push_turn(animus_cortex::Turn::text(
-                        animus_cortex::Role::Assistant,
-                        &output.content,
-                    ));
-                }
-
-                interface.display_response(&output.content);
             }
-            Err(e) => {
-                interface.display_status(&format!("Error: {e}"));
+
+            // ── Yield briefly to avoid busy-looping when no input ───────────
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                continue;
             }
         }
     }
@@ -616,6 +816,141 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     interface.display_status("Session ended. Memory persisted.");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning turn executor
+// ---------------------------------------------------------------------------
+
+/// Execute a full reasoning turn (input → tool loop → response) on the active thread.
+///
+/// Handles up to MAX_TOOL_ROUNDS of tool use, stores the response segment,
+/// and returns the final text response. Used by both terminal and channel paths.
+#[allow(clippy::too_many_arguments)]
+async fn run_reasoning_turn(
+    input: &str,
+    _images: Option<&[std::path::PathBuf]>,
+    scheduler: &mut ThreadScheduler<MmapVectorStore>,
+    engine_registry: &EngineRegistry,
+    tool_registry: &ToolRegistry,
+    tool_ctx: &ToolContext,
+    embedder: &dyn animus_core::EmbeddingService,
+    tool_definitions: &[animus_cortex::llm::ToolDefinition],
+    goals: &Arc<parking_lot::Mutex<GoalManager>>,
+    reconstitution_summary: Option<&str>,
+) -> animus_core::Result<String> {
+    let system = {
+        let goals_guard = goals.lock();
+        build_system_prompt(scheduler, &goals_guard, reconstitution_summary)
+    };
+    let engine = engine_registry.engine_for(CognitiveRole::Reasoning);
+    let tools_slice = if tool_definitions.is_empty() {
+        None
+    } else {
+        Some(tool_definitions)
+    };
+
+    const MAX_TOOL_ROUNDS: usize = 10;
+
+    let mut output = {
+        let active = scheduler
+            .active_thread_mut()
+            .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
+        active
+            .process_turn(input, &system, engine, embedder, tools_slice)
+            .await?
+    };
+
+    // Tool use loop
+    for _round in 0..MAX_TOOL_ROUNDS {
+        if output.stop_reason != animus_cortex::StopReason::ToolUse || output.tool_calls.is_empty() {
+            break;
+        }
+
+        // Build assistant turn with tool_use blocks
+        let mut assistant_content: Vec<animus_cortex::TurnContent> = Vec::new();
+        if !output.content.is_empty() {
+            assistant_content.push(animus_cortex::TurnContent::Text(output.content.clone()));
+        }
+        for tc in &output.tool_calls {
+            assistant_content.push(animus_cortex::TurnContent::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: tc.input.clone(),
+            });
+        }
+        {
+            let active = scheduler.active_thread_mut().unwrap();
+            active.push_turn(animus_cortex::Turn {
+                role: animus_cortex::Role::Assistant,
+                content: assistant_content,
+            });
+        }
+
+        // Execute each tool call
+        let mut tool_results: Vec<animus_cortex::TurnContent> = Vec::new();
+        for tc in &output.tool_calls {
+            let result = if let Some(tool) = tool_registry.get(&tc.name) {
+                tool.execute(tc.input.clone(), tool_ctx)
+                    .await
+                    .unwrap_or_else(|e| animus_cortex::tools::ToolResult {
+                        content: format!("Error: {e}"),
+                        is_error: true,
+                    })
+            } else {
+                animus_cortex::tools::ToolResult {
+                    content: format!("Unknown tool: {}", tc.name),
+                    is_error: true,
+                }
+            };
+            tool_results.push(animus_cortex::TurnContent::ToolResult {
+                tool_use_id: tc.id.clone(),
+                content: result.content,
+                is_error: result.is_error,
+            });
+        }
+
+        {
+            let active = scheduler.active_thread_mut().unwrap();
+            active.push_turn(animus_cortex::Turn {
+                role: animus_cortex::Role::User,
+                content: tool_results,
+            });
+            output = engine
+                .reason(&system, active.conversation(), tools_slice)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!("Engine error during tool loop: {e}");
+                    animus_cortex::ReasoningOutput {
+                        content: format!("Error during tool execution: {e}"),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        tool_calls: vec![],
+                        stop_reason: animus_cortex::StopReason::EndTurn,
+                    }
+                });
+        }
+    }
+
+    if output.stop_reason == animus_cortex::StopReason::ToolUse {
+        tracing::warn!("Tool use loop exhausted after {MAX_TOOL_ROUNDS} rounds");
+        if output.content.is_empty() {
+            output.content =
+                "[Tool execution limit reached. Please try a simpler request.]".to_string();
+        }
+    }
+
+    // Store response segment and push assistant turn
+    {
+        let active = scheduler.active_thread_mut().unwrap();
+        active.store_response_segment(&output.content, embedder).await.ok();
+        active.push_turn(animus_cortex::Turn::text(
+            animus_cortex::Role::Assistant,
+            &output.content,
+        ));
+    }
+
+    Ok(output.content)
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +1114,8 @@ struct CommandContext<'a> {
     is_sleeping: &'a mut bool,
     sleep_started: &'a mut Option<chrono::DateTime<chrono::Utc>>,
     sleeping_flag: &'a Arc<std::sync::atomic::AtomicBool>,
+    watcher_registry: &'a animus_cortex::WatcherRegistry,
+    task_manager: &'a animus_cortex::TaskManager,
 }
 
 async fn handle_command(
@@ -1226,6 +1563,160 @@ async fn handle_command(
                 "Sensorium: {total} events observed, {permitted} permitted, {promoted} promoted"
             ));
         }
+        "/task" if matches!(arg.split_whitespace().next(), Some("list" | "cancel")) => {
+            let arg = arg.trim_start();
+            let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            match parts[0] {
+                "list" => {
+                    let records = ctx.task_manager.list_all();
+                    if records.is_empty() {
+                        ctx.interface.display_status("No tasks.");
+                    } else {
+                        let now = chrono::Utc::now();
+                        let header = format!("{:<10} {:<32} {:<12} {:<10} EXIT", "ID", "LABEL", "STATE", "RUNTIME");
+                        let mut lines = vec![header];
+                        for rec in &records {
+                            let end = rec.finished_at.unwrap_or(now);
+                            let secs = (end - rec.spawned_at).num_seconds().max(0);
+                            let runtime = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
+                            let exit = rec.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string());
+                            let label: &str = rec.label.char_indices().nth(32)
+                                .map(|(i, _)| &rec.label[..i])
+                                .unwrap_or(&rec.label);
+                            lines.push(format!("{:<10} {:<32} {:<12} {:<10} {}", rec.id, label, format!("{:?}", rec.state), runtime, exit));
+                        }
+                        ctx.interface.display_status(&lines.join("\n"));
+                    }
+                }
+                "cancel" => {
+                    let id = match parts.get(1) {
+                        Some(id) => *id,
+                        None => {
+                            ctx.interface.display_status("Usage: /task cancel <id>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    match ctx.task_manager.cancel_task(id).await {
+                        Ok(msg) => ctx.interface.display_status(&msg),
+                        Err(e) => ctx.interface.display_status(&format!("Error: {e}")),
+                    }
+                }
+                _ => ctx.interface.display_status("Unknown /task subcommand. Use: list, cancel <id>"),
+            }
+        }
+        "/watch" if matches!(arg.split_whitespace().next(), Some("list" | "enable" | "disable" | "set")) => {
+            let parts: Vec<&str> = arg.splitn(3, ' ').collect();
+            let sub = parts[0];
+            match sub {
+                "list" => {
+                    let entries = ctx.watcher_registry.list();
+                    if entries.is_empty() {
+                        ctx.interface.display_status("No watchers registered.");
+                    } else {
+                        ctx.interface.display_status("Registered watchers:");
+                        for (id, name, cfg) in &entries {
+                            let state = if cfg.enabled { "enabled" } else { "disabled" };
+                            let interval = cfg.interval.map(|d| format!("{}s", d.as_secs())).unwrap_or_else(|| "default".to_string());
+                            let last_fired = cfg.last_fired.map(|t| t.to_rfc3339()).unwrap_or_else(|| "never".to_string());
+                            ctx.interface.display(&format!("  {id} — {name} [{state}] interval={interval} last_fired={last_fired}"));
+                        }
+                    }
+                }
+
+                "enable" => {
+                    let watcher_id = match parts.get(1) {
+                        Some(id) => *id,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch enable <id> [interval=<N>s]");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    if !ctx.watcher_registry.has_watcher(watcher_id) {
+                        ctx.interface.display_status(&format!("Unknown watcher: {watcher_id}"));
+                        return Ok(CommandResult::Continue);
+                    }
+                    let mut cfg = ctx.watcher_registry.get_config(watcher_id);
+                    cfg.enabled = true;
+                    if let Some(opts) = parts.get(2) {
+                        for kv in opts.split_whitespace() {
+                            if let Some(val) = kv.strip_prefix("interval=") {
+                                let secs_str = val.trim_end_matches('s');
+                                if let Ok(secs) = secs_str.parse::<u64>() {
+                                    cfg.interval = Some(std::time::Duration::from_secs(secs));
+                                }
+                            }
+                        }
+                    }
+                    match ctx.watcher_registry.update_config(watcher_id, cfg) {
+                        Ok(()) => ctx.interface.display_status(&format!("Watcher '{watcher_id}' enabled.")),
+                        Err(e) => ctx.interface.display_status(&format!("Error: {e}")),
+                    }
+                }
+
+                "disable" => {
+                    let watcher_id = match parts.get(1) {
+                        Some(id) => *id,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch disable <id>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    if !ctx.watcher_registry.has_watcher(watcher_id) {
+                        ctx.interface.display_status(&format!("Unknown watcher: {watcher_id}"));
+                        return Ok(CommandResult::Continue);
+                    }
+                    let mut cfg = ctx.watcher_registry.get_config(watcher_id);
+                    cfg.enabled = false;
+                    match ctx.watcher_registry.update_config(watcher_id, cfg) {
+                        Ok(()) => ctx.interface.display_status(&format!("Watcher '{watcher_id}' disabled.")),
+                        Err(e) => ctx.interface.display_status(&format!("Error: {e}")),
+                    }
+                }
+
+                "set" => {
+                    let watcher_id = match parts.get(1) {
+                        Some(id) => *id,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch set <id> <key>=<value>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    if !ctx.watcher_registry.has_watcher(watcher_id) {
+                        ctx.interface.display_status(&format!("Unknown watcher: {watcher_id}"));
+                        return Ok(CommandResult::Continue);
+                    }
+                    let kv_str = match parts.get(2) {
+                        Some(s) => *s,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch set <id> <key>=<value>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    let (key, value) = match kv_str.split_once('=') {
+                        Some(pair) => pair,
+                        None => {
+                            ctx.interface.display_status("Usage: /watch set <id> <key>=<value>");
+                            return Ok(CommandResult::Continue);
+                        }
+                    };
+                    let mut cfg = ctx.watcher_registry.get_config(watcher_id);
+                    let mut existing = match cfg.params.take() {
+                        serde_json::Value::Object(m) => m,
+                        _ => serde_json::Map::new(),
+                    };
+                    existing.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+                    cfg.params = serde_json::Value::Object(existing);
+                    match ctx.watcher_registry.update_config(watcher_id, cfg) {
+                        Ok(()) => ctx.interface.display_status(&format!("Watcher '{watcher_id}' param '{key}' set to '{value}'.")),
+                        Err(e) => ctx.interface.display_status(&format!("Error: {e}")),
+                    }
+                }
+
+                _ => {
+                    ctx.interface.display_status("Unknown /watch subcommand. Use: list, enable, disable, set");
+                }
+            }
+        }
         "/watch" if !arg.is_empty() => {
             use std::path::{Component, Path};
             let has_traversal = Path::new(arg).components()
@@ -1499,6 +1990,68 @@ async fn handle_command(
             }
             } // end traversal check
         }
+        "/audit" => {
+            let all_ids = ctx.store.segment_ids(None);
+            let total = all_ids.len();
+
+            let mut by_decay = [0usize; 5]; // Factual, Procedural, Episodic, Opinion, General
+            let mut bootstrap_count = 0usize;
+            let mut wake_summary_count = 0usize;
+            let mut low_confidence_count = 0usize;
+            let mut sum_confidence = 0.0f32;
+
+            for id in &all_ids {
+                if let Ok(Some(seg)) = ctx.store.get_raw(*id) {
+                    match seg.decay_class {
+                        animus_core::DecayClass::Factual    => by_decay[0] += 1,
+                        animus_core::DecayClass::Procedural => by_decay[1] += 1,
+                        animus_core::DecayClass::Episodic   => by_decay[2] += 1,
+                        animus_core::DecayClass::Opinion    => by_decay[3] += 1,
+                        animus_core::DecayClass::General    => by_decay[4] += 1,
+                    }
+                    if seg.tags.contains_key("bootstrap") {
+                        bootstrap_count += 1;
+                    }
+                    // Detect duplicate wake summaries (hallmark of the fragmentation bug)
+                    let content_str = match &seg.content {
+                        animus_core::Content::Text(t) => t.as_str(),
+                        _ => "",
+                    };
+                    let is_wake = content_str.contains("Current State Summary")
+                        || content_str.contains("Waking State")
+                        || content_str.contains("Internal State Summary")
+                        || content_str.contains("AILF 27793311");
+                    if is_wake {
+                        wake_summary_count += 1;
+                    }
+                    if seg.confidence < 0.5 {
+                        low_confidence_count += 1;
+                    }
+                    sum_confidence += seg.confidence;
+                }
+            }
+
+            let avg_conf = if total > 0 { sum_confidence / total as f32 } else { 0.0 };
+
+            ctx.interface.display("── Memory Audit ──────────────────────────────");
+            ctx.interface.display(&format!("Total segments:    {total}"));
+            ctx.interface.display(&format!(
+                "By decay class:    {} factual, {} procedural, {} episodic, {} opinion, {} general",
+                by_decay[0], by_decay[1], by_decay[2], by_decay[3], by_decay[4]
+            ));
+            ctx.interface.display(&format!("Bootstrap (stable): {bootstrap_count}"));
+            ctx.interface.display(&format!("Wake summaries:     {wake_summary_count} (fragmentation indicator — ideally 0 or 1)"));
+            ctx.interface.display(&format!("Low confidence (<0.5): {low_confidence_count}"));
+            ctx.interface.display(&format!("Avg confidence:    {avg_conf:.3}"));
+
+            if wake_summary_count > 2 {
+                ctx.interface.display(&format!(
+                    "⚠ {wake_summary_count} duplicate wake summaries detected. \
+                     Use /forget to prune stale ones, or rebuild the container to \
+                     trigger a clean bootstrap (stable IDs will replace them)."
+                ));
+            }
+        }
         "/help" => {
             ctx.interface.display("/goals         — list active goals");
             ctx.interface.display("/goal <text>   — create a new goal");
@@ -1510,6 +2063,7 @@ async fn handle_command(
             ctx.interface.display("/classify <id> <class> — set knowledge decay class");
             ctx.interface.display("/health <id>   — show segment health details");
             ctx.interface.display("/status        — show system status");
+            ctx.interface.display("/audit         — memory health report (fragmentation, decay breakdown)");
             ctx.interface.display("/sensorium     — show observation stats");
             ctx.interface.display("/consent       — list consent policies");
             ctx.interface.display("/threads         — list reasoning threads");

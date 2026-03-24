@@ -132,6 +132,13 @@ impl Segment {
         }
     }
 
+    /// Create a segment with a pre-determined ID (for stable/upsert bootstrap segments).
+    pub fn with_id(id: SegmentId, content: Content, embedding: Vec<f32>, source: Source) -> Self {
+        let mut seg = Self::new(content, embedding, source);
+        seg.id = id;
+        seg
+    }
+
     /// Record an access, updating count and timestamp.
     pub fn record_access(&mut self) {
         self.access_count = self.access_count.saturating_add(1);

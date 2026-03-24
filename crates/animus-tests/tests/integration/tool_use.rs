@@ -16,6 +16,10 @@ fn test_ctx(dir: &std::path::Path) -> ToolContext {
         store: store as Arc<dyn animus_vectorfs::VectorStore>,
         embedder: embedder as Arc<dyn animus_core::EmbeddingService>,
         signal_tx: None,
+        autonomy_tx: None,
+        active_telegram_chat_id: Arc::new(parking_lot::Mutex::new(None)),
+        watcher_registry: None,
+        task_manager: None,
     }
 }
 

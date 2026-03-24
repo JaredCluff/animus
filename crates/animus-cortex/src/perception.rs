@@ -25,10 +25,12 @@ pub struct PerceivedEvent {
     pub event_index: usize,
     /// Whether this event should be stored as a segment.
     pub store: bool,
-    /// One-sentence summary (becomes segment content if stored).
-    pub summary: String,
-    /// Decay class assignment.
-    pub decay_class: DecayClass,
+    /// One-sentence summary (becomes segment content if stored). May be null when store=false.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Decay class assignment. May be null when store=false.
+    #[serde(default)]
+    pub decay_class: Option<DecayClass>,
     /// Tags for categorization.
     #[serde(default)]
     pub tags: HashMap<String, String>,
@@ -135,12 +137,13 @@ impl<S: VectorStore> PerceptionLoop<S> {
 
         match self.engine.reason(PERCEPTION_SYSTEM_PROMPT, &messages, None).await {
             Ok(output) => {
-                match serde_json::from_str::<PerceptionOutput>(&output.content) {
+                let json = strip_json_fence(&output.content);
+                match serde_json::from_str::<PerceptionOutput>(json) {
                     Ok(perception) => {
                         self.handle_perception_output(perception, &events).await;
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to parse perception output: {e}");
+                        tracing::warn!("Failed to parse perception output: {e}\nRaw: {}", &output.content[..output.content.len().min(200)]);
                         self.fallback_store(&events).await;
                     }
                 }
@@ -160,6 +163,11 @@ impl<S: VectorStore> PerceptionLoop<S> {
     ) {
         for perceived in output.events {
             if perceived.store {
+                let summary = match &perceived.summary {
+                    Some(s) if !s.is_empty() => s.clone(),
+                    _ => continue, // skip if no summary when store=true
+                };
+
                 // Determine the source event (for provenance)
                 let source = if perceived.event_index < events.len() {
                     let ev = &events[perceived.event_index];
@@ -174,14 +182,14 @@ impl<S: VectorStore> PerceptionLoop<S> {
                     }
                 };
 
-                match self.embedder.embed_text(&perceived.summary).await {
+                match self.embedder.embed_text(&summary).await {
                     Ok(embedding) => {
                         let mut segment = Segment::new(
-                            Content::Text(perceived.summary.clone()),
+                            Content::Text(summary),
                             embedding,
                             source,
                         );
-                        segment.decay_class = perceived.decay_class;
+                        segment.decay_class = perceived.decay_class.unwrap_or(DecayClass::General);
                         segment.tags = perceived.tags.clone();
                         if let Err(e) = self.store.store(segment) {
                             tracing::warn!("Failed to store perception segment: {e}");
@@ -279,6 +287,19 @@ impl<S: VectorStore> PerceptionLoop<S> {
     }
 }
 
+/// Strip markdown code fences (` ```json ... ``` ` or ` ``` ... ``` `) from LLM output.
+fn strip_json_fence(s: &str) -> &str {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix("```json")
+        .or_else(|| s.strip_prefix("```"))
+        .unwrap_or(s);
+    inner
+        .trim()
+        .trim_end_matches("```")
+        .trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,7 +330,7 @@ mod tests {
         assert_eq!(output.events.len(), 2);
         assert!(output.events[0].store);
         assert!(!output.events[1].store);
-        assert_eq!(output.events[0].decay_class, DecayClass::Episodic);
+        assert_eq!(output.events[0].decay_class, Some(DecayClass::Episodic));
     }
 
     #[test]

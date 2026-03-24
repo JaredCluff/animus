@@ -1,12 +1,14 @@
 use crate::telos::Autonomy;
 use super::{Tool, ToolResult, ToolContext};
 
+const TIMEOUT_SECS: u64 = 30;
+
 pub struct ShellExecTool;
 
 #[async_trait::async_trait]
 impl Tool for ShellExecTool {
     fn name(&self) -> &str { "shell_exec" }
-    fn description(&self) -> &str { "Execute a shell command and return its stdout/stderr." }
+    fn description(&self) -> &str { "Execute a shell command and return its stdout/stderr. Commands are killed after 30 seconds; do not use for long-running or background processes." }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -34,8 +36,18 @@ impl Tool for ShellExecTool {
             }
             cmd.current_dir(p);
         }
-        match cmd.output().await {
-            Ok(output) => {
+        let timeout = std::time::Duration::from_secs(TIMEOUT_SECS);
+        match tokio::time::timeout(timeout, cmd.output()).await {
+            Err(_elapsed) => {
+                return Ok(ToolResult {
+                    content: format!("Command timed out after {TIMEOUT_SECS}s. Do not use shell_exec for long-running or background processes."),
+                    is_error: true,
+                });
+            }
+            Ok(Err(e)) => {
+                return Ok(ToolResult { content: format!("Error executing command: {e}"), is_error: true });
+            }
+            Ok(Ok(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let mut result = String::new();
@@ -54,7 +66,6 @@ impl Tool for ShellExecTool {
                 }
                 Ok(ToolResult { content: result, is_error: !output.status.success() })
             }
-            Err(e) => Ok(ToolResult { content: format!("Error executing command: {e}"), is_error: true }),
         }
     }
 }

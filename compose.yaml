@@ -13,7 +13,7 @@ services:
     environment:
       ANIMUS_DATA_DIR: /home/animus/.animus
       ANIMUS_HEALTH_BIND: "0.0.0.0:8082"
-      ANIMUS_LOG_LEVEL: "animus=info"
+      ANIMUS_LOG_LEVEL: "animus=debug,animus_cortex=debug"
 
       # ── LLM: Anthropic via Claude Code OAuth (no API key purchase needed) ──
       # Option 1 (recommended): Run `podman compose up` from within a Claude Code terminal.
@@ -37,6 +37,18 @@ services:
       ANIMUS_OLLAMA_URL: "${ANIMUS_OLLAMA_URL:-http://localhost:11434}"
       ANIMUS_EMBED_MODEL: "${ANIMUS_EMBED_MODEL:-mxbai-embed-large}"
 
+      # ── Telegram bot (set ANIMUS_TELEGRAM_TOKEN to enable) ─────────────────
+      # Create a bot via @BotFather, copy the token here or export it:
+      #   export ANIMUS_TELEGRAM_TOKEN=123456789:ABCdef...
+      ANIMUS_TELEGRAM_TOKEN: "${ANIMUS_TELEGRAM_TOKEN:-}"
+
+      # ── Autonomy mode (reactive | goal_directed | full) ──────────────────
+      ANIMUS_AUTONOMY_MODE: "${ANIMUS_AUTONOMY_MODE:-reactive}"
+
+      # ── Security: trusted Telegram user IDs (comma-separated) ───────────
+      # Your Telegram user ID (get it from @userinfobot). Bypasses heavy scan.
+      ANIMUS_TRUSTED_TELEGRAM_IDS: "${ANIMUS_TRUSTED_TELEGRAM_IDS:-}"
+
       # ── Federation (disabled by default) ────────────────────────────────────
       ANIMUS_FEDERATION: "${ANIMUS_FEDERATION:-0}"
 
@@ -46,6 +58,10 @@ services:
       # Claude Code OAuth credentials — for OAuth auth without purchasing API tokens.
       # Mounted read-write so the engine can persist refreshed tokens.
       - "${HOME}/.claude/.credentials.json:/home/animus/.claude/.credentials.json"
+      # Shared communication channel between Animus and Claude Code.
+      # Animus writes to /home/animus/comms/to-claude/
+      # Claude Code writes to /home/animus/comms/from-claude/
+      - "${HOME}/animus-comms:/home/animus/comms"
 
     # Healthcheck using the built-in HTTP endpoint
     healthcheck:
