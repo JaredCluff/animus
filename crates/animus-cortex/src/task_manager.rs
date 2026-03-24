@@ -65,7 +65,16 @@ impl TaskManagerState {
     pub fn load_or_default(index_path: &Path, max_concurrent: usize) -> Self {
         let mut records: HashMap<String, TaskRecord> = match std::fs::read_to_string(index_path) {
             Err(_) => HashMap::new(),
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Ok(raw) => match serde_json::from_str::<HashMap<String, TaskRecord>>(&raw) {
+                Ok(records) => records,
+                Err(e) => {
+                    warn!(
+                        "Could not parse tasks/index.json ({}): {}. Proceeding with empty state.",
+                        index_path.display(), e
+                    );
+                    HashMap::new()
+                }
+            },
         };
         let now = Utc::now();
         for rec in records.values_mut() {
