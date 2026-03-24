@@ -170,7 +170,7 @@ impl TaskManager {
         let id = new_task_id();
         let label = label.unwrap_or_else(|| {
             let c = command.trim();
-            if c.len() > 40 { c[..40].to_string() } else { c.to_string() }
+            c.char_indices().nth(40).map(|(i, _)| c[..i].to_string()).unwrap_or_else(|| c.to_string())
         });
         let log_path = self.data_dir.join("tasks").join(format!("{id}.log"));
 
@@ -217,6 +217,9 @@ impl TaskManager {
             ).await;
         });
 
+        // SAFETY INVARIANT: The spawned task cannot be scheduled until the current task yields
+        // (Tokio cooperative scheduling), so there is no race window between `tokio::spawn` and
+        // storing the abort handle here. No `.await` must be added between these two operations.
         {
             let mut state = self.state.lock();
             state.handles.insert(id.clone(), join_handle.abort_handle());
