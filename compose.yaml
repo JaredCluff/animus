@@ -49,8 +49,15 @@ services:
       # Your Telegram user ID (get it from @userinfobot). Bypasses heavy scan.
       ANIMUS_TRUSTED_TELEGRAM_IDS: "${ANIMUS_TRUSTED_TELEGRAM_IDS:-}"
 
+      # ── NATS messaging bus ──────────────────────────────────────────────────
+      ANIMUS_NATS_URL: "${ANIMUS_NATS_URL:-nats://nats:14222}"
+
       # ── Federation (disabled by default) ────────────────────────────────────
       ANIMUS_FEDERATION: "${ANIMUS_FEDERATION:-0}"
+
+    depends_on:
+      nats:
+        condition: service_healthy
 
     volumes:
       # Persistent AILF data (VectorFS, goals, identity)
@@ -70,6 +77,21 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  nats:
+    image: nats:latest
+    container_name: animus-nats
+    restart: unless-stopped
+    command: ["-p", "14222", "--jetstream", "-m", "8222"]
+    ports:
+      # Expose to host so nuntius (Claude Code MCP) can also connect
+      - "127.0.0.1:14222:14222"
+      - "127.0.0.1:8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   animus-data:
