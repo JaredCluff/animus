@@ -153,6 +153,37 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             config.vectorfs.quality_gate.clone(),
         ));
 
+    // Re-embed pass: if a previous run saved a reembed-queue.jsonl (due to dimensionality
+    // change), re-embed each text entry with the current embedder and restore to VectorFS.
+    {
+        let queue = store.load_reembed_queue();
+        if !queue.is_empty() {
+            tracing::info!("Re-embedding {} segments from reembed-queue.jsonl", queue.len());
+            let mut restored = 0usize;
+            for entry in &queue {
+                match embedder.embed_text(&entry.text).await {
+                    Ok(embedding) => {
+                        let mut seg = Segment::new(
+                            Content::Text(entry.text.clone()),
+                            embedding,
+                            entry.source.clone(),
+                        );
+                        seg.decay_class = entry.decay_class;
+                        seg.tags = entry.tags.clone();
+                        if gated_store.store(seg).is_ok() {
+                            restored += 1;
+                        }
+                    }
+                    Err(e) => tracing::warn!("Re-embed failed for entry: {e}"),
+                }
+            }
+            tracing::info!("Re-embedding complete: {restored}/{} segments restored", queue.len());
+            if let Err(e) = store.clear_reembed_queue() {
+                tracing::warn!("Failed to clear reembed queue: {e}");
+            }
+        }
+    }
+
     // Compute snapshot directory — outside data_dir so the shell_exec guard covers both.
     let snapshot_dir: PathBuf = if config.snapshot.snapshot_dir.is_empty() {
         // Default: sibling of data_dir, named "<data_dir_name>-snapshots"

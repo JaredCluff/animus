@@ -1,10 +1,11 @@
 use animus_core::error::{AnimusError, Result};
 use animus_core::identity::SegmentId;
-use animus_core::segment::{Segment, Tier};
+use animus_core::segment::{Content, DecayClass, Segment, Source, Tier};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::index::HnswIndex;
@@ -17,6 +18,17 @@ const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreMeta {
     dimensionality: usize,
+}
+
+/// A text segment preserved for re-embedding when dimensionality changes.
+/// Written to `reembed-queue.jsonl` so the runtime can restore memories
+/// after switching embedding providers.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReembedEntry {
+    pub text: String,
+    pub source: Source,
+    pub decay_class: DecayClass,
+    pub tags: std::collections::HashMap<String, String>,
 }
 
 /// File-backed VectorStore using bincode-serialized segment files and HNSW index.
@@ -44,13 +56,24 @@ impl MmapVectorStore {
         let meta_path = dir.join("meta.json");
         let stored_dim = Self::read_meta(&meta_path)?;
 
-        // Handle dimensionality mismatch
+        // Handle dimensionality mismatch: preserve text content for re-embedding,
+        // then clear incompatible binary embeddings.
         if let Some(stored) = stored_dim {
             if stored != dimensionality {
-                tracing::warn!(
-                    "VectorFS dimensionality changed ({stored} -> {dimensionality}); \
-                     clearing incompatible segments"
-                );
+                match Self::save_reembed_queue(dir, &segments_dir) {
+                    Ok(n) if n > 0 => tracing::warn!(
+                        "VectorFS dimensionality changed ({stored} -> {dimensionality}); \
+                         saved {n} text segments to reembed-queue.jsonl for re-embedding on startup"
+                    ),
+                    Ok(_) => tracing::warn!(
+                        "VectorFS dimensionality changed ({stored} -> {dimensionality}); \
+                         no text segments to preserve"
+                    ),
+                    Err(e) => tracing::error!(
+                        "VectorFS dimensionality changed but failed to save reembed queue: {e}; \
+                         memories may be lost"
+                    ),
+                }
                 Self::clear_segments(&segments_dir)?;
             }
         }
@@ -136,6 +159,43 @@ impl MmapVectorStore {
         Ok(())
     }
 
+    /// Scan segment files and write all text-content segments to `reembed-queue.jsonl`
+    /// so the runtime can re-embed them after a dimensionality change.
+    /// Non-text segments (observations, structured data) are silently dropped.
+    fn save_reembed_queue(base_dir: &Path, segments_dir: &Path) -> Result<usize> {
+        let queue_path = base_dir.join("reembed-queue.jsonl");
+        let mut file = fs::File::create(&queue_path)?;
+        let mut count = 0usize;
+        for entry in fs::read_dir(segments_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "bin") {
+                continue;
+            }
+            let data = match fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let seg: Segment = match bincode::deserialize(&data) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Content::Text(ref text) = seg.content {
+                let entry = ReembedEntry {
+                    text: text.clone(),
+                    source: seg.source.clone(),
+                    decay_class: seg.decay_class,
+                    tags: seg.tags.clone(),
+                };
+                if let Ok(line) = serde_json::to_string(&entry) {
+                    let _ = writeln!(file, "{}", line);
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
     /// Remove all segment files from the segments directory.
     fn clear_segments(segments_dir: &Path) -> Result<()> {
         for entry in fs::read_dir(segments_dir)? {
@@ -144,6 +204,32 @@ impl MmapVectorStore {
             if path.extension().is_some_and(|ext| ext == "bin") {
                 fs::remove_file(&path)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Path to the re-embed queue file (if it exists).
+    pub fn reembed_queue_path(&self) -> std::path::PathBuf {
+        self.base_dir.join("reembed-queue.jsonl")
+    }
+
+    /// Load all entries from the re-embed queue. Returns empty vec if no queue exists.
+    pub fn load_reembed_queue(&self) -> Vec<ReembedEntry> {
+        let path = self.reembed_queue_path();
+        if !path.exists() {
+            return Vec::new();
+        }
+        let Ok(contents) = fs::read_to_string(&path) else { return Vec::new(); };
+        contents.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// Delete the re-embed queue file after processing.
+    pub fn clear_reembed_queue(&self) -> Result<()> {
+        let path = self.reembed_queue_path();
+        if path.exists() {
+            fs::remove_file(&path)?;
         }
         Ok(())
     }
