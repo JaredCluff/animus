@@ -82,3 +82,4 @@ pub mod store;
 pub mod tier_manager;
 
 pub use quality_gate::MemoryQualityGate;
+pub use store::ReembedEntry;
