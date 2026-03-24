@@ -1,4 +1,7 @@
 pub mod engine_registry;
+pub mod task_manager;
+pub mod watcher;
+pub mod watchers;
 pub mod llm;
 pub mod perception;
 pub mod reconstitution;
@@ -19,3 +22,5 @@ pub use reflection::{ReflectionLoop, ReflectionOutput, Synthesis, Contradiction,
 pub use scheduler::ThreadScheduler;
 pub use telos::{Autonomy, Goal, GoalManager, GoalSource, GoalStatus, Priority};
 pub use thread::ReasoningThread;
+pub use watcher::{Watcher, WatcherConfig, WatcherEvent, WatcherRegistry};
+pub use watchers::CommsWatcher;
