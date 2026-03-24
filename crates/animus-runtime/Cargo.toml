@@ -29,4 +29,5 @@ chrono = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 toml = { workspace = true }
+async-nats = { workspace = true }
 hostname = "0.3"

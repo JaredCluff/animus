@@ -19,6 +19,8 @@ pub enum DecayClass {
     /// Default: moderate decay (half-life: 30 days).
     #[default]
     General,
+    /// Very short-lived noise: keepalive failures, silence loops. Half-life: 1 hour.
+    Ephemeral,
 }
 
 impl DecayClass {
@@ -31,7 +33,18 @@ impl DecayClass {
             Self::Episodic => 14.0 * DAY,
             Self::Opinion => 7.0 * DAY,
             Self::General => 30.0 * DAY,
+            Self::Ephemeral => 3600.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_has_short_half_life() {
+        assert_eq!(DecayClass::Ephemeral.half_life_secs(), 3600.0);
     }
 }
 

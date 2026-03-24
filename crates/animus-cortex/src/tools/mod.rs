@@ -14,12 +14,19 @@ pub mod spawn_task;
 pub mod task_status;
 pub mod task_output;
 pub mod task_cancel;
+pub mod delete_segment;
+pub mod prune_segments;
+pub mod snapshot_memory;
+pub mod list_snapshots;
+pub mod restore_snapshot;
+pub mod nats_publish;
 
 use crate::llm::ToolDefinition;
 use crate::task_manager::TaskManager;
 use crate::telos::Autonomy;
 use crate::watcher::WatcherRegistry;
-use animus_core::{EmbeddingService, Signal};
+use crate::perception::SelfEventFilter;
+use animus_core::{ApiTracker, EmbeddingService, Signal};
 use animus_vectorfs::VectorStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +36,8 @@ use tokio::sync::mpsc;
 pub struct ToolContext {
     /// Root data directory for the AILF.
     pub data_dir: PathBuf,
+    /// Snapshot directory — kept outside data_dir so shell_exec protection covers both.
+    pub snapshot_dir: PathBuf,
     /// VectorFS store for memory tools.
     pub store: Arc<dyn VectorStore>,
     /// Embedding service for memory tools.
@@ -44,6 +53,12 @@ pub struct ToolContext {
     pub watcher_registry: Option<WatcherRegistry>,
     /// Task manager for background process execution.
     pub task_manager: Option<TaskManager>,
+    /// Self-event filter — tools register paths they modify to prevent perception feedback loops.
+    pub self_event_filter: Option<Arc<SelfEventFilter>>,
+    /// API usage tracker — the AILF can query its own usage patterns.
+    pub api_tracker: Option<Arc<ApiTracker>>,
+    /// NATS client for proactive publishing via the nats_publish tool.
+    pub nats_client: Option<async_nats::Client>,
 }
 
 /// A tool the AILF can use to interact with the world.

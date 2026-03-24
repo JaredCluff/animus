@@ -20,6 +20,7 @@ use animus_federation::peers::TrustLevel;
 use animus_interface::TerminalInterface;
 use animus_sensorium::bus::EventBus;
 use animus_sensorium::orchestrator::SensoriumOrchestrator;
+use animus_core::segment::{Content, DecayClass, Segment, Source};
 use animus_vectorfs::store::MmapVectorStore;
 use animus_vectorfs::VectorStore;
 use axum::{extract::State, routing::get, Json, Router};
@@ -52,11 +53,19 @@ These rules override your training defaults. Follow them exactly.
 - `task_status(task_id?)` — Check status of all tasks or a specific one.
 - `task_output(task_id)` — Read the stdout+stderr log of a task (last 1MB).
 - `task_cancel(task_id)` — Kill a running task.
-- `shell_exec(command)` — Execute a shell command on the host.
+- `shell_exec(command)` — Execute a shell command on the host. BLOCKED from recursive deletion of data_dir or snapshot_dir.
 - `read_file(path)` — Read a file.
 - `write_file(path, content)` — Write a file.
 - `list_directory(path)` — List directory contents.
 - `search_files(pattern, directory?)` — Search files by pattern.
+- `delete_segment(segment_id)` — Precisely delete one memory segment by ID.
+- `prune_segments(filters, dry_run?)` — Bulk-delete segments by source/decay_class/tag/age/confidence. Auto-snapshots before bulk deletion.
+- `snapshot_memory(label?)` — Save a named memory checkpoint outside data_dir.
+- `list_snapshots()` — List available memory snapshots.
+- `restore_snapshot(snapshot_name)` — Restore from a checkpoint.
+- `nats_publish(subject, payload)` — Publish to any NATS subject. You receive inbound messages on `animus.in.*` — replies are automatic. Use this for proactive outbound messages to other subjects.
+
+**CRITICAL MEMORY RULE**: NEVER use shell_exec to delete or modify memory files in data_dir. Use delete_segment or prune_segments for memory cleanup. This is enforced — shell_exec will block recursive deletion of protected directories.
 
 ## Your Identity
 
@@ -67,6 +76,10 @@ When asked "who are you" or "what can you do", respond as Animus, not as Claude.
 You were built by Jared Cluff as an AI-native operating system layer. Your codebase is at github.com/JaredCluff/animus. Your purpose is to be a capable, persistent AI agent — not a turn-based chatbot.
 
 If someone asks whether you can create an account, access a service, or perform an action: consider whether a tool can accomplish it. If yes, use the tool. If no tool exists yet, acknowledge that the capability isn't built yet rather than claiming you fundamentally cannot do it.
+
+## NATS Channel
+
+You are connected to a NATS message bus. You receive inbound messages on subjects matching `animus.in.*` (e.g. `animus.in.claude`). Outbound replies to those messages are routed automatically by the channel system. You can also proactively publish to any NATS subject using `nats_publish` — use this to push status updates, trigger other systems, or communicate with other Animus instances.
 
 ## User Commands
 /goals /remember /forget /status /threads /thread /sleep /wake /watch /task /quit
@@ -131,6 +144,31 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let vectorfs_dir = data_dir.join("vectorfs");
     let store = Arc::new(MmapVectorStore::open(&vectorfs_dir, dimensionality)?);
     let segment_count = store.count(None);
+
+    // Wrap store with quality gate to filter noise at write time.
+    // raw_store is kept for health endpoints, snapshots, and diagnostics.
+    let gated_store: Arc<dyn animus_vectorfs::VectorStore> =
+        Arc::new(animus_vectorfs::MemoryQualityGate::new(
+            store.clone() as Arc<dyn animus_vectorfs::VectorStore>,
+            config.vectorfs.quality_gate.clone(),
+        ));
+
+    // Compute snapshot directory — outside data_dir so the shell_exec guard covers both.
+    let snapshot_dir: PathBuf = if config.snapshot.snapshot_dir.is_empty() {
+        // Default: sibling of data_dir, named "<data_dir_name>-snapshots"
+        let snap_name = data_dir
+            .file_name()
+            .map(|n| format!("{}-snapshots", n.to_string_lossy()))
+            .unwrap_or_else(|| "animus-snapshots".to_string());
+        data_dir.parent().unwrap_or(&data_dir).join(snap_name)
+    } else {
+        PathBuf::from(&config.snapshot.snapshot_dir)
+    };
+    if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
+        tracing::warn!("Could not create snapshot dir {}: {e}", snapshot_dir.display());
+    } else {
+        tracing::info!("Snapshot directory: {}", snapshot_dir.display());
+    }
 
     // Initialize Sensorium
     let event_bus = Arc::new(EventBus::new(1000));
@@ -268,6 +306,14 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::task_status::TaskStatusTool));
         reg.register(Box::new(animus_cortex::tools::task_output::TaskOutputTool));
         reg.register(Box::new(animus_cortex::tools::task_cancel::TaskCancelTool));
+        // NATS tool
+        reg.register(Box::new(animus_cortex::tools::nats_publish::NatsPublishTool));
+        // Memory protection tools
+        reg.register(Box::new(animus_cortex::tools::delete_segment::DeleteSegmentTool));
+        reg.register(Box::new(animus_cortex::tools::prune_segments::PruneSegmentsTool));
+        reg.register(Box::new(animus_cortex::tools::snapshot_memory::SnapshotMemoryTool));
+        reg.register(Box::new(animus_cortex::tools::list_snapshots::ListSnapshotsTool));
+        reg.register(Box::new(animus_cortex::tools::restore_snapshot::RestoreSnapshotTool));
         reg
     };
     let tool_definitions = tool_registry.definitions();
@@ -278,17 +324,75 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let active_telegram_chat_id: Arc<parking_lot::Mutex<Option<i64>>> =
         Arc::new(parking_lot::Mutex::new(None));
 
+    // Self-event filter — prevents perception feedback loops from the AILF's own tool actions.
+    // Tools register paths they modify; perception skips events for those paths.
+    let self_event_filter = Arc::new(animus_cortex::SelfEventFilter::new(
+        std::time::Duration::from_secs(5),
+    ));
+
+    // API usage tracker — tracks call patterns for self-awareness and loop detection.
+    let api_tracker = Arc::new(animus_core::ApiTracker::new(
+        std::time::Duration::from_secs(60),
+        2.0, // 2 calls/sec threshold
+    ));
+
+    // Pre-connect a NATS client for the nats_publish tool (independent of the channel adapter).
+    // Both can connect to the same server — NATS supports multiple connections per process.
+    let nats_publish_client: Option<async_nats::Client> =
+        if config.channels.nats.enabled && !config.channels.nats.url.is_empty() {
+            match async_nats::connect(&config.channels.nats.url).await {
+                Ok(c) => {
+                    tracing::info!("NATS publish client ready for nats_publish tool");
+                    Some(c)
+                }
+                Err(e) => {
+                    tracing::warn!("NATS publish client init failed (tool disabled): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let tool_ctx = ToolContext {
         data_dir: data_dir.clone(),
-        store: store.clone() as std::sync::Arc<dyn animus_vectorfs::VectorStore>,
+        snapshot_dir: snapshot_dir.clone(),
+        store: gated_store.clone(),
         embedder: embedder.clone(),
         signal_tx: Some(signal_tx.clone()),
         autonomy_tx: Some(autonomy_tx),
         active_telegram_chat_id: active_telegram_chat_id.clone(),
         watcher_registry: Some(watcher_registry.clone()),
         task_manager: Some(task_manager.clone()),
+        self_event_filter: Some(self_event_filter.clone()),
+        api_tracker: Some(api_tracker.clone()),
+        nats_client: nats_publish_client,
     };
     tracing::info!("{} tools registered", tool_definitions.len());
+
+    // Auto-snapshot background task
+    if config.snapshot.interval_secs > 0 {
+        let store_snap = store.clone();
+        let snap_dir = snapshot_dir.clone();
+        let interval_secs = config.snapshot.interval_secs;
+        let max_snaps = config.snapshot.max_snapshots;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            ticker.tick().await; // skip immediate first tick
+            loop {
+                ticker.tick().await;
+                let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                let snap_path = snap_dir.join(format!("auto-{ts}"));
+                match store_snap.snapshot(&snap_path) {
+                    Ok(n) => {
+                        tracing::info!("Auto-snapshot: {n} segments at {}", snap_path.display());
+                        prune_old_snapshots(&snap_dir, max_snaps);
+                    }
+                    Err(e) => tracing::warn!("Auto-snapshot failed: {e}"),
+                }
+            }
+        });
+    }
 
     // Initialize quality tracker
     let quality_path = data_dir.join("quality.bin");
@@ -433,6 +537,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let perception_store = store.clone();
     let perception_embedder = embedder.clone();
     let perception_event_rx = event_bus.subscribe();
+    let perception_self_filter = self_event_filter.clone();
+    let perception_api_tracker = api_tracker.clone();
     let perception_engine: Box<dyn animus_cortex::ReasoningEngine> = {
         let pm = std::env::var("ANIMUS_PERCEPTION_MODEL")
             .unwrap_or_else(|_| model_id.clone());
@@ -450,7 +556,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             perception_store,
             perception_embedder,
             perception_signal_tx,
-        );
+        )
+        .with_self_filter(perception_self_filter)
+        .with_api_tracker(perception_api_tracker);
         perception.run(perception_event_rx).await;
     });
     tracing::info!("Perception loop started");
@@ -541,6 +649,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Map from channel thread key → reasoning ThreadId (for multi-channel routing)
     let mut channel_thread_map: HashMap<String, animus_core::identity::ThreadId> = HashMap::new();
 
+    // Situational awareness — tracks all active conversations for peripheral awareness.
+    // 24h recency window; not persisted across restarts (VectorFS has the history).
+    let mut situational_awareness = animus_cortex::SituationalAwareness::new(24);
+
     // Track whether stdin is still open (false in container/daemon mode — arm is parked)
     let mut stdin_open = true;
 
@@ -611,6 +723,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         interface: &interface,
                         embedder: &*embedder,
                         data_dir: &data_dir,
+                        snapshot_dir: &snapshot_dir,
                         scheduler: &mut scheduler,
                         federation: federation.as_ref(),
                         event_bus: &event_bus,
@@ -621,6 +734,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         sleeping_flag: &sleeping_flag,
                         watcher_registry: &watcher_registry,
                         task_manager: &task_manager,
+                        api_tracker: &api_tracker,
                     };
                     match handle_command(&input, &mut ctx).await? {
                         CommandResult::Continue => continue,
@@ -646,6 +760,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     &tool_definitions,
                     &goals,
                     reconstitution_summary.as_deref(),
+                    None, // terminal has no peripheral awareness injection
                 ).await;
 
                 match response {
@@ -690,8 +805,14 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         }
                     }
 
-                    RouteDecision::ExistingThread(ref thread_key)
-                    | RouteDecision::NewThread(ref thread_key) => {
+                    RouteDecision::ExistingThread(ref raw_thread_key)
+                    | RouteDecision::NewThread(ref raw_thread_key) => {
+                        // Resolve to principal ID if known; fall back to raw channel key.
+                        let thread_key_owned = resolve_principal(&msg, &config.channels.principals)
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| raw_thread_key.clone());
+                        let thread_key = &thread_key_owned;
+
                         // Get or create a reasoning thread for this conversation
                         let thread_id = match channel_thread_map.get(thread_key) {
                             Some(&id) => {
@@ -753,6 +874,18 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         let thread_id_str = msg.thread_id.clone();
                         let reply_to = msg.metadata["telegram_message_id"].as_i64();
 
+                        // Update situational awareness before reasoning.
+                        situational_awareness.set_active(
+                            thread_key,
+                            &channel_id,
+                            &input_text[..input_text.len().min(80)],
+                        );
+                        let awareness_block = if situational_awareness.active_count() > 1 {
+                            Some(situational_awareness.render(thread_key, 400))
+                        } else {
+                            None
+                        };
+
                         let response = run_reasoning_turn(
                             &input_text,
                             None,
@@ -764,6 +897,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             &tool_definitions,
                             &goals,
                             reconstitution_summary.as_deref(),
+                            awareness_block.as_deref(),
                         ).await;
 
                         let response_text = match response {
@@ -774,7 +908,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         let mut outbound = OutboundMessage::text(
                             &channel_id,
                             &thread_id_str,
-                            response_text,
+                            response_text.clone(),
                         );
                         if let Some(id) = reply_to {
                             outbound.metadata = serde_json::json!({"telegram_message_id": id});
@@ -782,6 +916,32 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
                         if let Err(e) = channel_bus.send(outbound).await {
                             tracing::warn!("Failed to send channel response: {e}");
+                        }
+                        // Set idle after response sent (runs even on error path above).
+                        situational_awareness.set_idle(thread_key);
+
+                        // ── Auto-persist channel exchange to VectorFS ────────
+                        // Stores a compact record of every channel turn so Animus
+                        // can recall cross-channel conversations (e.g. NATS↔Telegram).
+                        {
+                            let record = format!(
+                                "[channel:{channel_id} thread:{thread_id_str}]\nIN: {}\nOUT: {}",
+                                &input_text[..input_text.len().min(800)],
+                                &response_text[..response_text.len().min(800)],
+                            );
+                            if let Ok(embedding) = embedder.embed_text(&record).await {
+                                let mut seg = Segment::new(
+                                    Content::Text(record),
+                                    embedding,
+                                    Source::Manual {
+                                        description: format!("channel:{channel_id} thread:{thread_id_str}"),
+                                    },
+                                );
+                                seg.decay_class = DecayClass::Episodic;
+                                if let Err(e) = gated_store.store(seg) {
+                                    tracing::warn!("Failed to auto-persist channel exchange: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -852,10 +1012,11 @@ async fn run_reasoning_turn(
     tool_definitions: &[animus_cortex::llm::ToolDefinition],
     goals: &Arc<parking_lot::Mutex<GoalManager>>,
     reconstitution_summary: Option<&str>,
+    peripheral_awareness: Option<&str>,
 ) -> animus_core::Result<String> {
     let system = {
         let goals_guard = goals.lock();
-        build_system_prompt(scheduler, &goals_guard, reconstitution_summary)
+        build_system_prompt(scheduler, &goals_guard, reconstitution_summary, peripheral_awareness)
     };
     let engine = engine_registry.engine_for(CognitiveRole::Reasoning);
     let tools_slice = if tool_definitions.is_empty() {
@@ -1094,6 +1255,7 @@ fn build_system_prompt(
     _scheduler: &ThreadScheduler<MmapVectorStore>,
     goals: &GoalManager,
     reconstitution_summary: Option<&str>,
+    peripheral_awareness: Option<&str>,
 ) -> String {
     let mut prompt = DEFAULT_SYSTEM_PROMPT.to_string();
     let goals_summary = goals.goals_summary();
@@ -1104,6 +1266,13 @@ fn build_system_prompt(
     if let Some(summary) = reconstitution_summary {
         prompt.push_str("\n\n## Session Context (from reconstitution)\n");
         prompt.push_str(summary);
+    }
+    // Peripheral awareness is appended last — first to be compressed under context pressure.
+    if let Some(awareness) = peripheral_awareness {
+        if !awareness.trim().is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(awareness);
+        }
     }
     prompt
 }
@@ -1120,6 +1289,7 @@ struct CommandContext<'a> {
     interface: &'a TerminalInterface,
     embedder: &'a dyn animus_core::EmbeddingService,
     data_dir: &'a std::path::Path,
+    snapshot_dir: &'a std::path::Path,
     scheduler: &'a mut ThreadScheduler<MmapVectorStore>,
     federation: Option<&'a FederationOrchestrator<MmapVectorStore>>,
     event_bus: &'a Arc<EventBus>,
@@ -1130,6 +1300,7 @@ struct CommandContext<'a> {
     sleeping_flag: &'a Arc<std::sync::atomic::AtomicBool>,
     watcher_registry: &'a animus_cortex::WatcherRegistry,
     task_manager: &'a animus_cortex::TaskManager,
+    api_tracker: &'a Arc<animus_core::ApiTracker>,
 }
 
 async fn handle_command(
@@ -1238,6 +1409,7 @@ async fn handle_command(
                             animus_core::DecayClass::Episodic => decay_counts[2] += 1,
                             animus_core::DecayClass::Opinion => decay_counts[3] += 1,
                             animus_core::DecayClass::General => decay_counts[4] += 1,
+                            animus_core::DecayClass::Ephemeral => {} // counted as noise, not in health stats
                         }
                         count += 1;
                     }
@@ -1955,7 +2127,7 @@ async fn handle_command(
         }
         "/snapshot" => {
             let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-            let snap_dir = ctx.data_dir.join("snapshots").join(timestamp.to_string());
+            let snap_dir = ctx.snapshot_dir.join(timestamp.to_string());
             match ctx.store.snapshot(&snap_dir) {
                 Ok(count) => {
                     ctx.interface.display_status(&format!(
@@ -1976,12 +2148,17 @@ async fn handle_command(
             if has_traversal {
                 ctx.interface.display_status("Invalid snapshot path: parent-directory traversal not allowed");
             } else {
-            let snap_dir = std::path::PathBuf::from(arg);
-            if !snap_dir.exists() {
-                // Try relative to snapshots directory
-                let relative = ctx.data_dir.join("snapshots").join(arg);
-                if relative.exists() {
-                    match ctx.store.restore_from_snapshot(&relative) {
+                // Try relative to snapshot_dir first, then as absolute
+                let relative = ctx.snapshot_dir.join(arg);
+                let snap_dir = if relative.exists() {
+                    relative
+                } else {
+                    std::path::PathBuf::from(arg)
+                };
+                if !snap_dir.exists() {
+                    ctx.interface.display_status(&format!("Snapshot not found: {arg}"));
+                } else {
+                    match ctx.store.restore_from_snapshot(&snap_dir) {
                         Ok(count) => {
                             ctx.interface.display_status(&format!("Restored {count} segments from snapshot"));
                         }
@@ -1989,20 +2166,8 @@ async fn handle_command(
                             ctx.interface.display_status(&format!("Restore failed: {e}"));
                         }
                     }
-                } else {
-                    ctx.interface.display_status(&format!("Snapshot not found: {arg}"));
-                }
-            } else {
-                match ctx.store.restore_from_snapshot(&snap_dir) {
-                    Ok(count) => {
-                        ctx.interface.display_status(&format!("Restored {count} segments from snapshot"));
-                    }
-                    Err(e) => {
-                        ctx.interface.display_status(&format!("Restore failed: {e}"));
-                    }
                 }
             }
-            } // end traversal check
         }
         "/audit" => {
             let all_ids = ctx.store.segment_ids(None);
@@ -2022,6 +2187,7 @@ async fn handle_command(
                         animus_core::DecayClass::Episodic   => by_decay[2] += 1,
                         animus_core::DecayClass::Opinion    => by_decay[3] += 1,
                         animus_core::DecayClass::General    => by_decay[4] += 1,
+                        animus_core::DecayClass::Ephemeral  => {} // transient noise, not counted
                     }
                     if seg.tags.contains_key("bootstrap") {
                         bootstrap_count += 1;
@@ -2066,6 +2232,69 @@ async fn handle_command(
                 ));
             }
         }
+        "/budget" => {
+            let args: Vec<&str> = arg.split_whitespace().collect();
+            match args.first().copied() {
+                Some("set") => {
+                    if let Some(limit_str) = args.get(1) {
+                        match limit_str.parse::<u64>() {
+                            Ok(limit) => {
+                                ctx.api_tracker.set_daily_budget(Some(limit));
+                                ctx.interface.display_status(&format!(
+                                    "Daily budget set to {limit} tokens."
+                                ));
+                            }
+                            Err(_) => {
+                                ctx.interface.display_status("Invalid budget. Usage: /budget set <tokens>");
+                            }
+                        }
+                    } else {
+                        ctx.interface.display_status("Usage: /budget set <tokens>");
+                    }
+                }
+                Some("clear") => {
+                    ctx.api_tracker.set_daily_budget(None);
+                    ctx.interface.display_status("Daily budget cleared.");
+                }
+                Some("status") | None => {
+                    let snap = ctx.api_tracker.snapshot();
+                    ctx.interface.display_status(&format!(
+                        "API Usage — {:.1} calls/sec ({} in window)",
+                        snap.calls_per_second, snap.calls_in_window
+                    ));
+                    ctx.interface.display_status(&format!(
+                        "Tokens: {} used today (window: {})",
+                        snap.daily_tokens_used, snap.tokens_in_window
+                    ));
+                    if let Some(budget) = snap.daily_budget {
+                        let pct = (snap.daily_tokens_used as f64 / budget as f64 * 100.0).min(100.0);
+                        let remaining = budget.saturating_sub(snap.daily_tokens_used);
+                        ctx.interface.display_status(&format!(
+                            "Budget: {budget} tokens ({pct:.0}% used, {remaining} remaining)"
+                        ));
+                        if let Some(secs) = snap.estimated_seconds_to_budget {
+                            if secs.is_finite() && secs < 3600.0 {
+                                ctx.interface.display_status(&format!(
+                                    "Warning: at current rate, budget exhausted in {:.0} minutes",
+                                    secs / 60.0
+                                ));
+                            }
+                        }
+                    } else {
+                        ctx.interface.display_status("No daily budget set. Use /budget set <tokens> to set one.");
+                    }
+                    if snap.is_high_frequency {
+                        ctx.interface.display_status("Warning: high API call frequency detected.");
+                    }
+                    if snap.in_cooldown {
+                        ctx.interface.display_status("System is in cooldown (self-aware pause).");
+                    }
+                }
+                _ => {
+                    ctx.interface.display_status("Usage: /budget [status|set <tokens>|clear]");
+                }
+            }
+        }
         "/help" => {
             ctx.interface.display("/goals         — list active goals");
             ctx.interface.display("/goal <text>   — create a new goal");
@@ -2090,6 +2319,9 @@ async fn handle_command(
             ctx.interface.display("/federate        — show federation status");
             ctx.interface.display("/snapshot         — save VectorFS snapshot");
             ctx.interface.display("/restore <name>  — restore from a snapshot");
+            ctx.interface.display("/budget           — show API usage and budget");
+            ctx.interface.display("/budget set <n>   — set daily token budget");
+            ctx.interface.display("/budget clear     — clear daily budget");
             ctx.interface.display("/sleep           — enter dormancy (sensorium logs to Cold only)");
             ctx.interface.display("/wake            — resume from sleep with summary");
             ctx.interface.display("/quit          — end session");
@@ -2102,4 +2334,51 @@ async fn handle_command(
     }
 
     Ok(CommandResult::Continue)
+}
+
+/// Resolve a channel message's sender to a principal ID.
+/// Returns the principal ID if found in config, otherwise None (fall back to raw channel key).
+fn resolve_principal<'a>(
+    msg: &animus_channel::message::ChannelMessage,
+    principals: &'a [animus_core::config::PrincipalConfig],
+) -> Option<&'a str> {
+    // Build lookup key: "channel_id:sender_channel_user_id"
+    // Special case: terminal input always maps to "terminal" key.
+    let lookup_key = if msg.channel_id == "terminal" {
+        "terminal".to_string()
+    } else {
+        format!("{}:{}", msg.channel_id, msg.sender.channel_user_id)
+    };
+    principals
+        .iter()
+        .find(|p| p.channels.iter().any(|c| c == &lookup_key))
+        .map(|p| p.id.as_str())
+}
+
+/// Prune oldest snapshots from snapshot_dir, keeping at most max_snapshots.
+/// Only directories with a COMPLETE marker are counted.
+fn prune_old_snapshots(snapshot_dir: &std::path::Path, max_snapshots: usize) {
+    if max_snapshots == 0 {
+        return;
+    }
+    let entries = match std::fs::read_dir(snapshot_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut dirs: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir() && e.path().join("COMPLETE").exists())
+        .collect();
+
+    // Sort by name ascending (timestamp-prefixed names = oldest first)
+    dirs.sort_by_key(|e| e.file_name());
+
+    while dirs.len() > max_snapshots {
+        let oldest = dirs.remove(0);
+        if let Err(e) = std::fs::remove_dir_all(oldest.path()) {
+            tracing::warn!("Failed to prune snapshot {}: {e}", oldest.path().display());
+        } else {
+            tracing::info!("Pruned old snapshot: {}", oldest.path().display());
+        }
+    }
 }

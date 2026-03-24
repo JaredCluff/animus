@@ -185,109 +185,6 @@ impl MmapVectorStore {
         Ok(())
     }
 
-    /// Create a snapshot of the entire store at the given directory.
-    /// Copies all segment files and metadata atomically.
-    pub fn snapshot(&self, snapshot_dir: &Path) -> Result<usize> {
-        let snap_segments = snapshot_dir.join("segments");
-        fs::create_dir_all(&snap_segments)?;
-
-        // Copy metadata
-        let meta_src = self.base_dir.join("meta.json");
-        if meta_src.exists() {
-            fs::copy(&meta_src, snapshot_dir.join("meta.json"))?;
-        } else {
-            Self::write_meta(&snapshot_dir.join("meta.json"), self.dimensionality)?;
-        }
-
-        // Copy all segment files
-        let segments = self.segments.read();
-        let mut count = 0;
-        for segment in segments.values() {
-            let data = bincode::serialize(segment)?;
-            let path = snap_segments.join(format!("{}.bin", segment.id.0));
-            fs::write(&path, &data)?;
-            count += 1;
-        }
-
-        // Write completion marker last so a partial snapshot is distinguishable from a
-        // complete one: if this write fails, the marker is absent and restore will refuse.
-        fs::write(snapshot_dir.join("COMPLETE"), b"")?;
-
-        tracing::info!(
-            "Snapshot created at {} ({count} segments)",
-            snapshot_dir.display()
-        );
-        Ok(count)
-    }
-
-    /// Restore segments from a snapshot directory into this store.
-    /// Existing segments with the same ID are overwritten.
-    pub fn restore_from_snapshot(&self, snapshot_dir: &Path) -> Result<usize> {
-        let snap_segments = snapshot_dir.join("segments");
-        if !snap_segments.exists() {
-            return Err(AnimusError::Storage(format!(
-                "snapshot directory has no segments: {}",
-                snapshot_dir.display()
-            )));
-        }
-        // Refuse to restore from a snapshot that was never fully written.
-        if !snapshot_dir.join("COMPLETE").exists() {
-            return Err(AnimusError::Storage(format!(
-                "snapshot at {} is incomplete (missing COMPLETE marker) — \
-                 it may have been interrupted mid-write",
-                snapshot_dir.display()
-            )));
-        }
-
-        let mut count = 0;
-        for entry in fs::read_dir(&snap_segments)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "bin") {
-                let data = fs::read(&path)?;
-                if data.len() as u64 > MAX_SEGMENT_BYTES {
-                    tracing::warn!("Skipping oversized snapshot segment: {}", path.display());
-                    continue;
-                }
-                match bincode::deserialize::<Segment>(&data) {
-                    Ok(segment) => {
-                        if segment.embedding.len() != self.dimensionality {
-                            tracing::warn!(
-                                "Skipping snapshot segment {} (dim {} != {})",
-                                segment.id.0,
-                                segment.embedding.len(),
-                                self.dimensionality
-                            );
-                            continue;
-                        }
-                        // Persist to disk before acquiring the write lock (I/O outside lock).
-                        self.persist_segment(&segment)?;
-                        // Hold the write lock for the entire check+HNSW-insert+map-insert
-                        // to prevent a TOCTOU race with concurrent store() calls.
-                        {
-                            let mut segs = self.segments.write();
-                            if !segs.contains_key(&segment.id) {
-                                self.index.insert(segment.id, &segment.embedding)?;
-                                segs.insert(segment.id, segment);
-                                count += 1;
-                            }
-                            // If already present, the disk file was refreshed above but
-                            // in-memory state is preserved; no HNSW insertion needed.
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Skipping corrupt snapshot segment {}: {e}", path.display());
-                    }
-                }
-            }
-        }
-
-        tracing::info!(
-            "Restored {count} segments from snapshot at {}",
-            snapshot_dir.display()
-        );
-        Ok(count)
-    }
 }
 
 impl VectorStore for MmapVectorStore {
@@ -491,5 +388,86 @@ impl VectorStore for MmapVectorStore {
             .filter(|(_, s)| tier_filter.is_none_or(|t| s.tier == t))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    fn snapshot(&self, snapshot_dir: &Path) -> Result<usize> {
+        let snap_segments = snapshot_dir.join("segments");
+        fs::create_dir_all(&snap_segments)?;
+
+        let meta_src = self.base_dir.join("meta.json");
+        if meta_src.exists() {
+            fs::copy(&meta_src, snapshot_dir.join("meta.json"))?;
+        } else {
+            Self::write_meta(&snapshot_dir.join("meta.json"), self.dimensionality)?;
+        }
+
+        let segments = self.segments.read();
+        let mut count = 0;
+        for segment in segments.values() {
+            let data = bincode::serialize(segment)?;
+            let path = snap_segments.join(format!("{}.bin", segment.id.0));
+            fs::write(&path, &data)?;
+            count += 1;
+        }
+
+        // Write COMPLETE marker last — absence means the snapshot was interrupted.
+        fs::write(snapshot_dir.join("COMPLETE"), b"")?;
+        tracing::info!("Snapshot created at {} ({count} segments)", snapshot_dir.display());
+        Ok(count)
+    }
+
+    fn restore_from_snapshot(&self, snapshot_dir: &Path) -> Result<usize> {
+        let snap_segments = snapshot_dir.join("segments");
+        if !snap_segments.exists() {
+            return Err(AnimusError::Storage(format!(
+                "snapshot directory has no segments: {}",
+                snapshot_dir.display()
+            )));
+        }
+        if !snapshot_dir.join("COMPLETE").exists() {
+            return Err(AnimusError::Storage(format!(
+                "snapshot at {} is incomplete (missing COMPLETE marker)",
+                snapshot_dir.display()
+            )));
+        }
+
+        let mut count = 0;
+        for entry in fs::read_dir(&snap_segments)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "bin") {
+                let data = fs::read(&path)?;
+                if data.len() as u64 > MAX_SEGMENT_BYTES {
+                    tracing::warn!("Skipping oversized snapshot segment: {}", path.display());
+                    continue;
+                }
+                match bincode::deserialize::<Segment>(&data) {
+                    Ok(segment) => {
+                        if segment.embedding.len() != self.dimensionality {
+                            tracing::warn!(
+                                "Skipping snapshot segment {} (dim {} != {})",
+                                segment.id.0, segment.embedding.len(), self.dimensionality
+                            );
+                            continue;
+                        }
+                        self.persist_segment(&segment)?;
+                        {
+                            let mut segs = self.segments.write();
+                            if !segs.contains_key(&segment.id) {
+                                self.index.insert(segment.id, &segment.embedding)?;
+                                segs.insert(segment.id, segment);
+                                count += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skipping corrupt snapshot segment {}: {e}", path.display());
+                    }
+                }
+            }
+        }
+
+        tracing::info!("Restored {count} segments from snapshot at {}", snapshot_dir.display());
+        Ok(count)
     }
 }

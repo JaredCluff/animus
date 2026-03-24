@@ -47,6 +47,9 @@ pub struct AnimusConfig {
     /// Autonomy mode configuration.
     pub autonomy: AutonomyConfig,
 
+    /// Automatic snapshot / memory protection configuration.
+    pub snapshot: SnapshotConfig,
+
     /// Security and prompt injection protection configuration.
     pub security: SecurityConfig,
 }
@@ -124,6 +127,64 @@ pub struct ChannelsConfig {
     pub telegram: TelegramChannelConfig,
     pub http_api: HttpApiChannelConfig,
     pub nats: NatsChannelConfig,
+    #[serde(default)]
+    pub principals: Vec<PrincipalConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Identity — Principals
+// ---------------------------------------------------------------------------
+
+/// Role of a known principal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalRole {
+    /// Instance owner — highest trust.
+    Owner,
+    /// AI agent peer (e.g., Claude Code).
+    AiAgent,
+    /// Human peer.
+    Peer,
+    /// Internal system.
+    System,
+}
+
+/// A known principal: a stable identity mapped from channel-specific IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrincipalConfig {
+    /// Stable identifier (e.g., "jared", "claude-code").
+    pub id: String,
+    pub role: PrincipalRole,
+    /// Channel binding keys in the form "channel_id:sender_id"
+    /// (e.g., "telegram:8593276557", "terminal", "nats:animus.in.claude").
+    pub channels: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot / Memory Protection
+// ---------------------------------------------------------------------------
+
+/// Configuration for automatic VectorFS snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotConfig {
+    /// Seconds between automatic background snapshots (0 = disabled).
+    pub interval_secs: u64,
+    /// Maximum number of snapshots to retain. Oldest are pruned when exceeded.
+    pub max_snapshots: usize,
+    /// Directory for snapshot storage.
+    /// Empty string = default: sibling of data_dir named `{data_dir_name}-snapshots`.
+    /// IMPORTANT: Should be outside data_dir so shell_exec protection covers both.
+    pub snapshot_dir: String,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 3600, // hourly
+            max_snapshots: 24,
+            snapshot_dir: String::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +335,8 @@ pub struct VectorFSConfig {
     pub dimensionality: usize,
     /// Maximum number of segments (hint for HNSW pre-allocation).
     pub max_segments: usize,
+    #[serde(default)]
+    pub quality_gate: QualityGateConfig,
 }
 
 impl Default for VectorFSConfig {
@@ -281,6 +344,35 @@ impl Default for VectorFSConfig {
         Self {
             dimensionality: 1024,
             max_segments: 100_000,
+            quality_gate: QualityGateConfig::default(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory Quality Gate
+// ---------------------------------------------------------------------------
+
+/// Configures the write-time memory quality filter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityGateConfig {
+    /// Enable/disable the quality gate entirely.
+    pub enabled: bool,
+    /// Cosine similarity threshold above which a write is considered a duplicate (0.0–1.0).
+    pub dedup_similarity_threshold: f32,
+    /// Window in hours within which dedup is checked.
+    pub dedup_window_hours: u64,
+    /// Cooldown in minutes for null-state segments (silence, keepalive failures).
+    pub null_state_cooldown_minutes: u64,
+}
+
+impl Default for QualityGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dedup_similarity_threshold: 0.92,
+            dedup_window_hours: 24,
+            null_state_cooldown_minutes: 60,
         }
     }
 }
@@ -465,6 +557,7 @@ impl Default for AnimusConfig {
             channels: ChannelsConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
+            snapshot: SnapshotConfig::default(),
         }
     }
 }
@@ -580,6 +673,21 @@ impl AnimusConfig {
                 Ok(m) => self.autonomy.default_mode = m,
                 Err(e) => eprintln!("Warning: invalid ANIMUS_AUTONOMY_MODE value: {e}"),
             }
+        }
+
+        // Snapshot overrides
+        if let Ok(dir) = std::env::var("ANIMUS_SNAPSHOT_DIR") {
+            if !dir.is_empty() {
+                self.snapshot.snapshot_dir = dir;
+            }
+        }
+        if let Ok(interval) = std::env::var("ANIMUS_SNAPSHOT_INTERVAL") {
+            if let Ok(v) = interval.parse::<u64>() {
+                self.snapshot.interval_secs = v;
+            }
+        }
+        if std::env::var("ANIMUS_SNAPSHOT_DISABLED").is_ok() {
+            self.snapshot.interval_secs = 0;
         }
 
         // Security overrides
