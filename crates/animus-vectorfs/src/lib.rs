@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use animus_core::segment::DecayClass;
 use animus_core::{Result, Segment, SegmentId, Tier};
@@ -57,8 +58,27 @@ pub trait VectorStore: Send + Sync {
 
     /// Get all segment IDs, optionally filtered by tier.
     fn segment_ids(&self, tier_filter: Option<Tier>) -> Vec<SegmentId>;
+
+    /// Create a point-in-time snapshot of all segments to the given directory.
+    /// Returns the number of segments captured.
+    fn snapshot(&self, _snapshot_dir: &Path) -> Result<usize> {
+        Err(animus_core::AnimusError::Storage(
+            "snapshot not supported by this store".to_string(),
+        ))
+    }
+
+    /// Restore segments from a previously captured snapshot.
+    /// Returns the number of segments loaded.
+    fn restore_from_snapshot(&self, _snapshot_dir: &Path) -> Result<usize> {
+        Err(animus_core::AnimusError::Storage(
+            "restore_from_snapshot not supported by this store".to_string(),
+        ))
+    }
 }
 
 pub mod index;
+pub mod quality_gate;
 pub mod store;
 pub mod tier_manager;
+
+pub use quality_gate::MemoryQualityGate;

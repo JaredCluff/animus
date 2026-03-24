@@ -32,7 +32,7 @@ impl Tool for WriteFileTool {
     }
     fn required_autonomy(&self) -> Autonomy { Autonomy::Act }
 
-    async fn execute(&self, params: serde_json::Value, _ctx: &ToolContext) -> Result<ToolResult, String> {
+    async fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolResult, String> {
         let path_str = params["path"].as_str().ok_or("missing 'path' parameter")?;
         let path = validate_path(path_str)
             .map_err(|e| format!("invalid path: {e}"))?;
@@ -48,6 +48,10 @@ impl Tool for WriteFileTool {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return Ok(ToolResult { content: format!("Error creating directory: {e}"), is_error: true });
             }
+        }
+        // Register path with self-event filter before writing to prevent perception feedback loop
+        if let Some(filter) = &ctx.self_event_filter {
+            filter.register(path.to_string_lossy().to_string()).await;
         }
         match tokio::fs::write(&path, content).await {
             Ok(()) => Ok(ToolResult { content: format!("Wrote {} bytes to {}", content.len(), path.display()), is_error: false }),

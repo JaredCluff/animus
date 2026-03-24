@@ -152,6 +152,7 @@ mod tests {
         let (signal_tx, _rx) = mpsc::channel(8);
         ToolContext {
             data_dir: tmp_dir.to_path_buf(),
+            snapshot_dir: tmp_dir.join("snapshots"),
             store: store as Arc<dyn animus_vectorfs::VectorStore>,
             embedder: embedder as Arc<dyn animus_core::EmbeddingService>,
             signal_tx: Some(signal_tx),
@@ -159,6 +160,9 @@ mod tests {
             active_telegram_chat_id: Arc::new(parking_lot::Mutex::new(None)),
             watcher_registry: Some(registry),
             task_manager: None,
+            self_event_filter: None,
+            api_tracker: None,
+            nats_client: None,
         }
     }
 

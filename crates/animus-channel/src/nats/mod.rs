@@ -34,6 +34,12 @@ impl NatsChannel {
         tracing::info!("NATS channel: connected to {}", config.url);
         Ok(Self { config, client })
     }
+
+    /// Return a clone of the underlying NATS client.
+    /// `async_nats::Client` is cheaply cloneable (reference-counted internally).
+    pub fn nats_client(&self) -> Client {
+        self.client.clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -70,13 +76,28 @@ impl ChannelPlugin for NatsChannel {
             tokio::spawn(async move {
                 tracing::info!("NATS adapter: subscribed to '{subject}'");
                 while let Some(msg) = sub.next().await {
-                    let payload = match std::str::from_utf8(&msg.payload) {
+                    let raw_payload = match std::str::from_utf8(&msg.payload) {
                         Ok(s) => s.to_string(),
                         Err(_) => {
                             tracing::warn!("NATS: non-UTF8 payload on '{}', skipping", msg.subject);
                             continue;
                         }
                     };
+
+                    // Check if the payload is a wrapped delegation message carrying
+                    // a conversation_id for routing the reply back to the originating thread.
+                    let (payload, conversation_id_override) =
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw_payload) {
+                            if v.get("x-conversation-id").is_some() {
+                                let inner = v["payload"].as_str().unwrap_or(&raw_payload).to_string();
+                                let cid = v["x-conversation-id"].as_str().map(|s| s.to_string());
+                                (inner, cid)
+                            } else {
+                                (raw_payload, None)
+                            }
+                        } else {
+                            (raw_payload, None)
+                        };
 
                     let inbound_subject = msg.subject.to_string();
 
@@ -94,8 +115,14 @@ impl ChannelPlugin for NatsChannel {
                         format!("{}.reply", reply_prefix)
                     };
 
-                    // thread_id is the outbound subject — prevents Animus replying back into
-                    // its own inbound subscription and creating a loop.
+                    // Use conversation_id_override as thread_id when present — this routes
+                    // the response back to the originating conversation thread (e.g. "jared").
+                    // Fall back to reply_subject for unsolicited messages.
+                    let effective_thread_id = conversation_id_override
+                        .unwrap_or_else(|| reply_subject.clone());
+
+                    // sender.channel_user_id uses inbound_subject (not thread_id) so that
+                    // principal resolution can match "nats:animus.in.claude".
                     let sender = SenderIdentity {
                         name: "nats".to_string(),
                         channel_user_id: inbound_subject.clone(),
@@ -104,7 +131,7 @@ impl ChannelPlugin for NatsChannel {
 
                     let mut channel_msg = ChannelMessage::new(
                         CHANNEL_ID,
-                        reply_subject.clone(),
+                        effective_thread_id,
                         sender,
                         Some(payload),
                     );

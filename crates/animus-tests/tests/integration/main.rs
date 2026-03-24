@@ -27,6 +27,7 @@ mod federation_auth;
 mod federation_knowledge;
 mod federation_e2e;
 mod quality_gate;
+mod identity;
 mod thompson_sampling;
 mod tool_use;
 mod engine_registry;

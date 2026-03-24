@@ -18,6 +18,8 @@ parking_lot = { workspace = true }
 uuid = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 base64 = { workspace = true }
+async-nats = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 animus-embed = { workspace = true }

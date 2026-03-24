@@ -1,3 +1,4 @@
+pub mod api_tracker;
 pub mod config;
 pub mod embedding;
 pub mod error;
@@ -7,7 +8,8 @@ pub mod sensorium;
 pub mod threading;
 pub mod tier;
 
-pub use config::{AnimusConfig, CortexConfig, EmbeddingConfig, EmbeddingProviderKind, FederationConfig, HealthConfig, InterfaceConfig, MnemosConfig, NatsChannelConfig, SensoriumConfig, VectorFSConfig};
+pub use api_tracker::{ApiTracker, ApiUsageSnapshot};
+pub use config::{AnimusConfig, CortexConfig, EmbeddingConfig, EmbeddingProviderKind, FederationConfig, HealthConfig, InterfaceConfig, MnemosConfig, NatsChannelConfig, PrincipalConfig, PrincipalRole, QualityGateConfig, SensoriumConfig, SnapshotConfig, VectorFSConfig};
 pub use embedding::EmbeddingService;
 pub use error::{AnimusError, Result};
 pub use identity::{AnimusIdentity, EventId, GoalId, InstanceId, PolicyId, SegmentId, SnapshotId, ThreadId};

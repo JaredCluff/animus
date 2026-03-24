@@ -69,6 +69,7 @@ mod tests {
         let mgr = TaskManager::new(tx, dir.to_path_buf(), 5);
         ToolContext {
             data_dir: dir.to_path_buf(),
+            snapshot_dir: dir.join("snapshots"),
             store: store as Arc<dyn animus_vectorfs::VectorStore>,
             embedder: embedder as Arc<dyn animus_core::EmbeddingService>,
             signal_tx: None,
@@ -76,6 +77,9 @@ mod tests {
             active_telegram_chat_id: Arc::new(parking_lot::Mutex::new(None)),
             watcher_registry: None,
             task_manager: Some(mgr),
+            self_event_filter: None,
+            api_tracker: None,
+            nats_client: None,
         }
     }
 
@@ -111,6 +115,7 @@ mod tests {
         let embedder = Arc::new(SyntheticEmbedding::new(4));
         let ctx = ToolContext {
             data_dir: tmp.path().to_path_buf(),
+            snapshot_dir: tmp.path().join("snapshots"),
             store: store as Arc<dyn animus_vectorfs::VectorStore>,
             embedder: embedder as Arc<dyn animus_core::EmbeddingService>,
             signal_tx: None,
@@ -118,6 +123,9 @@ mod tests {
             active_telegram_chat_id: Arc::new(parking_lot::Mutex::new(None)),
             watcher_registry: None,
             task_manager: None,
+            self_event_filter: None,
+            api_tracker: None,
+            nats_client: None,
         };
         let result = SpawnTaskTool.execute(
             serde_json::json!({"command": "echo hi"}),

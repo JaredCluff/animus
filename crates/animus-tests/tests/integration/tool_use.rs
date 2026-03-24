@@ -13,6 +13,7 @@ fn test_ctx(dir: &std::path::Path) -> ToolContext {
     let embedder = Arc::new(SyntheticEmbedding::new(4));
     ToolContext {
         data_dir: dir.to_path_buf(),
+        snapshot_dir: dir.join("snapshots"),
         store: store as Arc<dyn animus_vectorfs::VectorStore>,
         embedder: embedder as Arc<dyn animus_core::EmbeddingService>,
         signal_tx: None,
@@ -20,6 +21,9 @@ fn test_ctx(dir: &std::path::Path) -> ToolContext {
         active_telegram_chat_id: Arc::new(parking_lot::Mutex::new(None)),
         watcher_registry: None,
         task_manager: None,
+        self_event_filter: None,
+        api_tracker: None,
+        nats_client: None,
     }
 }
 
