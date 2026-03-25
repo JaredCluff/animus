@@ -15,11 +15,12 @@ COPY crates/animus-sensorium/Cargo.toml     crates/animus-sensorium/
 COPY crates/animus-interface/Cargo.toml     crates/animus-interface/
 COPY crates/animus-runtime/Cargo.toml       crates/animus-runtime/
 COPY crates/animus-federation/Cargo.toml    crates/animus-federation/
+COPY crates/animus-voice/Cargo.toml         crates/animus-voice/
 COPY crates/animus-tests/Cargo.toml         crates/animus-tests/
 
 # Stub out all lib/main entry points so the dep layer caches correctly
 RUN for crate in animus-core animus-vectorfs animus-mnemos animus-embed animus-cortex \
-        animus-channel animus-sensorium animus-interface animus-federation animus-tests; do \
+        animus-channel animus-sensorium animus-interface animus-federation animus-voice animus-tests; do \
       mkdir -p crates/$crate/src && \
       echo "pub fn _stub() {}" > crates/$crate/src/lib.rs; \
     done && \
