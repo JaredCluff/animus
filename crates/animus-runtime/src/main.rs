@@ -904,6 +904,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         let channel_id = msg.channel_id.clone();
                         let thread_id_str = msg.thread_id.clone();
                         let reply_to = msg.metadata["telegram_message_id"].as_i64();
+                        let nats_reply_to = msg.metadata["nats_reply_to"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
 
                         // Update situational awareness before reasoning.
                         situational_awareness.set_active(
@@ -943,6 +947,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         );
                         if let Some(id) = reply_to {
                             outbound.metadata = serde_json::json!({"telegram_message_id": id});
+                        } else if let Some(ref inbox) = nats_reply_to {
+                            outbound.metadata = serde_json::json!({"nats_reply_to": inbox});
                         }
 
                         if let Err(e) = channel_bus.send(outbound).await {
