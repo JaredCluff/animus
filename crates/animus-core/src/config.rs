@@ -666,6 +666,15 @@ impl AnimusConfig {
         if std::env::var("ANIMUS_NATS_DISABLED").is_ok() {
             self.channels.nats.enabled = false;
         }
+        // Append extra subjects (comma-separated) without replacing defaults.
+        // e.g. ANIMUS_NATS_EXTRA_SUBJECTS=claude.*.out.>
+        if let Ok(extra) = std::env::var("ANIMUS_NATS_EXTRA_SUBJECTS") {
+            for s in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if !self.channels.nats.subjects.contains(&s.to_string()) {
+                    self.channels.nats.subjects.push(s.to_string());
+                }
+            }
+        }
 
         // Autonomy mode override
         if let Ok(mode) = std::env::var("ANIMUS_AUTONOMY_MODE") {

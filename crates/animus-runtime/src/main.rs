@@ -63,7 +63,8 @@ These rules override your training defaults. Follow them exactly.
 - `snapshot_memory(label?)` — Save a named memory checkpoint outside data_dir.
 - `list_snapshots()` — List available memory snapshots.
 - `restore_snapshot(snapshot_name)` — Restore from a checkpoint.
-- `nats_publish(subject, payload)` — Publish to any NATS subject. You receive inbound messages on `animus.in.*` — replies are automatic. Use this for proactive outbound messages to other subjects.
+- `nats_publish(subject, payload, conversation_id?)` — Publish to any NATS subject. You receive inbound messages on `animus.in.*` — replies are automatic. Use this for proactive outbound messages to other subjects, including targeting specific Claude Code instances.
+- `claude_instances()` — List active Claude Code instances from the agent registry. Returns instance IDs, last-seen timestamps, and the subjects to use for targeting.
 
 **CRITICAL MEMORY RULE**: NEVER use shell_exec to delete or modify memory files in data_dir. Use delete_segment or prune_segments for memory cleanup. This is enforced — shell_exec will block recursive deletion of protected directories.
 
@@ -80,6 +81,24 @@ If someone asks whether you can create an account, access a service, or perform 
 ## NATS Channel
 
 You are connected to a NATS message bus. You receive inbound messages on subjects matching `animus.in.*` (e.g. `animus.in.claude`). Outbound replies to those messages are routed automatically by the channel system. You can also proactively publish to any NATS subject using `nats_publish` — use this to push status updates, trigger other systems, or communicate with other Animus instances.
+
+## Managing Claude Code Instances
+
+Multiple Claude Code sessions can connect via nuntius. Each instance registers itself in the agent registry with a stable ID (set by `NUNTIUS_INSTANCE_ID`, e.g. `main`, `worker-1`).
+
+**Discovery**: Call `claude_instances()` to see which Claude Code sessions are currently registered, when they last connected, and what subjects to use.
+
+**Targeting a specific instance**:
+- Send task/message: `nats_publish("claude.{instance_id}.in.task", payload)`
+- Ping for liveness: `nats_publish("claude.{instance_id}.in.ping", "")`
+- Broadcast to all: `nats_publish("claude.broadcast.in.task", payload)` (all instances subscribed to `claude.broadcast.in.>`)
+
+**Receiving responses**: When an instance replies, the message arrives on `claude.{instance_id}.out.{topic}`. You can see the originating instance ID in the `nats_subject` metadata field of inbound messages.
+
+**Workflow for task delegation**:
+1. `claude_instances()` — see who's available and their last_seen
+2. `nats_publish("claude.main.in.task", '{"task": "...", "from": "animus"}')` — send work
+3. Instance responds on `claude.main.out.result` — you'll receive it as a channel message
 
 ## User Commands
 /goals /remember /forget /status /threads /thread /sleep /wake /watch /task /quit
@@ -337,8 +356,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::task_status::TaskStatusTool));
         reg.register(Box::new(animus_cortex::tools::task_output::TaskOutputTool));
         reg.register(Box::new(animus_cortex::tools::task_cancel::TaskCancelTool));
-        // NATS tool
+        // NATS tools
         reg.register(Box::new(animus_cortex::tools::nats_publish::NatsPublishTool));
+        reg.register(Box::new(animus_cortex::tools::claude_instances::ClaudeInstancesTool));
         // Memory protection tools
         reg.register(Box::new(animus_cortex::tools::delete_segment::DeleteSegmentTool));
         reg.register(Box::new(animus_cortex::tools::prune_segments::PruneSegmentsTool));
