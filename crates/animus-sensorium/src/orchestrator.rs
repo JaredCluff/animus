@@ -117,7 +117,13 @@ impl SensoriumOrchestrator {
                         AttentionDecision::Pass { .. } => {
                             action = AuditAction::Promoted;
                         }
-                        AttentionDecision::Drop { .. } => {
+                        AttentionDecision::Drop { reason } => {
+                            tracing::debug!(
+                                event_id = %event.id,
+                                event_type = ?event.event_type,
+                                reason = %reason,
+                                "Tier 2 attention: event filtered (embedding similarity below threshold)"
+                            );
                             passed = false;
                             action = AuditAction::Ignored;
                         }

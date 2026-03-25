@@ -472,7 +472,12 @@ pub struct SensoriumConfig {
     pub process_poll_interval_secs: u64,
     pub file_watching_enabled: bool,
     pub process_monitoring_enabled: bool,
-    pub attention_similarity_threshold: f32,
+    /// Cosine similarity threshold for Tier 2 attention filtering.
+    /// Events whose embedding similarity to all active goal embeddings falls
+    /// below this value are silently dropped (logged to Cold only).
+    /// Range: 0.0–1.0. Default: 0.25.
+    /// Override: `ANIMUS_SENSORIUM_ATTENTION_THRESHOLD` env var.
+    pub attention_threshold: f32,
 }
 
 impl Default for SensoriumConfig {
@@ -482,7 +487,7 @@ impl Default for SensoriumConfig {
             process_poll_interval_secs: 5,
             file_watching_enabled: false,
             process_monitoring_enabled: false,
-            attention_similarity_threshold: 0.5,
+            attention_threshold: 0.25,
         }
     }
 }
@@ -768,6 +773,17 @@ impl AnimusConfig {
                     if !self.security.trusted_telegram_ids.contains(&id) {
                         self.security.trusted_telegram_ids.push(id);
                     }
+                }
+            }
+        }
+
+        // Sensorium overrides
+        if let Ok(threshold) = std::env::var("ANIMUS_SENSORIUM_ATTENTION_THRESHOLD") {
+            if let Ok(v) = threshold.parse::<f32>() {
+                if (0.0..=1.0).contains(&v) {
+                    self.sensorium.attention_threshold = v;
+                } else {
+                    eprintln!("Warning: ANIMUS_SENSORIUM_ATTENTION_THRESHOLD must be in 0.0–1.0, got {v}");
                 }
             }
         }
