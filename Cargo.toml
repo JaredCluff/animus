@@ -9,6 +9,7 @@ members = [
     "crates/animus-sensorium",
     "crates/animus-interface",
     "crates/animus-channel",
+    "crates/animus-voice",
     "crates/animus-runtime",
     "crates/animus-federation",
     "crates/animus-tests",
@@ -51,6 +52,7 @@ sha2 = "0.10"
 hex = "0.4"
 animus-federation = { path = "crates/animus-federation" }
 animus-channel = { path = "crates/animus-channel" }
+animus-voice = { path = "crates/animus-voice" }
 arboard = "3"
 toml = "0.8"
 base64 = "0.22"

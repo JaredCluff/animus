@@ -52,6 +52,10 @@ pub struct AnimusConfig {
 
     /// Security and prompt injection protection configuration.
     pub security: SecurityConfig,
+
+    /// Voice input/output configuration (STT + TTS).
+    #[serde(default)]
+    pub voice: VoiceConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +510,60 @@ impl Default for InterfaceConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Voice
+// ---------------------------------------------------------------------------
+
+/// Configuration for voice input/output (STT and TTS).
+///
+/// STT: delegates to the `macos-stt` HTTP service (SFSpeechRecognizer on macOS).
+/// TTS: Cartesia neural TTS.
+///
+/// Neither API key is ever serialized to disk — both come from env vars only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    /// Enable voice input (speech-to-text transcription of Telegram voice messages).
+    pub enabled: bool,
+
+    /// Enable voice replies (text-to-speech via Cartesia).
+    pub tts_enabled: bool,
+
+    // ── STT (macos-stt service) ──────────────────────────────────────────────
+
+    /// Base URL of the macos-stt service (e.g. "http://127.0.0.1:7600").
+    pub stt_url: String,
+
+    /// Bearer key for the macos-stt service. Set via `ANIMUS_STT_KEY`; never serialized.
+    #[serde(skip)]
+    pub stt_key: String,
+
+    // ── TTS (Cartesia) ───────────────────────────────────────────────────────
+
+    /// Cartesia voice UUID.
+    pub cartesia_voice_id: String,
+
+    /// Cartesia model ID (default: "sonic-2").
+    pub cartesia_model: String,
+
+    /// Cartesia API key. Set via `ANIMUS_CARTESIA_KEY`; never serialized.
+    #[serde(skip)]
+    pub cartesia_api_key: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tts_enabled: false,
+            stt_url: "http://127.0.0.1:7600".to_string(),
+            stt_key: String::new(),
+            cartesia_voice_id: String::new(),
+            cartesia_model: "sonic-2".to_string(),
+            cartesia_api_key: String::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Federation
 // ---------------------------------------------------------------------------
 
@@ -558,6 +616,7 @@ impl Default for AnimusConfig {
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             snapshot: SnapshotConfig::default(),
+            voice: VoiceConfig::default(),
         }
     }
 }
@@ -710,6 +769,36 @@ impl AnimusConfig {
                         self.security.trusted_telegram_ids.push(id);
                     }
                 }
+            }
+        }
+
+        // Voice overrides
+        if std::env::var("ANIMUS_VOICE_ENABLED").as_deref() == Ok("1") {
+            self.voice.enabled = true;
+        }
+        if std::env::var("ANIMUS_VOICE_TTS_ENABLED").as_deref() == Ok("1") {
+            self.voice.tts_enabled = true;
+        }
+        // STT service connection
+        if let Ok(url) = std::env::var("ANIMUS_STT_URL") {
+            if !url.is_empty() {
+                self.voice.stt_url = url;
+            }
+        }
+        if let Ok(key) = std::env::var("ANIMUS_STT_KEY") {
+            if !key.is_empty() {
+                self.voice.stt_key = key;
+            }
+        }
+        // Cartesia TTS
+        if let Ok(key) = std::env::var("ANIMUS_CARTESIA_KEY") {
+            if !key.is_empty() {
+                self.voice.cartesia_api_key = key;
+            }
+        }
+        if let Ok(id) = std::env::var("ANIMUS_CARTESIA_VOICE_ID") {
+            if !id.is_empty() {
+                self.voice.cartesia_voice_id = id;
             }
         }
     }

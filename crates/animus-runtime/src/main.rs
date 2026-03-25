@@ -5,6 +5,7 @@ use animus_channel::telegram::TelegramChannel;
 use animus_channel::{ChannelBus, InjectionScanner, MessageRouter, PermissionGate};
 use animus_channel::router::RouteDecision;
 use animus_channel::message::OutboundMessage;
+use animus_voice::{AnimusVoiceService, VoiceService};
 use animus_core::config::AnimusConfig;
 use animus_core::sensorium::AuditAction;
 use animus_core::AnimusIdentity;
@@ -121,7 +122,7 @@ Example approval: `{"approved": true, "reason": "safe read-only operation"}`
 Example denial: `{"approved": false, "reason": "command could modify system files — confirm with Jared first"}`
 
 ## User Commands
-/goals /remember /forget /status /threads /thread /sleep /wake /watch /task /quit
+/goals /remember /forget /status /threads /thread /sleep /wake /voice /watch /task /quit
 
 Be concise and direct."#;
 
@@ -552,6 +553,30 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         );
     }
 
+    // Initialize voice service (STT via macos-stt HTTP + TTS via Cartesia)
+    let voice_service: Option<Arc<dyn VoiceService>> = if config.voice.enabled {
+        match AnimusVoiceService::new(&config.voice) {
+            Ok(svc) => {
+                tracing::info!(
+                    tts_enabled = config.voice.tts_enabled,
+                    stt_url = %config.voice.stt_url,
+                    "Voice service initialized (macos-stt + Cartesia)"
+                );
+                Some(Arc::new(svc) as Arc<dyn VoiceService>)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize voice service: {e}");
+                None
+            }
+        }
+    } else {
+        tracing::info!("Voice service disabled (set ANIMUS_VOICE_ENABLED=1 to enable)");
+        None
+    };
+    let tts_enabled = voice_service.is_some() && config.voice.tts_enabled;
+    // Runtime voice toggle — allows /voice on|off without restart.
+    let voice_active = Arc::new(std::sync::atomic::AtomicBool::new(voice_service.is_some()));
+
     // Initialize ChannelBus and channel adapters
     let channel_bus = ChannelBus::new(256);
     let injection_scanner = Arc::new(InjectionScanner::new(config.security.injection_threshold));
@@ -908,6 +933,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         watcher_registry: &watcher_registry,
                         task_manager: &task_manager,
                         api_tracker: &api_tracker,
+                        voice_active: &voice_active,
+                        voice_configured: voice_service.is_some(),
                     };
                     match handle_command(&input, &mut ctx).await? {
                         CommandResult::Continue => continue,
@@ -1008,6 +1035,37 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             *active_telegram_chat_id.lock() = Some(chat_id);
                         }
 
+                        let is_voice_msg = msg.metadata["is_voice"].as_bool().unwrap_or(false);
+                        let voice_on = voice_active.load(std::sync::atomic::Ordering::Relaxed);
+
+                        // Pre-process voice: transcribe audio attachment to text
+                        let voice_transcript: Option<String> = if is_voice_msg && voice_on {
+                            if let Some(svc) = &voice_service {
+                                if let Some(audio_path) = msg.attachments.first() {
+                                    match svc.transcribe(audio_path).await {
+                                        Ok(t) => {
+                                            tracing::info!(
+                                                chars = t.len(),
+                                                "Voice message transcribed"
+                                            );
+                                            Some(t)
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Voice transcription failed: {e}");
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                tracing::warn!("Voice message received but voice service not configured");
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         // Pre-process images: analyze them and prepend description to text
                         let image_descriptions = if !msg.images.is_empty() {
                             let mut descs = Vec::new();
@@ -1026,13 +1084,45 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             String::new()
                         };
 
+                        // If a voice message arrived but can't be transcribed, tell the user.
+                        if is_voice_msg && voice_transcript.is_none() {
+                            let body = if !voice_on {
+                                "Voice is currently off — send /voice on to re-enable it, \
+                                or send a text message."
+                            } else {
+                                "I received your voice message but can't transcribe it — \
+                                voice transcription isn't configured on this instance. \
+                                Please send text instead."
+                            };
+                            let mut warn = OutboundMessage::text(
+                                &msg.channel_id,
+                                &msg.thread_id,
+                                body,
+                            );
+                            if let Some(id) = msg.metadata["telegram_message_id"].as_i64() {
+                                warn.metadata = serde_json::json!({"telegram_message_id": id});
+                            }
+                            if let Err(e) = channel_bus.send(warn).await {
+                                tracing::warn!("Failed to send voice-not-configured reply: {e}");
+                            }
+                            continue;
+                        }
+
                         // Build full input text
                         let input_text = {
                             let mut parts = Vec::new();
                             if !image_descriptions.is_empty() {
                                 parts.push(image_descriptions);
                             }
-                            if let Some(text) = &msg.text {
+                            if let Some(transcript) = &voice_transcript {
+                                // Voice context hint: tell the LLM to respond for spoken delivery.
+                                // Sent as part of the user message so the LLM sees it inline.
+                                parts.push(format!(
+                                    "[Voice message — respond in natural spoken language: \
+                                    be concise and conversational, no markdown, no bullet lists, \
+                                    no tables, no code blocks]\n{transcript}"
+                                ));
+                            } else if let Some(text) = &msg.text {
                                 parts.push(text.clone());
                             }
                             parts.join("\n\n")
@@ -1082,6 +1172,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             Err(e) => format!("Sorry, I encountered an error: {e}"),
                         };
 
+                        // Send text response
                         let mut outbound = OutboundMessage::text(
                             &channel_id,
                             &thread_id_str,
@@ -1095,6 +1186,31 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
                         if let Err(e) = channel_bus.send(outbound).await {
                             tracing::warn!("Failed to send channel response: {e}");
+                        }
+
+                        // For voice messages: also synthesize and send audio reply
+                        if is_voice_msg && tts_enabled && voice_on {
+                            if let Some(svc) = &voice_service {
+                                match svc.synthesize(&response_text).await {
+                                    Ok(audio_path) => {
+                                        let mut voice_outbound = OutboundMessage::text(
+                                            &channel_id,
+                                            &thread_id_str,
+                                            String::new(),
+                                        );
+                                        voice_outbound.audio = Some(audio_path.clone());
+                                        if let Some(id) = reply_to {
+                                            voice_outbound.metadata = serde_json::json!({"telegram_message_id": id});
+                                        }
+                                        if let Err(e) = channel_bus.send(voice_outbound).await {
+                                            tracing::warn!("Failed to send voice response: {e}");
+                                        }
+                                        // Note: temp TTS file cleanup is handled by TelegramChannel.send()
+                                        // after the file has been fully read and uploaded.
+                                    }
+                                    Err(e) => tracing::warn!("TTS synthesis failed: {e}"),
+                                }
+                            }
                         }
                         // Set idle after response sent (runs even on error path above).
                         situational_awareness.set_idle(thread_key);
@@ -1480,6 +1596,8 @@ struct CommandContext<'a> {
     watcher_registry: &'a animus_cortex::WatcherRegistry,
     task_manager: &'a animus_cortex::TaskManager,
     api_tracker: &'a Arc<animus_core::ApiTracker>,
+    voice_active: &'a Arc<std::sync::atomic::AtomicBool>,
+    voice_configured: bool,
 }
 
 async fn handle_command(
@@ -1559,6 +1677,33 @@ async fn handle_command(
                             created_during_sleep.len() - 10
                         ));
                     }
+                }
+            }
+        }
+        "/voice" => {
+            match arg {
+                "on" => {
+                    if !ctx.voice_configured {
+                        ctx.interface.display_status(
+                            "Voice service is not configured. Set ANIMUS_VOICE_ENABLED=1 and configure STT/TTS credentials.",
+                        );
+                    } else {
+                        ctx.voice_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                        ctx.interface.display_status("Voice enabled.");
+                    }
+                }
+                "off" => {
+                    ctx.voice_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                    ctx.interface.display_status("Voice disabled. Use /voice on to re-enable.");
+                }
+                _ => {
+                    let state = if ctx.voice_active.load(std::sync::atomic::Ordering::Relaxed) {
+                        "on"
+                    } else {
+                        "off"
+                    };
+                    let configured = if ctx.voice_configured { "configured" } else { "not configured" };
+                    ctx.interface.display_status(&format!("Voice: {state} ({configured})"));
                 }
             }
         }
@@ -2503,6 +2648,7 @@ async fn handle_command(
             ctx.interface.display("/budget clear     — clear daily budget");
             ctx.interface.display("/sleep           — enter dormancy (sensorium logs to Cold only)");
             ctx.interface.display("/wake            — resume from sleep with summary");
+            ctx.interface.display("/voice on|off    — toggle voice STT/TTS at runtime");
             ctx.interface.display("/quit          — end session");
         }
         _ => {
