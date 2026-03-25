@@ -62,6 +62,7 @@ mod tests {
             self_event_filter: None,
             api_tracker: None,
             nats_client: None,
+            federation_tx: None,
         };
         (ctx, rx)
     }

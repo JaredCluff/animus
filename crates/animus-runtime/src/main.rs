@@ -339,6 +339,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Create signal bridge channel for background cognitive loops
     let (signal_tx, mut signal_rx) = tokio::sync::mpsc::channel::<animus_core::threading::Signal>(100);
 
+    // Federation broadcast channel — created early so ToolContext can hold the sender
+    let (federation_broadcast_tx, mut federation_broadcast_rx) =
+        tokio::sync::mpsc::channel::<animus_core::identity::SegmentId>(32);
+
     // ── Watcher Registry ──────────────────────────────────────────────────────────
     let watcher_registry = animus_cortex::WatcherRegistry::new(
         vec![
@@ -387,6 +391,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         // NATS tools
         reg.register(Box::new(animus_cortex::tools::nats_publish::NatsPublishTool));
         reg.register(Box::new(animus_cortex::tools::claude_instances::ClaudeInstancesTool));
+        reg.register(Box::new(animus_cortex::tools::federate_segment::FederateSegmentTool));
         // Memory protection tools
         reg.register(Box::new(animus_cortex::tools::delete_segment::DeleteSegmentTool));
         reg.register(Box::new(animus_cortex::tools::prune_segments::PruneSegmentsTool));
@@ -446,6 +451,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         self_event_filter: Some(self_event_filter.clone()),
         api_tracker: Some(api_tracker.clone()),
         nats_client: nats_publish_client.clone(),
+        federation_tx: Some(federation_broadcast_tx.clone()),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
@@ -496,20 +502,46 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
     // Initialize federation
     let federation_config = config.federation.clone();
-    let federation = if federation_config.enabled {
-        let mut orch = FederationOrchestrator::new(
-            identity.clone(),
-            federation_config,
-            store.clone(),
-            &data_dir,
-        );
-        orch.start().await?;
-        tracing::info!("Federation started");
-        Some(orch)
-    } else {
-        tracing::info!("Federation disabled; enable in config.toml or set ANIMUS_FEDERATION=1");
-        None
-    };
+    let federation: Option<Arc<FederationOrchestrator<MmapVectorStore>>> =
+        if federation_config.enabled {
+            let mut orch = FederationOrchestrator::new(
+                identity.clone(),
+                federation_config,
+                store.clone(),
+                &data_dir,
+            );
+            orch.start().await?;
+            tracing::info!("Federation started");
+            Some(Arc::new(orch))
+        } else {
+            tracing::info!("Federation disabled; enable in config.toml or set ANIMUS_FEDERATION=1");
+            None
+        };
+
+    // Federation broadcast background task — receives SegmentId from tools and broadcasts
+    {
+        let fed_arc = federation.clone();
+        let broadcast_store = store.clone();
+        tokio::spawn(async move {
+            while let Some(segment_id) = federation_broadcast_rx.recv().await {
+                let Some(ref orch) = fed_arc else { continue };
+
+                let segment = match broadcast_store.get_raw(segment_id) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        tracing::warn!("Federation broadcast: segment {segment_id} not found");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Federation broadcast: store error for {segment_id}: {e}");
+                        continue;
+                    }
+                };
+
+                orch.broadcast_segment(&segment).await;
+            }
+        });
+    }
 
     // Start health endpoint
     if config.health.enabled {
@@ -866,7 +898,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         data_dir: &data_dir,
                         snapshot_dir: &snapshot_dir,
                         scheduler: &mut scheduler,
-                        federation: federation.as_ref(),
+                        federation: federation.clone(),
                         event_bus: &event_bus,
                         file_watcher: &file_watcher,
                         sensorium: &orchestrator,
@@ -1438,7 +1470,7 @@ struct CommandContext<'a> {
     data_dir: &'a std::path::Path,
     snapshot_dir: &'a std::path::Path,
     scheduler: &'a mut ThreadScheduler<MmapVectorStore>,
-    federation: Option<&'a FederationOrchestrator<MmapVectorStore>>,
+    federation: Option<Arc<FederationOrchestrator<MmapVectorStore>>>,
     event_bus: &'a Arc<EventBus>,
     file_watcher: &'a Arc<parking_lot::Mutex<Option<animus_sensorium::sensors::file_watcher::FileWatcher>>>,
     sensorium: &'a Arc<SensoriumOrchestrator>,
@@ -2180,7 +2212,7 @@ async fn handle_command(
             }
         }
         "/peers" => {
-            if let Some(fed) = ctx.federation {
+            if let Some(ref fed) = ctx.federation {
                 let registry = fed.peers();
                 let peers = registry.read();
                 let all = peers.all_peers();
@@ -2204,7 +2236,7 @@ async fn handle_command(
             }
         }
         "/trust" if !arg.is_empty() => {
-            if let Some(fed) = ctx.federation {
+            if let Some(ref fed) = ctx.federation {
                 let registry = fed.peers();
                 let mut peers = registry.write();
                 let all: Vec<_> = peers.all_peers().iter().map(|p| p.info.instance_id).collect();
@@ -2230,7 +2262,7 @@ async fn handle_command(
             }
         }
         "/block" if !arg.is_empty() => {
-            if let Some(fed) = ctx.federation {
+            if let Some(ref fed) = ctx.federation {
                 let registry = fed.peers();
                 let mut peers = registry.write();
                 let all: Vec<_> = peers.all_peers().iter().map(|p| p.info.instance_id).collect();
@@ -2256,7 +2288,7 @@ async fn handle_command(
             }
         }
         "/federate" => {
-            if let Some(fed) = ctx.federation {
+            if let Some(ref fed) = ctx.federation {
                 let peer_count = fed.peer_count();
                 let trusted_count = fed.trusted_peer_count();
                 let addr = fed.server_addr()
