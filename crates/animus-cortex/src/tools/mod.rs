@@ -21,6 +21,7 @@ pub mod list_snapshots;
 pub mod restore_snapshot;
 pub mod nats_publish;
 pub mod claude_instances;
+pub mod federate_segment;
 
 use crate::llm::ToolDefinition;
 use crate::task_manager::TaskManager;
@@ -28,6 +29,7 @@ use crate::telos::Autonomy;
 use crate::watcher::WatcherRegistry;
 use crate::perception::SelfEventFilter;
 use animus_core::{ApiTracker, EmbeddingService, Signal};
+use animus_core::identity::SegmentId;
 use animus_vectorfs::VectorStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,6 +62,9 @@ pub struct ToolContext {
     pub api_tracker: Option<Arc<ApiTracker>>,
     /// NATS client for proactive publishing via the nats_publish tool.
     pub nats_client: Option<async_nats::Client>,
+    /// Federation broadcast channel — send a SegmentId to broadcast it to trusted peers.
+    /// None when federation is disabled or not configured.
+    pub federation_tx: Option<mpsc::Sender<SegmentId>>,
 }
 
 /// A tool the AILF can use to interact with the world.
