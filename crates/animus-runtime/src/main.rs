@@ -252,7 +252,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         policies,
         vec![], // no attention rules initially
         audit_path.clone(),
-        0.5,
+        config.sensorium.attention_threshold,
         embedder.clone(),
     )?);
 
@@ -339,6 +339,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
     // Create signal bridge channel for background cognitive loops
     let (signal_tx, mut signal_rx) = tokio::sync::mpsc::channel::<animus_core::threading::Signal>(100);
+
+    // Proactive message channel — background tasks send here; main loop gates on autonomy mode.
+    let (proactive_tx, mut proactive_rx) = tokio::sync::mpsc::channel::<ProactiveMessage>(32);
 
     // Federation broadcast channel — created early so ToolContext can hold the sender
     let (federation_broadcast_tx, mut federation_broadcast_rx) =
@@ -575,7 +578,18 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     };
     let tts_enabled = voice_service.is_some() && config.voice.tts_enabled;
     // Runtime voice toggle — allows /voice on|off without restart.
-    let voice_active = Arc::new(std::sync::atomic::AtomicBool::new(voice_service.is_some()));
+    // Persisted to {data_dir}/voice.state so the setting survives restarts.
+    let voice_state_path = data_dir.join("voice.state");
+    let voice_state_default = voice_service.is_some();
+    let voice_state_initial = if voice_state_path.exists() {
+        std::fs::read_to_string(&voice_state_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<bool>().ok())
+            .unwrap_or(voice_state_default)
+    } else {
+        voice_state_default
+    };
+    let voice_active = Arc::new(std::sync::atomic::AtomicBool::new(voice_state_initial));
 
     // Initialize ChannelBus and channel adapters
     let channel_bus = ChannelBus::new(256);
@@ -828,6 +842,54 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         }
     });
 
+    // Goal deadline watcher — checks every 60 s for approaching/overdue goals.
+    // Sends a proactive message when a deadline is ≤ 1 hour away or just passed.
+    {
+        let deadline_goals = goals.clone();
+        let deadline_tx = proactive_tx.clone();
+        // Track which goals we've already alerted at each threshold to avoid spam.
+        tokio::spawn(async move {
+            let mut alerted: std::collections::HashSet<(animus_core::identity::GoalId, &'static str)> =
+                std::collections::HashSet::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let now = chrono::Utc::now();
+                // Collect messages under the lock, then send after releasing it
+                // to avoid holding parking_lot lock across await.
+                let pending: Vec<(animus_core::identity::GoalId, &'static str, String)> = {
+                    let goals_guard = deadline_goals.lock();
+                    goals_guard.active_goals().into_iter().filter_map(|goal| {
+                        let deadline = goal.deadline?;
+                        let remaining = deadline - now;
+                        let mins = remaining.num_minutes();
+                        let threshold: &'static str = if mins <= 0 {
+                            "overdue"
+                        } else if mins <= 15 {
+                            "15min"
+                        } else if mins <= 60 {
+                            "1hr"
+                        } else {
+                            return None;
+                        };
+                        if alerted.contains(&(goal.id, threshold)) {
+                            return None;
+                        }
+                        let text = if mins <= 0 {
+                            format!("Goal overdue: {}", goal.description)
+                        } else {
+                            format!("Goal deadline in {} min: {}", mins, goal.description)
+                        };
+                        Some((goal.id, threshold, text))
+                    }).collect()
+                };
+                for (id, threshold, text) in pending {
+                    alerted.insert((id, threshold));
+                    let _ = deadline_tx.send(ProactiveMessage { text, source: "goal_deadline" }).await;
+                }
+            }
+        });
+    }
+
     // Initialize terminal interface
     let interface = TerminalInterface::new(">> ".to_string());
     let instance_str = format!("{}", identity.instance_id);
@@ -877,8 +939,17 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
     // Main event loop — handles terminal input, channel messages, and signals
     loop {
-        // Poll signal bridge — deliver signals from background cognitive loops
+        // Poll signal bridge — deliver signals from background cognitive loops.
+        // Urgent signals also become proactive messages when autonomy mode allows.
         while let Ok(signal) = signal_rx.try_recv() {
+            if signal.priority == animus_core::threading::SignalPriority::Urgent
+                && autonomy_mode != animus_core::config::AutonomyMode::Reactive
+            {
+                let _ = proactive_tx.try_send(ProactiveMessage {
+                    text: signal.summary.clone(),
+                    source: "signal",
+                });
+            }
             if let Some(active) = scheduler.active_thread_mut() {
                 active.deliver_signal(signal);
             }
@@ -935,6 +1006,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         api_tracker: &api_tracker,
                         voice_active: &voice_active,
                         voice_configured: voice_service.is_some(),
+                        voice_state_path: &voice_state_path,
                     };
                     match handle_command(&input, &mut ctx).await? {
                         CommandResult::Continue => continue,
@@ -966,6 +1038,30 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 match response {
                     Ok(text) => interface.display_response(&text),
                     Err(e) => interface.display_status(&format!("Error: {e}")),
+                }
+            }
+
+            // ── Proactive message from background cognitive loops ────────────
+            proactive_msg = proactive_rx.recv() => {
+                let Some(pm) = proactive_msg else { continue };
+                // Only deliver if autonomy mode permits independent action.
+                if autonomy_mode == animus_core::config::AutonomyMode::Reactive {
+                    tracing::debug!(source = pm.source, "Proactive message suppressed (Reactive mode)");
+                    continue;
+                }
+                // Resolve primary contact: last active Telegram chat, else first trusted ID.
+                let chat_id_opt = active_telegram_chat_id.lock().as_ref().copied()
+                    .or_else(|| config.security.trusted_telegram_ids.first().copied());
+                let Some(chat_id) = chat_id_opt else {
+                    tracing::debug!(source = pm.source, "Proactive message dropped (no known chat_id)");
+                    continue;
+                };
+                let chat_str = chat_id.to_string();
+                let outbound = OutboundMessage::text("telegram", &chat_str, pm.text);
+                if let Err(e) = channel_bus.send(outbound).await {
+                    tracing::warn!(source = pm.source, "Failed to send proactive message: {e}");
+                } else {
+                    tracing::info!(source = pm.source, chat_id, "Proactive message sent");
                 }
             }
 
@@ -1572,6 +1668,14 @@ fn build_system_prompt(
     prompt
 }
 
+/// A message that Animus initiates to the user unprompted.
+/// Sent via `proactive_tx`; main loop gates on autonomy mode before delivering.
+struct ProactiveMessage {
+    text: String,
+    /// Human-readable source label for tracing (e.g. "goal_deadline", "reflection").
+    source: &'static str,
+}
+
 enum CommandResult {
     Continue,
     Quit,
@@ -1598,6 +1702,7 @@ struct CommandContext<'a> {
     api_tracker: &'a Arc<animus_core::ApiTracker>,
     voice_active: &'a Arc<std::sync::atomic::AtomicBool>,
     voice_configured: bool,
+    voice_state_path: &'a std::path::Path,
 }
 
 async fn handle_command(
@@ -1689,11 +1794,13 @@ async fn handle_command(
                         );
                     } else {
                         ctx.voice_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = std::fs::write(ctx.voice_state_path, "true");
                         ctx.interface.display_status("Voice enabled.");
                     }
                 }
                 "off" => {
                     ctx.voice_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = std::fs::write(ctx.voice_state_path, "false");
                     ctx.interface.display_status("Voice disabled. Use /voice on to re-enable.");
                 }
                 _ => {
@@ -2266,24 +2373,102 @@ async fn handle_command(
             } // end traversal check
         }
         "/consent" => {
-            let loaded = animus_sensorium::policy_store::PolicyStore::load(
-                &ctx.data_dir.join("consent-policies.json"),
-            )
-            .ok()
-            .unwrap_or_default();
-            if loaded.is_empty() {
-                ctx.interface
-                    .display_status("No consent policies defined. Use /consent-add to create one.");
-            } else {
-                for policy in &loaded {
-                    let status = if policy.active { "active" } else { "inactive" };
-                    ctx.interface.display_status(&format!(
-                        "[{}] {} — {} rules ({})",
-                        policy.id.0.to_string().get(..8).unwrap_or("?"),
-                        policy.name,
-                        policy.rules.len(),
-                        status,
-                    ));
+            use animus_core::sensorium::{AuditLevel, ConsentPolicy, ConsentRule, EventType, Permission, Scope};
+            use animus_core::identity::PolicyId;
+            let consent_path = ctx.data_dir.join("consent-policies.json");
+
+            let sub_parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            let sub = sub_parts.first().copied().unwrap_or("list");
+            let scope_str = sub_parts.get(1).copied().unwrap_or("").trim();
+
+            match sub {
+                "list" | "" => {
+                    let loaded = animus_sensorium::policy_store::PolicyStore::load(&consent_path)
+                        .ok()
+                        .unwrap_or_default();
+                    if loaded.is_empty() {
+                        ctx.interface.display_status(
+                            "No consent rules defined. Use /consent allow <scope> or /consent deny <scope>.",
+                        );
+                    } else {
+                        ctx.interface.display("── Consent Rules ──────────────────────────────");
+                        for policy in &loaded {
+                            let status = if policy.active { "active" } else { "inactive" };
+                            for rule in &policy.rules {
+                                let perm = match rule.permission {
+                                    Permission::Allow => "ALLOW",
+                                    Permission::Deny  => "DENY ",
+                                    Permission::AllowAnonymized => "ALLOW(anon)",
+                                };
+                                let scope_label = match &rule.scope {
+                                    Scope::All => "*".to_string(),
+                                    Scope::PathGlob(p) => p.clone(),
+                                    Scope::ProcessName(n) => format!("process:{n}"),
+                                };
+                                ctx.interface.display(&format!(
+                                    "  [{}] {} {} — {} ({})",
+                                    policy.id.0.to_string().get(..8).unwrap_or("?"),
+                                    perm,
+                                    scope_label,
+                                    policy.name,
+                                    status,
+                                ));
+                            }
+                        }
+                    }
+                }
+                "allow" | "deny" => {
+                    if scope_str.is_empty() {
+                        ctx.interface.display_status(&format!(
+                            "Usage: /consent {} <scope>  (e.g. /consent {} /home/user/**)",
+                            sub, sub
+                        ));
+                    } else {
+                        let permission = if sub == "allow" { Permission::Allow } else { Permission::Deny };
+                        let scope = if scope_str == "*" {
+                            Scope::All
+                        } else {
+                            Scope::PathGlob(scope_str.to_string())
+                        };
+                        let all_event_types = vec![
+                            EventType::FileChange,
+                            EventType::ProcessLifecycle,
+                            EventType::SystemResources,
+                            EventType::Network,
+                            EventType::Clipboard,
+                            EventType::WindowFocus,
+                            EventType::UsbDevice,
+                        ];
+                        let rule = ConsentRule {
+                            event_types: all_event_types,
+                            scope,
+                            permission,
+                            audit_level: AuditLevel::MetadataOnly,
+                        };
+                        let policy = ConsentPolicy {
+                            id: PolicyId::new(),
+                            name: format!("{} {}", sub, scope_str),
+                            rules: vec![rule],
+                            active: true,
+                            created: chrono::Utc::now(),
+                            created_by: None,
+                        };
+                        let mut policies = animus_sensorium::policy_store::PolicyStore::load(&consent_path)
+                            .ok()
+                            .unwrap_or_default();
+                        policies.push(policy);
+                        match animus_sensorium::policy_store::PolicyStore::save(&consent_path, &policies) {
+                            Ok(()) => ctx.interface.display_status(&format!(
+                                "Consent rule added: {} {}",
+                                sub.to_uppercase(),
+                                scope_str
+                            )),
+                            Err(e) => ctx.interface.display_status(&format!("Failed to save consent rules: {e}")),
+                        }
+                    }
+                }
+                _ => {
+                    ctx.interface.display_status("Usage: /consent list | /consent allow <scope> | /consent deny <scope>");
                 }
             }
         }
@@ -2493,6 +2678,60 @@ async fn handle_command(
                 }
             }
         }
+        "/audit" if arg.starts_with("export") => {
+            // /audit export [json|csv]
+            let export_parts: Vec<&str> = arg.splitn(2, ' ').collect();
+            let fmt = export_parts.get(1).copied().unwrap_or("json").trim().to_lowercase();
+            let audit_path = ctx.data_dir.join("sensorium-audit.jsonl");
+            let entries = animus_sensorium::audit::AuditTrail::read_all(&audit_path)
+                .ok()
+                .unwrap_or_default();
+            let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+            match fmt.as_str() {
+                "csv" => {
+                    let out_path = format!("/tmp/animus-audit-{timestamp}.csv");
+                    let mut csv = String::new();
+                    csv.push_str("timestamp,event_id,consent_policy,attention_tier_reached,action_taken,segment_created\n");
+                    for e in &entries {
+                        let policy = e.consent_policy.map(|p| p.0.to_string()).unwrap_or_default();
+                        let seg = e.segment_created.map(|s| s.0.to_string()).unwrap_or_default();
+                        csv.push_str(&format!(
+                            "{},{},{},{},{:?},{}\n",
+                            e.timestamp.to_rfc3339(),
+                            e.event_id.0,
+                            policy,
+                            e.attention_tier_reached,
+                            e.action_taken,
+                            seg,
+                        ));
+                    }
+                    match std::fs::write(&out_path, &csv) {
+                        Ok(()) => {
+                            ctx.interface.display_status(&format!(
+                                "Audit exported: {} entries → {out_path}",
+                                entries.len()
+                            ));
+                        }
+                        Err(e) => ctx.interface.display_status(&format!("Export failed: {e}")),
+                    }
+                }
+                "json" | _ => {
+                    let out_path = format!("/tmp/animus-audit-{timestamp}.json");
+                    match serde_json::to_string_pretty(&entries) {
+                        Ok(json) => match std::fs::write(&out_path, &json) {
+                            Ok(()) => {
+                                ctx.interface.display_status(&format!(
+                                    "Audit exported: {} entries → {out_path}",
+                                    entries.len()
+                                ));
+                            }
+                            Err(e) => ctx.interface.display_status(&format!("Export failed: {e}")),
+                        },
+                        Err(e) => ctx.interface.display_status(&format!("Serialization failed: {e}")),
+                    }
+                }
+            }
+        }
         "/audit" => {
             let all_ids = ctx.store.segment_ids(None);
             let total = all_ids.len();
@@ -2631,8 +2870,11 @@ async fn handle_command(
             ctx.interface.display("/health <id>   — show segment health details");
             ctx.interface.display("/status        — show system status");
             ctx.interface.display("/audit         — memory health report (fragmentation, decay breakdown)");
+            ctx.interface.display("/audit export [json|csv] — export sensorium audit log to /tmp");
             ctx.interface.display("/sensorium     — show observation stats");
-            ctx.interface.display("/consent       — list consent policies");
+            ctx.interface.display("/consent list  — list active consent rules");
+            ctx.interface.display("/consent allow <scope> — add an Allow rule for a path/scope pattern");
+            ctx.interface.display("/consent deny <scope>  — add a Deny rule for a path/scope pattern");
             ctx.interface.display("/threads         — list reasoning threads");
             ctx.interface.display("/thread new <n>  — create a new thread");
             ctx.interface.display("/thread switch <id> — switch to a thread");
