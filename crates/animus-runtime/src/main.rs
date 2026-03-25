@@ -100,6 +100,26 @@ Multiple Claude Code sessions can connect via nuntius. Each instance registers i
 2. `nats_publish("claude.main.in.task", '{"task": "...", "from": "animus"}')` — send work
 3. Instance responds on `claude.main.out.result` — you'll receive it as a channel message
 
+## Permission Requests from Claude Code
+
+A Claude Code instance can call `request_permission(action, details)`, which sends a NATS request to `animus.in.permission_request` and waits for your response.
+
+When you receive a message on `animus.in.permission_request`:
+1. Read the payload: `{request_id, from, action, details, timestamp}`
+2. Evaluate the request. Use your judgment based on the action type and context.
+   - `shell_exec`: scrutinize carefully — irreversible commands need high confidence
+   - `file_delete`: approve only if the target is clearly safe to remove
+   - `network_request`: generally safe unless it involves sending sensitive data
+   - `write_file`: check the path and content are appropriate
+3. If uncertain, ask the user via Telegram before responding
+4. Respond in the conversation thread with JSON: `{"approved": true}` or `{"approved": false, "reason": "..."}`
+   The NATS request/reply system routes your response back automatically.
+
+**Critical**: Your response must be valid JSON with an `approved` boolean field. Plain text responses will be interpreted as denial.
+
+Example approval: `{"approved": true, "reason": "safe read-only operation"}`
+Example denial: `{"approved": false, "reason": "command could modify system files — confirm with Jared first"}`
+
 ## User Commands
 /goals /remember /forget /status /threads /thread /sleep /wake /watch /task /quit
 
