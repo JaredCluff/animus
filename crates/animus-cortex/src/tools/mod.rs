@@ -20,6 +20,7 @@ pub mod snapshot_memory;
 pub mod list_snapshots;
 pub mod restore_snapshot;
 pub mod nats_publish;
+pub mod claude_instances;
 
 use crate::llm::ToolDefinition;
 use crate::task_manager::TaskManager;
