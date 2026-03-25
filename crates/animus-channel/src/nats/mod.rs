@@ -20,9 +20,15 @@ pub const CHANNEL_ID: &str = "nats";
 /// Subscribes to one or more NATS subjects and publishes inbound messages to
 /// the ChannelBus. Outbound responses are published back to the subject stored
 /// in `thread_id`, or to `metadata["nats_reply_to"]` if set (request/reply).
+///
+/// Subjects in `excluded_subjects` are subscribed by dedicated handlers (e.g.
+/// `PermissionGate`) and must not be double-routed through the ChannelBus.
 pub struct NatsChannel {
     config: NatsChannelConfig,
     client: Client,
+    /// Exact subjects that are handled by dedicated components and should NOT
+    /// be published to the ChannelBus by this adapter.
+    excluded_subjects: Vec<String>,
 }
 
 impl NatsChannel {
@@ -32,7 +38,18 @@ impl NatsChannel {
             .await
             .map_err(|e| AnimusError::Llm(format!("NATS connect failed ({}): {e}", config.url)))?;
         tracing::info!("NATS channel: connected to {}", config.url);
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            excluded_subjects: Vec::new(),
+        })
+    }
+
+    /// Subjects that will not be published to the ChannelBus by this adapter
+    /// because a dedicated handler (e.g. `PermissionGate`) owns them.
+    pub fn with_excluded_subjects(mut self, subjects: Vec<String>) -> Self {
+        self.excluded_subjects = subjects;
+        self
     }
 
     /// Return a clone of the underlying NATS client.
@@ -67,6 +84,7 @@ impl ChannelPlugin for NatsChannel {
             let bus = bus.clone();
             let subject = subject.clone();
             let reply_prefix = self.config.reply_prefix.clone();
+            let excluded = self.excluded_subjects.clone();
 
             let mut sub = client
                 .subscribe(subject.clone())
@@ -100,6 +118,12 @@ impl ChannelPlugin for NatsChannel {
                         };
 
                     let inbound_subject = msg.subject.to_string();
+
+                    // Skip subjects owned by dedicated handlers (e.g. PermissionGate)
+                    if excluded.iter().any(|ex| ex == &inbound_subject) {
+                        tracing::debug!("NATS: skipping excluded subject '{inbound_subject}'");
+                        continue;
+                    }
 
                     // Compute reply subject: animus.in.X → animus.out.X
                     // Replace the first path segment up to the leaf with reply_prefix.

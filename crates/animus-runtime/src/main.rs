@@ -2,7 +2,7 @@ mod bootstrap;
 
 use animus_channel::nats::NatsChannel;
 use animus_channel::telegram::TelegramChannel;
-use animus_channel::{ChannelBus, InjectionScanner, MessageRouter};
+use animus_channel::{ChannelBus, InjectionScanner, MessageRouter, PermissionGate};
 use animus_channel::router::RouteDecision;
 use animus_channel::message::OutboundMessage;
 use animus_core::config::AnimusConfig;
@@ -437,7 +437,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         task_manager: Some(task_manager.clone()),
         self_event_filter: Some(self_event_filter.clone()),
         api_tracker: Some(api_tracker.clone()),
-        nats_client: nats_publish_client,
+        nats_client: nats_publish_client.clone(),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
@@ -537,6 +537,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     if config.channels.nats.enabled {
         match NatsChannel::connect(config.channels.nats.clone()).await {
             Ok(adapter) => {
+                // Exclude the permission_request subject — PermissionGate owns it
+                let adapter = adapter.with_excluded_subjects(vec![
+                    animus_channel::permission_gate::PERMISSION_REQUEST_SUBJECT.to_string(),
+                ]);
                 channel_bus.register(Arc::new(adapter)).await;
                 tracing::info!("NATS channel adapter registered");
             }
@@ -549,6 +553,39 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Start all registered channel adapters
     if let Err(e) = channel_bus.start_all().await {
         tracing::warn!("ChannelBus start error: {e}");
+    }
+
+    // Start PermissionGate if NATS is available
+    // Uses the nats_publish_client (already connected) — avoids a second connection.
+    if let Some(ref nats_client) = nats_publish_client {
+        let tg_client = if config.channels.telegram.enabled
+            && !config.channels.telegram.bot_token.is_empty()
+        {
+            match animus_channel::telegram::api::TelegramClient::new(
+                &config.channels.telegram.bot_token,
+            ) {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    tracing::warn!("PermissionGate: could not create Telegram client: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let trusted_chat_id = config.security.trusted_telegram_ids.first().copied();
+
+        let gate = Arc::new(PermissionGate::new(
+            nats_client.clone(),
+            tg_client,
+            trusted_chat_id,
+            autonomy_rx.clone(),
+        ));
+        gate.start(channel_bus.clone()).await;
+        tracing::info!("PermissionGate started (autonomy: {})", config.autonomy.default_mode);
+    } else {
+        tracing::info!("PermissionGate disabled (NATS not available)");
     }
 
     // Subscribe to inbound channel messages
