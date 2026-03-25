@@ -123,6 +123,7 @@ impl VoiceService for AnimusVoiceService {
             ));
         }
 
+        // Cartesia does not support OGG output; request MP3 and convert via ffmpeg.
         let body = serde_json::json!({
             "model_id": self.cartesia_model,
             "transcript": text,
@@ -131,9 +132,9 @@ impl VoiceService for AnimusVoiceService {
                 "id": self.cartesia_voice_id,
             },
             "output_format": {
-                "container": "ogg",
-                "encoding": "opus",
-                "sample_rate": 24000,
+                "container": "mp3",
+                "bit_rate": 128000,
+                "sample_rate": 44100,
             },
         });
 
@@ -160,15 +161,33 @@ impl VoiceService for AnimusVoiceService {
             .await
             .map_err(|e| AnimusError::Llm(format!("voice: Cartesia read failed: {e}")))?;
 
-        // .ogg extension → TelegramChannel routes to sendVoice (inline player)
-        let path = std::env::temp_dir()
-            .join(format!("animus_tts_{}.ogg", uuid::Uuid::new_v4()));
+        let id = uuid::Uuid::new_v4();
+        let mp3_path = std::env::temp_dir().join(format!("animus_tts_{id}.mp3"));
+        let ogg_path = std::env::temp_dir().join(format!("animus_tts_{id}.ogg"));
 
-        tokio::fs::write(&path, &bytes)
+        tokio::fs::write(&mp3_path, &bytes)
             .await
-            .map_err(|e| AnimusError::Llm(format!("voice: failed to write TTS audio: {e}")))?;
+            .map_err(|e| AnimusError::Llm(format!("voice: failed to write MP3: {e}")))?;
 
-        tracing::debug!(chars = text.len(), path = %path.display(), "Cartesia TTS synthesized");
-        Ok(path)
+        // Convert MP3 → OGG Opus so Telegram routes to sendVoice (inline player).
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-i", mp3_path.to_str().unwrap_or(""),
+                "-c:a", "libopus", "-b:a", "32k",
+                ogg_path.to_str().unwrap_or(""),
+            ])
+            .output()
+            .await
+            .map_err(|e| AnimusError::Llm(format!("voice: ffmpeg not found: {e}")))?;
+
+        let _ = tokio::fs::remove_file(&mp3_path).await;
+
+        if !status.status.success() {
+            let stderr = String::from_utf8_lossy(&status.stderr);
+            return Err(AnimusError::Llm(format!("voice: ffmpeg conversion failed: {stderr}")));
+        }
+
+        tracing::debug!(chars = text.len(), path = %ogg_path.display(), "Cartesia TTS synthesized");
+        Ok(ogg_path)
     }
 }
