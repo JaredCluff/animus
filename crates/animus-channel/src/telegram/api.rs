@@ -39,8 +39,17 @@ pub struct Message {
     pub text: Option<String>,
     pub photo: Option<Vec<PhotoSize>>,
     pub document: Option<Document>,
+    pub voice: Option<Voice>,
     pub caption: Option<String>,
     pub date: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Voice {
+    pub file_id: String,
+    pub duration: u32,
+    pub mime_type: Option<String>,
+    pub file_size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +323,155 @@ impl TelegramClient {
         std::fs::write(dest, &bytes)
             .map_err(|e| AnimusError::Llm(format!("failed to write downloaded file: {e}")))?;
 
+        Ok(())
+    }
+
+    /// Send a voice message (OGG Opus or MP3) to a chat.
+    pub async fn send_voice(&self, chat_id: i64, path: &Path, reply_to: Option<i64>) -> Result<()> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| AnimusError::Llm(format!("failed to read voice file: {e}")))?;
+
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("voice.ogg")
+            .to_string();
+
+        let mime = if filename.ends_with(".mp3") { "audio/mpeg" } else { "audio/ogg" };
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(mime)
+            .map_err(|e| AnimusError::Llm(format!("MIME error: {e}")))?;
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("voice", part);
+
+        if let Some(id) = reply_to {
+            form = form.text("reply_to_message_id", id.to_string());
+        }
+
+        let resp = self
+            .http
+            .post(self.url("sendVoice"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| AnimusError::Llm(format!("sendVoice request failed: {e}")))?;
+
+        let api_resp: ApiResponse<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| AnimusError::Llm(format!("sendVoice parse failed: {e}")))?;
+
+        if !api_resp.ok {
+            return Err(AnimusError::Llm(format!(
+                "sendVoice failed: {}",
+                api_resp.description.unwrap_or_default()
+            )));
+        }
+
+        tracing::info!(chat_id, "Telegram: sent voice message");
+        Ok(())
+    }
+
+    /// Download a voice message to a local file. Returns the local path.
+    pub async fn download_voice(
+        &self,
+        voice: &Voice,
+        download_dir: &Path,
+        message_id: i64,
+    ) -> Option<PathBuf> {
+        let tg_file = match self.get_file(&voice.file_id).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("Failed to get voice file info: {e}");
+                return None;
+            }
+        };
+
+        let Some(file_path) = tg_file.file_path else {
+            return None;
+        };
+
+        // Sanitize extension: only allow short alphanumeric extensions to prevent path traversal
+        let raw_ext = file_path.rsplit('.').next().unwrap_or("ogg");
+        let ext = if raw_ext.len() <= 6 && raw_ext.chars().all(|c| c.is_alphanumeric()) {
+            raw_ext
+        } else {
+            "ogg"
+        };
+        let dest = download_dir.join(format!("tg_voice_{message_id}.{ext}"));
+
+        match self.download_file(&file_path, &dest).await {
+            Ok(()) => {
+                tracing::debug!("Downloaded voice to {}", dest.display());
+                Some(dest)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to download voice: {e}");
+                None
+            }
+        }
+    }
+
+    /// Send an audio file (non-voice format: AIFF, MP3, etc.) to a chat.
+    /// Telegram displays this as a music-player attachment, not an inline voice player.
+    /// Use `send_voice` for OGG Opus files that should play inline.
+    pub async fn send_audio(&self, chat_id: i64, path: &Path, reply_to: Option<i64>) -> Result<()> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| AnimusError::Llm(format!("failed to read audio file: {e}")))?;
+
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("audio.aiff")
+            .to_string();
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("aiff");
+        let mime = match ext {
+            "mp3" => "audio/mpeg",
+            "m4a" => "audio/mp4",
+            "wav" => "audio/wav",
+            "flac" => "audio/flac",
+            _ => "audio/x-aiff",
+        };
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(mime)
+            .map_err(|e| AnimusError::Llm(format!("MIME error: {e}")))?;
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("audio", part);
+
+        if let Some(id) = reply_to {
+            form = form.text("reply_to_message_id", id.to_string());
+        }
+
+        let resp = self
+            .http
+            .post(self.url("sendAudio"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| AnimusError::Llm(format!("sendAudio request failed: {e}")))?;
+
+        let api_resp: ApiResponse<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| AnimusError::Llm(format!("sendAudio parse failed: {e}")))?;
+
+        if !api_resp.ok {
+            return Err(AnimusError::Llm(format!(
+                "sendAudio failed: {}",
+                api_resp.description.unwrap_or_default()
+            )));
+        }
+
+        tracing::info!(chat_id, "Telegram: sent audio file");
         Ok(())
     }
 

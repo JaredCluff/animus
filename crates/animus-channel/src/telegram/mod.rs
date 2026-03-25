@@ -180,6 +180,19 @@ impl ChannelPlugin for TelegramChannel {
                                 channel_msg.images = paths;
                             }
 
+                            // Download voice message if present
+                            if let Some(voice) = &tg_msg.voice {
+                                if let Some(path) = client
+                                    .download_voice(voice, &download_dir, tg_msg.message_id)
+                                    .await
+                                {
+                                    channel_msg.attachments.push(path);
+                                    if let Some(obj) = channel_msg.metadata.as_object_mut() {
+                                        obj.insert("is_voice".to_string(), serde_json::json!(true));
+                                    }
+                                }
+                            }
+
                             tracing::info!("Telegram: {}", channel_msg.summary());
                             bus.publish(channel_msg);
                         }
@@ -205,7 +218,20 @@ impl ChannelPlugin for TelegramChannel {
         // Extract optional reply_to_message_id from metadata
         let reply_to = msg.metadata["telegram_message_id"].as_i64();
 
-        if let Some(image_path) = msg.image {
+        if let Some(audio_path) = msg.audio {
+            // OGG Opus → sendVoice (inline voice player in Telegram).
+            // Any other format (AIFF from macOS `say`, etc.) → sendAudio (music player).
+            let is_ogg = audio_path.extension().and_then(|e| e.to_str()) == Some("ogg");
+            if is_ogg {
+                self.client.send_voice(chat_id, &audio_path, reply_to).await?;
+            } else {
+                self.client.send_audio(chat_id, &audio_path, reply_to).await?;
+            }
+            // File has been fully read and uploaded; clean up temp TTS file.
+            // Cleanup happens here (not in the runtime) to avoid a race where the
+            // runtime deletes the file before this task has finished reading it.
+            let _ = tokio::fs::remove_file(&audio_path).await;
+        } else if let Some(image_path) = msg.image {
             // Send photo with caption (truncated to 1024 chars for Telegram caption limit)
             let caption = if msg.text.len() > 1024 {
                 Some(&msg.text[..1024])

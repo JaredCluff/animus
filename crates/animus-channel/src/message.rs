@@ -137,6 +137,8 @@ pub struct OutboundMessage {
     pub text: String,
     /// Optional image to attach.
     pub image: Option<PathBuf>,
+    /// Optional audio file to send as a voice message (OGG/MP3).
+    pub audio: Option<PathBuf>,
     /// Channel-specific routing metadata (e.g. Telegram reply_to_message_id).
     pub metadata: serde_json::Value,
 }
@@ -148,6 +150,7 @@ impl OutboundMessage {
             thread_id: thread_id.into(),
             text: text.into(),
             image: None,
+            audio: None,
             metadata: serde_json::Value::Null,
         }
     }
