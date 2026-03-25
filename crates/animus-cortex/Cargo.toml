@@ -7,6 +7,7 @@ edition = "2021"
 animus-core = { path = "../animus-core" }
 animus-vectorfs = { path = "../animus-vectorfs" }
 animus-mnemos = { path = "../animus-mnemos" }
+animus-sensorium = { path = "../animus-sensorium" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

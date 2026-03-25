@@ -24,6 +24,6 @@ pub use scheduler::ThreadScheduler;
 pub use telos::{Autonomy, Goal, GoalManager, GoalSource, GoalStatus, Priority};
 pub use thread::ReasoningThread;
 pub use watcher::{Watcher, WatcherConfig, WatcherEvent, WatcherRegistry};
-pub use watchers::CommsWatcher;
+pub use watchers::{CommsWatcher, SegmentPressureWatcher, SensoriumHealthWatcher};
 pub use task_manager::{TaskManager, TaskRecord, TaskState, new_task_id};
 pub use situational_awareness::SituationalAwareness;
