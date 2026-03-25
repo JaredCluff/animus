@@ -341,12 +341,20 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
     // ── Watcher Registry ──────────────────────────────────────────────────────────
     let watcher_registry = animus_cortex::WatcherRegistry::new(
-        vec![Box::new(animus_cortex::CommsWatcher)],
+        vec![
+            Box::new(animus_cortex::CommsWatcher),
+            Box::new(animus_cortex::SegmentPressureWatcher::new(
+                store.clone() as Arc<dyn animus_vectorfs::VectorStore>,
+            )),
+            Box::new(animus_cortex::SensoriumHealthWatcher::new(
+                data_dir.join("sensorium-audit.jsonl"),
+            )),
+        ],
         signal_tx.clone(),
         data_dir.join("watchers.json"),
     );
     watcher_registry.start();
-    tracing::info!("Watcher registry started (1 watcher registered)");
+    tracing::info!("Watcher registry started (3 watchers: comms, segment_pressure, sensorium_health)");
 
     // ── Task Manager ──────────────────────────────────────────────────────────────
     let task_manager = TaskManager::new(
@@ -683,6 +691,31 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             tier_manager.run_cycle();
         }
     });
+
+    // Start periodic Mnemos consolidation (every 60 minutes)
+    // Merges near-duplicate warm-tier segments to reduce memory density.
+    let consolidation_store = store.clone();
+    tokio::spawn(async move {
+        let consolidator = animus_mnemos::Consolidator::new(consolidation_store, 0.85);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        interval.tick().await; // skip first immediate tick
+        loop {
+            interval.tick().await;
+            match consolidator.run_cycle() {
+                Ok(report) if report.segments_merged > 0 => {
+                    tracing::info!(
+                        "Mnemos consolidation: scanned={} merged={} created={}",
+                        report.segments_scanned,
+                        report.segments_merged,
+                        report.segments_created,
+                    );
+                }
+                Ok(_) => {} // nothing to consolidate this cycle
+                Err(e) => tracing::warn!("Mnemos consolidation error: {e}"),
+            }
+        }
+    });
+    tracing::info!("Mnemos periodic consolidation started (60 min interval, similarity ≥ 0.85)");
 
     // Start Reflection loop (replaces standalone consolidation)
     let reflection_signal_tx = signal_tx.clone();
