@@ -1,0 +1,7 @@
+{
+  "name": "animus-opencode-plugins",
+  "private": true,
+  "dependencies": {
+    "nats": "^2.29.3"
+  }
+}
