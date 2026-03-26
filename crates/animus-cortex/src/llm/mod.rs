@@ -1,5 +1,7 @@
 pub mod anthropic;
+pub mod openai_compat;
 pub use anthropic::AnthropicEngine;
+pub use openai_compat::OpenAICompatEngine;
 
 use animus_core::error::Result;
 use async_trait::async_trait;

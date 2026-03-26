@@ -11,6 +11,7 @@ use animus_core::sensorium::AuditAction;
 use animus_core::AnimusIdentity;
 use animus_cortex::engine_registry::{CognitiveRole, EngineRegistry};
 use animus_cortex::llm::anthropic::AnthropicEngine;
+use animus_cortex::llm::openai_compat::OpenAICompatEngine;
 use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
 use animus_cortex::tools::{Tool, ToolContext, ToolRegistry};
@@ -294,44 +295,79 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
     tracing::info!("Sensorium initialized (use /consent to manage observation policies)");
 
-    // Build engine registry from env vars
+    // Build engine registry from config + env vars.
+    // Provider dispatch: anthropic (default) | ollama | openai | mock
+    // Per-role overrides: ANIMUS_{REASONING,REFLECTION,PERCEPTION}_MODEL and _PROVIDER
     let engine_registry = {
-        let perception_model = std::env::var("ANIMUS_PERCEPTION_MODEL").ok();
-        let reflection_model = std::env::var("ANIMUS_REFLECTION_MODEL").ok();
-        let reasoning_model = std::env::var("ANIMUS_REASONING_MODEL")
-            .unwrap_or_else(|_| model_id.clone());
+        let provider_str = config.cortex.llm_provider.clone();
+        let base_url = config.cortex.openai_base_url.clone();
+        let api_key = config.cortex.api_key.clone()
+            .or_else(|| std::env::var("ANIMUS_OPENAI_API_KEY").ok())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+            .unwrap_or_default();
+
+        // Helper: build an engine for a given provider/model/max_tokens
+        let build_engine = |provider: &str, model: &str, max_tokens: usize, url: &str, key: &str|
+            -> Option<Box<dyn animus_cortex::ReasoningEngine>>
+        {
+            match provider.to_lowercase().as_str() {
+                "ollama" => {
+                    match OpenAICompatEngine::for_ollama(url, model, max_tokens) {
+                        Ok(e) => { tracing::info!("LLM engine: ollama/{model} @ {url}"); Some(Box::new(e)) }
+                        Err(e) => { eprintln!("Warning: ollama engine init failed: {e}"); None }
+                    }
+                }
+                "openai" | "openai-compat" | "openai_compat" => {
+                    match OpenAICompatEngine::new(url, key, model, max_tokens) {
+                        Ok(e) => { tracing::info!("LLM engine: openai-compat/{model} @ {url}"); Some(Box::new(e)) }
+                        Err(e) => { eprintln!("Warning: openai-compat engine init failed: {e}"); None }
+                    }
+                }
+                "mock" => {
+                    tracing::warn!("LLM engine: mock (no real reasoning)");
+                    Some(Box::new(animus_cortex::MockEngine::new("mock")))
+                }
+                _ => {
+                    // anthropic (default)
+                    match AnthropicEngine::from_best_available(model, max_tokens) {
+                        Ok(e) => { tracing::info!("LLM engine: anthropic/{model}"); Some(Box::new(e)) }
+                        Err(e) => { eprintln!("Warning: Anthropic engine init failed: {e}"); None }
+                    }
+                }
+            }
+        };
 
         let fallback: Box<dyn animus_cortex::ReasoningEngine> =
-            match AnthropicEngine::from_best_available(&model_id, 4096) {
-                Ok(e) => Box::new(e),
-                Err(e) => {
-                    eprintln!("Warning: Could not initialize Anthropic engine: {e}");
-                    eprintln!("Running with mock engine. To enable reasoning, one of:");
-                    eprintln!("  1. Mount ~/.claude/.credentials.json (uses Claude Code OAuth)");
-                    eprintln!("  2. Set ANTHROPIC_OAUTH_TOKEN env var");
-                    eprintln!("  3. Set ANTHROPIC_API_KEY env var");
-                    Box::new(animus_cortex::MockEngine::new(
-                        "I'm running without an LLM connection. Mount your Claude Code credentials or set ANTHROPIC_API_KEY.",
-                    ))
-                }
-            };
+            build_engine(&provider_str, &model_id, 4096, &base_url, &api_key)
+            .unwrap_or_else(|| {
+                eprintln!("Warning: Could not initialize LLM engine. Running with mock.");
+                eprintln!("For Anthropic: mount ~/.claude/.credentials.json or set ANTHROPIC_API_KEY");
+                eprintln!("For Ollama:    set ANIMUS_LLM_PROVIDER=ollama ANIMUS_OLLAMA_URL=http://host:11434");
+                eprintln!("For OpenAI:    set ANIMUS_LLM_PROVIDER=openai ANIMUS_OPENAI_API_KEY=sk-...");
+                Box::new(animus_cortex::MockEngine::new(
+                    "I'm running without an LLM connection. Set ANIMUS_LLM_PROVIDER and related vars.",
+                ))
+            });
 
         let mut registry = EngineRegistry::new(fallback);
 
-        if let Some(model) = perception_model {
-            if let Ok(engine) = AnthropicEngine::from_best_available(&model, 1024) {
-                registry.set_engine(CognitiveRole::Perception, Box::new(engine));
-                tracing::info!("Perception engine: {model}");
+        // Per-role overrides — each can specify a different provider + model
+        for (role, model_env, provider_env, max_tok) in [
+            (CognitiveRole::Perception,  "ANIMUS_PERCEPTION_MODEL",  "ANIMUS_PERCEPTION_PROVIDER",  1024usize),
+            (CognitiveRole::Reflection,  "ANIMUS_REFLECTION_MODEL",  "ANIMUS_REFLECTION_PROVIDER",  4096),
+            (CognitiveRole::Reasoning,   "ANIMUS_REASONING_MODEL",   "ANIMUS_REASONING_PROVIDER",   4096),
+        ] {
+            let role_model = std::env::var(model_env).ok()
+                .or_else(|| if role == CognitiveRole::Reasoning { Some(model_id.clone()) } else { None });
+            let role_provider = std::env::var(provider_env).ok()
+                .unwrap_or_else(|| provider_str.clone());
+
+            if let Some(model) = role_model {
+                if let Some(engine) = build_engine(&role_provider, &model, max_tok, &base_url, &api_key) {
+                    tracing::info!("{role:?} role: {role_provider}/{model}");
+                    registry.set_engine(role, engine);
+                }
             }
-        }
-        if let Some(model) = reflection_model {
-            if let Ok(engine) = AnthropicEngine::from_best_available(&model, 4096) {
-                registry.set_engine(CognitiveRole::Reflection, Box::new(engine));
-                tracing::info!("Reflection engine: {model}");
-            }
-        }
-        if let Ok(engine) = AnthropicEngine::from_best_available(&reasoning_model, 4096) {
-            registry.set_engine(CognitiveRole::Reasoning, Box::new(engine));
         }
 
         registry

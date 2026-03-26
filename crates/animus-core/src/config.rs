@@ -412,11 +412,12 @@ impl Default for MnemosConfig {
 /// Configuration for the Cortex reasoning layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CortexConfig {
-    /// LLM provider name (e.g., "anthropic", "openai", "mock").
+    /// LLM provider name: "anthropic" | "ollama" | "openai" | "mock".
     pub llm_provider: String,
     /// Model identifier.
     /// With Claude Max OAuth: use "claude-haiku-4-5-20251001".
     /// With ANTHROPIC_API_KEY: any model works (e.g., "claude-sonnet-4-20250514").
+    /// For Ollama: use the model tag, e.g. "llama3.1:8b".
     pub model_id: String,
     /// API key for the LLM provider. Always read from env at runtime; never serialized.
     #[serde(skip)]
@@ -425,6 +426,10 @@ pub struct CortexConfig {
     pub max_response_tokens: usize,
     /// System prompt prepended to every reasoning call.
     pub system_prompt: String,
+    /// Base URL for OpenAI-compatible endpoint (ollama or openai provider).
+    /// Ollama default: "http://127.0.0.1:11434"
+    /// OpenAI default: "https://api.openai.com"
+    pub openai_base_url: String,
 }
 
 impl Default for CortexConfig {
@@ -435,6 +440,7 @@ impl Default for CortexConfig {
             api_key: None,
             max_response_tokens: 4096,
             system_prompt: String::new(),
+            openai_base_url: "http://127.0.0.1:11434".to_string(),
         }
     }
 }
@@ -693,6 +699,12 @@ impl AnimusConfig {
         }
         if let Ok(provider) = std::env::var("ANIMUS_LLM_PROVIDER") {
             self.cortex.llm_provider = provider;
+        }
+        if let Ok(url) = std::env::var("ANIMUS_OPENAI_BASE_URL") {
+            self.cortex.openai_base_url = url;
+        } else if let Ok(url) = std::env::var("ANIMUS_OLLAMA_URL") {
+            // ANIMUS_OLLAMA_URL doubles as the base URL for both embeddings and LLM.
+            self.cortex.openai_base_url = url;
         }
 
         // Health overrides
