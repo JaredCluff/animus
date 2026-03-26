@@ -12,6 +12,7 @@ use animus_core::AnimusIdentity;
 use animus_cortex::engine_registry::{CognitiveRole, EngineRegistry};
 use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::llm::openai_compat::OpenAICompatEngine;
+use animus_core::capability::CapabilityState;
 use animus_cortex::model_plan::ModelPlan;
 use animus_cortex::smart_router::SmartRouter;
 use animus_cortex::scheduler::ThreadScheduler;
@@ -419,7 +420,27 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let (federation_broadcast_tx, mut federation_broadcast_rx) =
         tokio::sync::mpsc::channel::<animus_core::identity::SegmentId>(32);
 
+    // ── Capability State (shared between CapabilityProbe and ToolContext) ────────
+    // Conservative default: MemoryOnly until the first probe cycle completes.
+    let capability_state = Arc::new(parking_lot::RwLock::new(CapabilityState::default()));
+
     // ── Watcher Registry ──────────────────────────────────────────────────────────
+    // Determine the probe endpoint for CapabilityProbe: use the Ollama URL if configured,
+    // or the Anthropic/OpenAI base URL otherwise.
+    let probe_url = if config.cortex.llm_provider.to_lowercase() == "ollama"
+        || config.cortex.openai_base_url.contains("11434")
+    {
+        if config.cortex.openai_base_url.is_empty() {
+            "http://localhost:11434".to_string()
+        } else {
+            config.cortex.openai_base_url.trim_end_matches('/').to_string()
+        }
+    } else if !config.cortex.openai_base_url.is_empty() {
+        config.cortex.openai_base_url.trim_end_matches('/').to_string()
+    } else {
+        "https://api.anthropic.com".to_string()
+    };
+
     let watcher_registry = animus_cortex::WatcherRegistry::new(
         vec![
             Box::new(animus_cortex::CommsWatcher),
@@ -429,12 +450,34 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             Box::new(animus_cortex::SensoriumHealthWatcher::new(
                 data_dir.join("sensorium-audit.jsonl"),
             )),
+            Box::new(animus_cortex::CapabilityProbe::new(
+                capability_state.clone(),
+                &probe_url,
+                config.cortex.model_id.clone(),
+                config.cortex.llm_provider.clone(),
+                store.clone() as Arc<dyn animus_vectorfs::VectorStore>,
+                embedder.clone(),
+            )),
         ],
         signal_tx.clone(),
         data_dir.join("watchers.json"),
     );
+    // Enable capability_probe by default — self-awareness is always on.
+    // Other watchers remain opt-in (manage_watcher tool enables them).
+    if !watcher_registry.get_config("capability_probe").enabled {
+        let _ = watcher_registry.update_config(
+            "capability_probe",
+            animus_cortex::WatcherConfig {
+                enabled: true,
+                interval: None,
+                params: serde_json::Value::Null,
+                last_checked: None,
+                last_fired: None,
+            },
+        );
+    }
     watcher_registry.start();
-    tracing::info!("Watcher registry started (3 watchers: comms, segment_pressure, sensorium_health)");
+    tracing::info!("Watcher registry started (4 watchers: comms, segment_pressure, sensorium_health, capability_probe)");
 
     // ── Model Plan + Smart Router ─────────────────────────────────────────────────
     // Animus builds and owns its own cognitive routing plan. The plan is persisted
@@ -532,6 +575,15 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         );
     }
 
+    // Log initial capability tier (conservative default until first probe cycle)
+    {
+        let state = capability_state.read();
+        tracing::info!(
+            "Initial cognitive tier: {} (will update after first probe cycle)",
+            state.tier.label()
+        );
+    }
+
     // ── Task Manager ──────────────────────────────────────────────────────────────
     let task_manager = TaskManager::new(
         signal_tx.clone(),
@@ -575,6 +627,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::propose_route_amendment::ProposeRouteAmendmentTool));
         reg.register(Box::new(animus_cortex::tools::get_classification_patterns::GetClassificationPatternsTool));
         reg.register(Box::new(animus_cortex::tools::update_classification_pattern::UpdateClassificationPatternTool));
+        reg.register(Box::new(animus_cortex::tools::get_capability_state::GetCapabilityStateTool));
         reg
     };
     let tool_definitions = tool_registry.definitions();
@@ -630,6 +683,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         nats_client: nats_publish_client.clone(),
         federation_tx: Some(federation_broadcast_tx.clone()),
         smart_router: smart_router.clone(),
+        capability_state: Some(capability_state.clone()),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 

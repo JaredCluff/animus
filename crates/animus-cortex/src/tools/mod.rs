@@ -27,6 +27,7 @@ pub mod get_route_stats;
 pub mod propose_route_amendment;
 pub mod get_classification_patterns;
 pub mod update_classification_pattern;
+pub mod get_capability_state;
 
 use crate::llm::ToolDefinition;
 use crate::task_manager::TaskManager;
@@ -34,6 +35,7 @@ use crate::telos::Autonomy;
 use crate::watcher::WatcherRegistry;
 use crate::perception::SelfEventFilter;
 use crate::smart_router::SmartRouter;
+use animus_core::capability::CapabilityState;
 use animus_core::{ApiTracker, EmbeddingService, Signal};
 use animus_core::identity::SegmentId;
 use animus_vectorfs::VectorStore;
@@ -74,6 +76,9 @@ pub struct ToolContext {
     /// Smart router — introspective tools use this to inspect/amend the model routing plan.
     /// None when model plan is not initialized or not yet built.
     pub smart_router: Option<SmartRouter>,
+    /// Capability state — introspective tool reads current cognitive tier and probe metrics.
+    /// None when capability probe is not initialized.
+    pub capability_state: Option<Arc<parking_lot::RwLock<CapabilityState>>>,
 }
 
 /// A tool the AILF can use to interact with the world.
