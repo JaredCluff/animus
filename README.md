@@ -275,9 +275,9 @@ animus/
 | Voice interface (STT + TTS, Telegram voice messages) | Complete |
 | Dynamic think-control (per-input thinking budget) | Complete |
 | Multi-LLM routing (Ollama, OpenAI-compatible, per-role overrides) | Complete |
-| Self-Configuring Model Plan + Smart Router | **Planned** |
-| Cognitive Tier system + CapabilityProbe | **Planned** |
-| Role-Capability Mesh (federated cognitive roles) | **Planned** |
+| Self-Configuring Model Plan + Smart Router | Complete |
+| Cognitive Tier system + CapabilityProbe | Complete |
+| Role-Capability Mesh (federated cognitive roles) | Complete |
 
 ## Building
 
