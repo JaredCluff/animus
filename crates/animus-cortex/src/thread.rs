@@ -25,9 +25,6 @@ pub struct ReasoningThread<S: VectorStore> {
     store: Arc<S>,
     /// Context assembler for building LLM context.
     assembler: ContextAssembler<S>,
-    /// Embedding dimensionality (for creating placeholder embeddings).
-    #[allow(dead_code)]
-    embedding_dim: usize,
     /// Current thread status.
     status: ThreadStatus,
     /// Pending inter-thread signals (inbox).
@@ -42,7 +39,6 @@ impl<S: VectorStore> ReasoningThread<S> {
         name: String,
         store: Arc<S>,
         token_budget: usize,
-        embedding_dim: usize,
     ) -> Self {
         let assembler = ContextAssembler::new(store.clone(), token_budget);
         Self {
@@ -53,7 +49,6 @@ impl<S: VectorStore> ReasoningThread<S> {
             bound_goals: Vec::new(),
             store,
             assembler,
-            embedding_dim,
             status: ThreadStatus::Active,
             pending_signals: Vec::new(),
             last_retrieved_ids: Vec::new(),

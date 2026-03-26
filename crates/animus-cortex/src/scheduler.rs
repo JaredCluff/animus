@@ -13,17 +13,15 @@ pub struct ThreadScheduler<S: VectorStore> {
     active_thread: Option<ThreadId>,
     store: Arc<S>,
     token_budget: usize,
-    embedding_dim: usize,
 }
 
 impl<S: VectorStore> ThreadScheduler<S> {
-    pub fn new(store: Arc<S>, token_budget: usize, embedding_dim: usize) -> Self {
+    pub fn new(store: Arc<S>, token_budget: usize) -> Self {
         Self {
             threads: HashMap::new(),
             active_thread: None,
             store,
             token_budget,
-            embedding_dim,
         }
     }
 
@@ -32,7 +30,6 @@ impl<S: VectorStore> ThreadScheduler<S> {
             name,
             self.store.clone(),
             self.token_budget,
-            self.embedding_dim,
         );
 
         let id = thread.id;

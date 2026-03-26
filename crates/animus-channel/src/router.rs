@@ -46,7 +46,24 @@ impl MessageRouter {
     pub async fn route(&self, mut msg: ChannelMessage) -> (ChannelMessage, RouteDecision) {
         // Step 1: Injection scan (skip for trusted senders with high trust)
         if !msg.sender.is_trusted {
-            let content = msg.text.clone().unwrap_or_default();
+            // Include text, image filenames, and attachment filenames in the scan.
+            // This prevents injection payloads embedded in captions or file names
+            // from bypassing the scanner by arriving in non-text fields.
+            let mut content_parts: Vec<String> = Vec::new();
+            if let Some(text) = &msg.text {
+                content_parts.push(text.clone());
+            }
+            for img in &msg.images {
+                if let Some(name) = img.file_name().and_then(|n| n.to_str()) {
+                    content_parts.push(name.to_string());
+                }
+            }
+            for att in &msg.attachments {
+                if let Some(name) = att.file_name().and_then(|n| n.to_str()) {
+                    content_parts.push(name.to_string());
+                }
+            }
+            let content = content_parts.join(" ");
             let scan = self.scanner.scan(&content, &msg.sender.channel_user_id).await;
             if matches!(scan, ScanResult::Injected { .. }) {
                 let confidence = if let ScanResult::Injected { confidence } = scan {

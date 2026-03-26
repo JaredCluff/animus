@@ -234,7 +234,7 @@ impl BurstState {
 fn format_burst_summary(events: &[SensorEvent]) -> String {
     let mut type_counts: HashMap<String, usize> = HashMap::new();
     let mut path_counts: HashMap<String, usize> = HashMap::new();
-    let mut unique_paths: Vec<String> = Vec::new();
+    let mut unique_paths_set: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for event in events {
         let type_key = format!("{:?}", event.event_type);
@@ -242,11 +242,10 @@ fn format_burst_summary(events: &[SensorEvent]) -> String {
 
         if let Some(path) = event.data.get("path").and_then(|v| v.as_str()) {
             *path_counts.entry(path.to_string()).or_insert(0) += 1;
-            if !unique_paths.contains(&path.to_string()) {
-                unique_paths.push(path.to_string());
-            }
+            unique_paths_set.insert(path.to_string());
         }
     }
+    let unique_paths: Vec<String> = unique_paths_set.into_iter().collect();
 
     let duration = if events.len() >= 2 {
         let first = events.first().unwrap().timestamp;

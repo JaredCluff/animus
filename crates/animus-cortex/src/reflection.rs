@@ -4,7 +4,7 @@ use animus_core::threading::{Signal, SignalPriority};
 use animus_core::EmbeddingService;
 use animus_vectorfs::VectorStore;
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -164,6 +164,7 @@ pub struct ReflectionLoop<S: VectorStore> {
     pub(crate) last_cycle: DateTime<Utc>,
     pub(crate) last_segment_count: usize,
     signaled_contradictions: HashSet<(SegmentId, SegmentId)>,
+    signaled_contradictions_order: VecDeque<(SegmentId, SegmentId)>,
     /// Stable identity for this loop, used as signal source.
     source_id: ThreadId,
 }
@@ -188,6 +189,7 @@ impl<S: VectorStore> ReflectionLoop<S> {
             last_cycle: Utc::now(),
             last_segment_count,
             signaled_contradictions: HashSet::new(),
+            signaled_contradictions_order: VecDeque::new(),
             source_id: ThreadId::new(),
         }
     }
@@ -305,19 +307,17 @@ impl<S: VectorStore> ReflectionLoop<S> {
                 continue;
             }
             // Cap the deduplication set to prevent unbounded growth in long sessions.
-            // When full, evict ~10% of entries so we don't evict on every insert.
+            // Evict the oldest entries (FIFO) when the cap is reached.
             const MAX_SIGNALED_CONTRADICTIONS: usize = 10_000;
-            if self.signaled_contradictions.len() >= MAX_SIGNALED_CONTRADICTIONS {
-                let to_remove: Vec<_> = self.signaled_contradictions
-                    .iter()
-                    .take(MAX_SIGNALED_CONTRADICTIONS / 10)
-                    .cloned()
-                    .collect();
-                for k in to_remove {
-                    self.signaled_contradictions.remove(&k);
+            while self.signaled_contradictions.len() >= MAX_SIGNALED_CONTRADICTIONS {
+                if let Some(oldest) = self.signaled_contradictions_order.pop_front() {
+                    self.signaled_contradictions.remove(&oldest);
+                } else {
+                    break;
                 }
             }
             self.signaled_contradictions.insert(pair);
+            self.signaled_contradictions_order.push_back(pair);
 
             let sig = Signal {
                 source_thread: self.source_id,

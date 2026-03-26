@@ -537,7 +537,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
     // Initialize thread scheduler
     let token_budget = 8000;
-    let mut scheduler = ThreadScheduler::new(store.clone(), token_budget, dimensionality);
+    let mut scheduler = ThreadScheduler::new(store.clone(), token_budget);
     let _main_thread_id = scheduler.create_thread("main".to_string());
 
     // Initialize federation

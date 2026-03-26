@@ -8,7 +8,7 @@ use tempfile::TempDir;
 fn make_scheduler() -> (ThreadScheduler<MmapVectorStore>, TempDir) {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(MmapVectorStore::open(&dir.path().join("vfs"), 128).unwrap());
-    let scheduler = ThreadScheduler::new(store, 8000, 128);
+    let scheduler = ThreadScheduler::new(store, 8000);
     (scheduler, dir)
 }
 
