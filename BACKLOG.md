@@ -71,35 +71,67 @@ Tracks what's been shipped and what's next. Organized by layer from the design s
 
 ### Medium Priority
 
-**Smart Model Router + Think Budget Engine** *(2026-03-26)*
+**Self-Configuring Model Plan + Smart Router** *(2026-03-26 — Animus is in charge of Animus)*
 
-A provider-agnostic layer that sits between the runtime and the engine registry:
+Animus builds and owns its own cognitive routing plan — not hardcoded by humans, but decided by Animus at startup using its own model knowledge. One-and-done: plan is built once, persisted, reused until config changes or failure forces a rebuild.
 
-*Think Budget Engine*
-- Extend current `needs_thinking` bool → `ThinkLevel { Off | Minimal(budget) | Full(budget) }`
-- Per-provider application: Anthropic uses `thinking: {type: "enabled", budget_tokens: N}` in request; Qwen/Ollama uses `/no_think` prefix (Off) or no prefix (Minimal/Full); others ignored
-- Budget scales with task complexity (short chat = 0, deep analysis = 8k+)
+*Plan Building (on startup or config change)*
+1. Discover available models: query Ollama `/api/tags`, check Anthropic/OpenAI key presence
+2. Compute a config hash; if saved plan matches hash → load and use it
+3. If no saved plan or hash mismatch: Animus asks itself (via whatever engine is available):
+   > "Given these available models and their known capabilities, assign each to task categories and define fallback chains. For any model you don't recognize, reason from its name/size/family."
+4. LLM returns a structured JSON plan; validate and persist to `animus-data/model_plan.json`
 
-*Task Classifier*
-- Classify inputs: `Conversational | Technical | Analytical | Creative | ToolExecution`
-- Used by both the think budget engine and the model router
+*ModelPlan (persisted)*
+```json
+{
+  "id": "uuid",
+  "created": "...",
+  "config_hash": "sha256 of available models",
+  "routes": {
+    "Conversational": {
+      "primary": {"provider": "ollama", "model": "qwen3.5:9b", "think": "off"},
+      "fallbacks": [{"provider": "ollama", "model": "qwen3.5:4b", "think": "off"}]
+    },
+    "Analytical": {
+      "primary": {"provider": "anthropic", "model": "claude-opus-4-6", "think": "full:8000"},
+      "fallbacks": [
+        {"provider": "ollama", "model": "qwen3.5:35b", "think": "dynamic"},
+        {"provider": "ollama", "model": "qwen3.5:9b", "think": "dynamic"}
+      ]
+    },
+    "Technical": { ... },
+    "Creative": { ... },
+    "ToolExecution": { ... }
+  }
+}
+```
 
-*Model Registry*
-- Models tagged with: task strengths, provider, think-control mechanism, cost tier
-- Config-driven (TOML/env); built-in defaults per provider
+*Think Budget Engine (layered on top)*
+- `ThinkLevel { Off | Dynamic | Minimal(tokens) | Full(tokens) }`
+- Applied per-provider: Anthropic → `thinking:{budget_tokens:N}`; Qwen → `/no_think` or absence; others ignored
+- "Dynamic" = use current `needs_thinking()` heuristic at call time
 
-*Smart Router*
-- For a classified task: select top model from registry for that task type
-- Apply appropriate think policy for the selected model+provider
-- Failure/timeout → fall back to next model in chain
-- Continue down chain until no models remain, then error
+*Smart Router (runtime)*
+- Classifies incoming input → `TaskClass`
+- Selects primary model from plan for that class
+- Applies think policy for the selected provider+model
+- On failure/timeout: records failure, tries next fallback in chain
+- After N consecutive failures on a route → marks route degraded, triggers async plan rebuild with remaining models
+- If all models in a chain fail → surface error + notify user
 
-*Fallback Chain example*:
-- `Analytical`: [claude-opus-4-6, qwen3.5:35b, qwen3.5:9b]
-- `Conversational`: [qwen3.5:9b, qwen3.5:4b, claude-haiku-4-5]
-- `Technical`: [claude-opus-4-6, qwen3.5:35b]
+*Plan Rebuild Triggers*
+- Startup with no saved plan
+- Config change detected (new ANIMUS_OLLAMA_URL, new API key, model added/removed)
+- Manual: `/plan rebuild` command
+- Auto: route failure rate exceeds threshold
 
-Foundation already in place: `supports_think_control()` engine flag, `needs_thinking()` heuristic, `ReasoningEngine` trait, `EngineRegistry` per-role dispatch.
+*Animus guidance*
+- Animus uses its built-in knowledge of model families (Claude, Qwen, Llama, Mistral, etc.)
+- For unknown models: infers from name/size (e.g., "deepseek-r1:70b" → likely strong for analytical)
+- Optional: web search tool to look up model benchmarks before deciding
+
+Foundation already in place: `supports_think_control()` flag, `needs_thinking()` heuristic, `ReasoningEngine` trait, `EngineRegistry` per-role dispatch, Ollama model listing.
 
 **Inter-thread signaling (formal)**
 - Typed Signal messages: Info / Normal / Urgent priorities
