@@ -196,9 +196,11 @@ if near_limit {
 }
 ```
 
-**Important:** SmartRouter does NOT write `near_limit_notified`. Writing the flag is exclusively the responsibility of `AnthropicEngine::reason()` (Layer 1). The SmartRouter only reads the flag to decide whether to send a Signal.
+**Flag write ownership (split by operation):**
+- `SmartRouter` sets `near_limit_notified = true` when it fires the Signal (it is the one firing, so it owns the "arm" operation)
+- `AnthropicEngine::reason()` resets `near_limit_notified = false` when capacity recovers (it is the one observing header data, so it owns the "reset" operation)
 
-**Single lock acquisition:** Acquire the `rate_limit_states` Mutex exactly once per routing decision. Read both `is_near_limit()` and `near_limit_notified` from the same lock guard, then drop the lock before calling `try_send`. Do not re-acquire the lock between reading the two values — a concurrent `reason()` call could update state between two separate acquisitions, causing a TOCTOU window where `near_limit_notified` appears stale relative to the threshold check.
+**Single lock acquisition:** Acquire the `rate_limit_states` Mutex exactly once per routing decision. Use a **write lock** on the inner `RwLock<RateLimitState>` so that reading `is_near_limit()` + `near_limit_notified` and setting `near_limit_notified = true` are atomic within the same lock guard. Drop all locks before calling `try_send`. This eliminates any TOCTOU window between reading and writing the flag.
 
 **Constant reuse:** Import `RATE_LIMIT_NEAR_THRESHOLD` from `animus_core::rate_limit`.
 
