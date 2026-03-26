@@ -1,12 +1,25 @@
 //! Smart Router — routes AILF reasoning turns to the appropriate model.
 //!
 //! The router consults the `ModelPlan` to classify each input and select the best engine.
-//! Route health is tracked in Layer 1 (no LLM). Degradation fires a single Signal (Layer 3).
+//! Route health and rate limit state are tracked in Layer 1 (no LLM). Changes fire a
+//! single Signal (Layer 3).
+//!
+//! # Three-layer routing decisions
+//!
+//! Two independent conditions can cause the router to skip the primary model:
+//!
+//! 1. **Health degradation** — primary has `>= 3` consecutive failures (existing behavior).
+//! 2. **Rate limit proximity** — primary's remaining capacity is below [`RATE_LIMIT_NEAR_THRESHOLD`]
+//!    (10% of limit). One `Normal` Signal fires on the first crossing per window.
+//!
+//! Both conditions fall back through `route.fallbacks` in order.
 //!
 //! # Thread-local stability
 //! The router is consulted **at thread start**, not per-turn. Once a thread selects a model,
 //! it uses that model for all subsequent turns unless the model fails. This preserves
 //! reasoning continuity within a conversation.
+//!
+//! [`RATE_LIMIT_NEAR_THRESHOLD`]: animus_core::RATE_LIMIT_NEAR_THRESHOLD
 
 use crate::model_plan::{HeuristicClassifier, ModelPlan, ModelSpec, RouteStats};
 use animus_core::identity::ThreadId;
@@ -65,7 +78,7 @@ pub struct SmartRouter {
     signal_tx: mpsc::Sender<Signal>,
     source_id: ThreadId,
     /// Per-model rate limit state handles — populated by register_rate_limit_state().
-    rate_limit_states: Arc<Mutex<HashMap<String, std::sync::Arc<parking_lot::RwLock<animus_core::RateLimitState>>>>>,
+    rate_limit_states: Arc<Mutex<HashMap<String, Arc<parking_lot::RwLock<animus_core::RateLimitState>>>>>,
 }
 
 impl SmartRouter {
@@ -343,7 +356,7 @@ impl SmartRouter {
     pub fn register_rate_limit_state(
         &self,
         model_name: &str,
-        state: std::sync::Arc<parking_lot::RwLock<animus_core::RateLimitState>>,
+        state: Arc<parking_lot::RwLock<animus_core::RateLimitState>>,
     ) {
         self.rate_limit_states.lock().insert(model_name.to_string(), state);
     }
@@ -371,8 +384,8 @@ mod tests {
     use animus_core::rate_limit::RateLimitState;
     use parking_lot::RwLock as ParkingRwLock;
 
-    fn make_near_limit_state() -> std::sync::Arc<ParkingRwLock<RateLimitState>> {
-        std::sync::Arc::new(ParkingRwLock::new(RateLimitState {
+    fn make_near_limit_state() -> Arc<ParkingRwLock<RateLimitState>> {
+        Arc::new(ParkingRwLock::new(RateLimitState {
             requests_limit: Some(1000),
             requests_remaining: Some(50), // 5% — near limit
             near_limit_notified: false,
@@ -380,8 +393,8 @@ mod tests {
         }))
     }
 
-    fn make_ok_state() -> std::sync::Arc<ParkingRwLock<RateLimitState>> {
-        std::sync::Arc::new(ParkingRwLock::new(RateLimitState {
+    fn make_ok_state() -> Arc<ParkingRwLock<RateLimitState>> {
+        Arc::new(ParkingRwLock::new(RateLimitState {
             requests_limit: Some(1000),
             requests_remaining: Some(500), // 50% — fine
             near_limit_notified: false,
@@ -389,14 +402,24 @@ mod tests {
         }))
     }
 
+    fn make_router() -> (SmartRouter, mpsc::Receiver<Signal>) {
+        let plan = ModelPlan::default_plan(&[
+            "ollama:qwen3.5:35b".to_string(),
+            "ollama:qwen3.5:9b".to_string(),
+        ]);
+        let plan_arc = Arc::new(RwLock::new(plan));
+        let (tx, rx) = mpsc::channel(32);
+        let router = SmartRouter::new(plan_arc, tx);
+        (router, rx)
+    }
+
     #[tokio::test]
-    async fn register_rate_limit_state_stores_handle() {
+    async fn routes_to_primary_when_rate_limit_is_ok() {
         let (router, _rx) = make_router();
-        let state = make_ok_state();
-        // Analytical primary is "ollama:qwen3.5:35b" in the test plan
-        router.register_rate_limit_state("ollama:qwen3.5:35b", state.clone());
-        // verify it doesn't panic and the map has an entry
-        // (no public accessor — test via routing behavior below)
+        // Register primary with healthy (50%) remaining capacity
+        router.register_rate_limit_state("ollama:qwen3.5:35b", make_ok_state());
+        let decision = router.select_for_class("Analytical").await;
+        assert_eq!(decision.fallback_index, 0, "should use primary when rate limit is healthy");
     }
 
     #[tokio::test]
@@ -416,36 +439,31 @@ mod tests {
         let state = make_near_limit_state();
         router.register_rate_limit_state("ollama:qwen3.5:35b", state);
         router.select_for_class("Analytical").await;
-        // Signal should have been sent
-        let signal = rx.try_recv();
-        assert!(signal.is_ok(), "expected a Signal to be fired");
-        assert_eq!(signal.unwrap().priority, SignalPriority::Normal);
+        // Signal should have been sent with the right priority and content
+        let signal = rx.try_recv().expect("expected a Signal to be fired");
+        assert_eq!(signal.priority, SignalPriority::Normal);
+        assert!(
+            signal.summary.contains("Rate limit near"),
+            "signal summary should describe the near-limit condition, got: {}",
+            signal.summary
+        );
     }
 
     #[tokio::test]
     async fn does_not_fire_duplicate_signal_when_already_notified() {
         let (router, mut rx) = make_router();
-        let state = std::sync::Arc::new(ParkingRwLock::new(RateLimitState {
+        let state = Arc::new(ParkingRwLock::new(RateLimitState {
             requests_limit: Some(1000),
             requests_remaining: Some(50),
             near_limit_notified: true, // already fired — flag was set by a prior routing call
             ..Default::default()
         }));
         router.register_rate_limit_state("ollama:qwen3.5:35b", state);
-        router.select_for_class("Analytical").await;
-        // No new Signal
+        let decision = router.select_for_class("Analytical").await;
+        // No new Signal (flag was already set)
         assert!(rx.try_recv().is_err(), "should not fire duplicate Signal");
-    }
-
-    fn make_router() -> (SmartRouter, mpsc::Receiver<Signal>) {
-        let plan = ModelPlan::default_plan(&[
-            "ollama:qwen3.5:35b".to_string(),
-            "ollama:qwen3.5:9b".to_string(),
-        ]);
-        let plan_arc = Arc::new(RwLock::new(plan));
-        let (tx, rx) = mpsc::channel(32);
-        let router = SmartRouter::new(plan_arc, tx);
-        (router, rx)
+        // But routing must still avoid the primary — signaling and routing are independent
+        assert!(decision.fallback_index > 0, "should still route to fallback when near-limit, even if no new signal fired");
     }
 
     #[tokio::test]

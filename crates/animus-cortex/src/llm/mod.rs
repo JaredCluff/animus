@@ -5,6 +5,7 @@ pub use openai_compat::OpenAICompatEngine;
 
 use animus_core::error::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Content within a single conversation turn.
@@ -115,7 +116,7 @@ pub trait ReasoningEngine: Send + Sync {
 
     /// Return a handle to the provider's current rate limit state, if tracked.
     /// Default: None (providers that don't track rate limits need no changes).
-    fn rate_limit_state(&self) -> Option<std::sync::Arc<parking_lot::RwLock<animus_core::RateLimitState>>> {
+    fn rate_limit_state(&self) -> Option<Arc<parking_lot::RwLock<animus_core::RateLimitState>>> {
         None
     }
 
