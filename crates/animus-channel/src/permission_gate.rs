@@ -141,6 +141,17 @@ impl PermissionGate {
                         if msg.channel_id != "telegram" {
                             continue;
                         }
+                        // Only accept approval from the configured trusted chat_id.
+                        // This prevents any random Telegram user from approving escalations.
+                        if let Some(trusted_id) = gate2.telegram_chat_id {
+                            if msg.thread_id != trusted_id.to_string() {
+                                tracing::warn!(
+                                    "PermissionGate: approval attempt from untrusted chat {} — ignoring",
+                                    msg.thread_id
+                                );
+                                continue;
+                            }
+                        }
                         let text = match &msg.text {
                             Some(t) => t.trim().to_lowercase(),
                             None => continue,
@@ -325,10 +336,10 @@ impl PermissionGate {
 
         match result {
             Ok(Ok(true)) => {
-                self.send_approval(reply_inbox, "approved by Jared via Telegram").await;
+                self.send_approval(reply_inbox, "approved via Telegram").await;
             }
             Ok(Ok(false)) => {
-                self.send_denial(reply_inbox, "denied by Jared via Telegram").await;
+                self.send_denial(reply_inbox, "denied via Telegram").await;
             }
             Ok(Err(_)) => {
                 // Sender dropped (shouldn't happen)

@@ -112,6 +112,17 @@ pub struct NatsChannelConfig {
     pub subjects: Vec<String>,
     /// Subject prefix for outbound replies (e.g. "animus.out").
     pub reply_prefix: String,
+    /// Subject prefixes whose publishers are granted `is_trusted = true`.
+    /// Only publishers on subjects matching these prefixes bypass heavy injection scanning.
+    /// For proper security, configure NATS server auth; this is an additional layer.
+    #[serde(default = "NatsChannelConfig::default_trusted_prefixes")]
+    pub trusted_subject_prefixes: Vec<String>,
+}
+
+impl NatsChannelConfig {
+    fn default_trusted_prefixes() -> Vec<String> {
+        vec!["animus.in.".to_string()]
+    }
 }
 
 impl Default for NatsChannelConfig {
@@ -121,6 +132,7 @@ impl Default for NatsChannelConfig {
             url: "nats://localhost:4222".to_string(),
             subjects: vec!["animus.in.>".to_string()],
             reply_prefix: "animus.out".to_string(),
+            trusted_subject_prefixes: Self::default_trusted_prefixes(),
         }
     }
 }

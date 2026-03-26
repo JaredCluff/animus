@@ -12,6 +12,77 @@ use crate::telos::Autonomy;
 
 pub struct HttpFetchTool;
 
+/// Returns an error string if the URL is disallowed (SSRF protection).
+///
+/// Blocked:
+/// - Non-HTTP(S) schemes
+/// - Loopback addresses (127.x, ::1)
+/// - Link-local / APIPA (169.254.x.x, fe80::)
+/// - Private RFC-1918 ranges (10.x, 172.16-31.x, 192.168.x)
+/// - Cloud metadata endpoints (169.254.169.254, metadata.google.internal, etc.)
+fn check_url_allowed(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        s => return Err(format!("scheme '{s}' is not allowed — use http or https")),
+    }
+
+    let host = parsed.host_str().ok_or("URL has no host")?;
+
+    // Deny well-known metadata hostnames
+    let blocked_hostnames = [
+        "metadata.google.internal",
+        "metadata.goog",
+        "169.254.169.254",
+        "instance-data",
+    ];
+    if blocked_hostnames.iter().any(|&h| host.eq_ignore_ascii_case(h)) {
+        return Err(format!("host '{host}' is blocked (cloud metadata endpoint)"));
+    }
+
+    // For IP addresses, deny private/loopback/link-local ranges
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            return Err(format!("loopback address '{ip}' is not allowed"));
+        }
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                // 169.254.0.0/16 link-local (APIPA, cloud metadata)
+                if octets[0] == 169 && octets[1] == 254 {
+                    return Err(format!("link-local address '{ip}' is not allowed"));
+                }
+                // 10.0.0.0/8
+                if octets[0] == 10 {
+                    return Err(format!("private address '{ip}' is not allowed"));
+                }
+                // 172.16.0.0/12
+                if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                    return Err(format!("private address '{ip}' is not allowed"));
+                }
+                // 192.168.0.0/16
+                if octets[0] == 192 && octets[1] == 168 {
+                    return Err(format!("private address '{ip}' is not allowed"));
+                }
+                // 100.64.0.0/10 (shared address space / Tailscale/VPN)
+                if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+                    return Err(format!("shared/carrier-grade NAT address '{ip}' is not allowed"));
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                let segments = v6.segments();
+                // fc00::/7 (unique local)
+                if (segments[0] & 0xfe00) == 0xfc00 {
+                    return Err(format!("unique-local IPv6 address '{ip}' is not allowed"));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Tool for HttpFetchTool {
     fn name(&self) -> &str {
@@ -70,6 +141,11 @@ impl Tool for HttpFetchTool {
             .as_str()
             .ok_or("missing url parameter")?
             .to_string();
+
+        // SSRF protection: block private/loopback/metadata URLs
+        if let Err(reason) = check_url_allowed(&url) {
+            return Ok(ToolResult { content: format!("Blocked: {reason}"), is_error: true });
+        }
 
         let method = params["method"].as_str().unwrap_or("GET").to_uppercase();
         let max_chars = params["max_chars"].as_u64().unwrap_or(8000) as usize;

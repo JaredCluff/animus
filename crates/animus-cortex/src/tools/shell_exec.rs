@@ -7,8 +7,11 @@ const TIMEOUT_SECS: u64 = 30;
 /// targeting data_dir or snapshot_dir. This is a heuristic guardrail — not a
 /// security boundary — to prevent accidental memory self-wipe.
 fn targets_protected_path(command: &str, ctx: &ToolContext) -> bool {
-    let data_str = ctx.data_dir.to_string_lossy();
-    let snap_str = ctx.snapshot_dir.to_string_lossy();
+    // Canonicalize protected paths so symlinks/relative segments can't bypass the check.
+    let data_canonical = std::fs::canonicalize(&ctx.data_dir).unwrap_or_else(|_| ctx.data_dir.clone());
+    let snap_canonical = std::fs::canonicalize(&ctx.snapshot_dir).unwrap_or_else(|_| ctx.snapshot_dir.clone());
+    let data_str = data_canonical.to_string_lossy();
+    let snap_str = snap_canonical.to_string_lossy();
 
     // Does the command mention a protected path?
     let mentions_data = command.contains(data_str.as_ref());

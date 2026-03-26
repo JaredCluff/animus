@@ -3,7 +3,8 @@ use super::{Tool, ToolResult, ToolContext};
 
 pub struct WriteFileTool;
 
-/// Reject paths that are relative or contain parent-directory traversal.
+/// Reject paths that are relative, contain parent-directory traversal, or resolve
+/// via symlink to a location that could bypass intended restrictions.
 fn validate_path(path: &str) -> Result<std::path::PathBuf, String> {
     use std::path::{Component, Path};
     let p = Path::new(path);
@@ -12,6 +13,14 @@ fn validate_path(path: &str) -> Result<std::path::PathBuf, String> {
     }
     if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("path traversal not allowed".to_string());
+    }
+    // Resolve symlinks on the parent directory so we catch symlinks that escape
+    // allowed directories even when the target file doesn't exist yet.
+    if let Some(parent) = p.parent() {
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            let file_name = p.file_name().ok_or("path has no file name")?;
+            return Ok(canonical_parent.join(file_name));
+        }
     }
     Ok(p.to_path_buf())
 }

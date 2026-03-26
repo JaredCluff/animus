@@ -18,6 +18,7 @@ chrono = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
+url = "2"
 base64 = { workspace = true }
 async-nats = { workspace = true }
 futures = { workspace = true }

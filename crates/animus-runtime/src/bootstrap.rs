@@ -90,7 +90,7 @@ pub async fn run_if_needed<S>(
 
     let telegram_status = if telegram_configured {
         format!(
-            "Telegram channel is active. Trusted user IDs: {}. Jared's primary Telegram ID is 8593276557.",
+            "Telegram channel is active. Trusted user IDs: {}.",
             if trusted_telegram_ids.is_empty() { "none configured" } else { trusted_telegram_ids }
         )
     } else {
@@ -203,10 +203,10 @@ pub async fn run_if_needed<S>(
 
     tracing::info!("Bootstrap: stored {stored} segments ({failed} failed)");
 
-    if failed == 0 || stored > 0 {
+    if failed == 0 {
         mark_complete(data_dir, model_id);
         tracing::info!("Bootstrap: complete");
     } else {
-        tracing::warn!("Bootstrap: all segments failed — will retry next startup");
+        tracing::warn!("Bootstrap: {failed} segment(s) failed — will retry next startup");
     }
 }
