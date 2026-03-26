@@ -1,7 +1,8 @@
 use animus_core::error::{AnimusError, Result};
+use animus_core::rate_limit::{RateLimitState, RATE_LIMIT_NEAR_THRESHOLD};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use super::{ReasoningEngine, ReasoningOutput, Role, StopReason, ToolCall, ToolDefinition, Turn, TurnContent};
 
@@ -154,6 +155,7 @@ pub struct AnthropicEngine {
     auth: Auth,
     model: String,
     max_tokens: usize,
+    rate_limit_state: Arc<parking_lot::RwLock<RateLimitState>>,
 }
 
 impl AnthropicEngine {
@@ -167,6 +169,7 @@ impl AnthropicEngine {
             auth: Auth::ApiKey(api_key),
             model,
             max_tokens,
+            rate_limit_state: Arc::new(parking_lot::RwLock::new(RateLimitState::default())),
         }
     }
 
@@ -181,6 +184,7 @@ impl AnthropicEngine {
             auth: Auth::OAuth(token),
             model,
             max_tokens,
+            rate_limit_state: Arc::new(parking_lot::RwLock::new(RateLimitState::default())),
         }
     }
 
@@ -195,6 +199,7 @@ impl AnthropicEngine {
             auth: Auth::ClaudeCode,
             model: model.to_string(),
             max_tokens,
+            rate_limit_state: Arc::new(parking_lot::RwLock::new(RateLimitState::default())),
         }
     }
 
@@ -348,6 +353,26 @@ fn build_api_message(turn: &Turn) -> serde_json::Value {
     })
 }
 
+fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> RateLimitState {
+    fn get_u32(headers: &reqwest::header::HeaderMap, key: &str) -> Option<u32> {
+        headers.get(key)?.to_str().ok()?.parse().ok()
+    }
+    fn get_datetime(headers: &reqwest::header::HeaderMap, key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        let s = headers.get(key)?.to_str().ok()?;
+        chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&chrono::Utc))
+    }
+    RateLimitState {
+        requests_limit: get_u32(headers, "anthropic-ratelimit-requests-limit"),
+        requests_remaining: get_u32(headers, "anthropic-ratelimit-requests-remaining"),
+        requests_reset: get_datetime(headers, "anthropic-ratelimit-requests-reset"),
+        tokens_limit: get_u32(headers, "anthropic-ratelimit-tokens-limit"),
+        tokens_remaining: get_u32(headers, "anthropic-ratelimit-tokens-remaining"),
+        tokens_reset: get_datetime(headers, "anthropic-ratelimit-tokens-reset"),
+        last_updated: chrono::Utc::now(),
+        near_limit_notified: false, // always false from parsing; caller preserves existing value
+    }
+}
+
 #[async_trait]
 impl ReasoningEngine for AnthropicEngine {
     async fn reason(
@@ -405,6 +430,7 @@ impl ReasoningEngine for AnthropicEngine {
             .map_err(|e| AnimusError::Llm(format!("HTTP request failed: {e}")))?;
 
         let status = response.status();
+        let response_headers = response.headers().clone(); // save BEFORE consuming body
         let body = response
             .text()
             .await
@@ -426,6 +452,14 @@ impl ReasoningEngine for AnthropicEngine {
                 &body[..body.len().min(500)]
             ))
         })?;
+
+        // Layer 1: update rate limit state from response headers (no LLM).
+        // apply_update() preserves near_limit_notified correctly — see RateLimitState docs.
+        {
+            let parsed = parse_rate_limit_headers(&response_headers);
+            let mut state = self.rate_limit_state.write();
+            *state = parsed.apply_update(state.near_limit_notified, RATE_LIMIT_NEAR_THRESHOLD);
+        }
 
         let content = api_response
             .content
@@ -467,6 +501,10 @@ impl ReasoningEngine for AnthropicEngine {
             tool_calls,
             stop_reason,
         })
+    }
+
+    fn rate_limit_state(&self) -> Option<Arc<parking_lot::RwLock<RateLimitState>>> {
+        Some(self.rate_limit_state.clone())
     }
 
     fn context_limit(&self) -> usize {
@@ -552,4 +590,78 @@ mod tests {
         let msg = build_api_message(&turn);
         assert_eq!(msg["role"], "user");
     }
+
+    // --- rate limit header parsing tests ---
+
+    fn make_headers(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                reqwest::header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn parse_rate_limit_headers_extracts_all_fields() {
+        let headers = make_headers(&[
+            ("anthropic-ratelimit-requests-limit", "1000"),
+            ("anthropic-ratelimit-requests-remaining", "950"),
+            ("anthropic-ratelimit-requests-reset", "2026-03-26T13:00:00Z"),
+            ("anthropic-ratelimit-tokens-limit", "100000"),
+            ("anthropic-ratelimit-tokens-remaining", "90000"),
+            ("anthropic-ratelimit-tokens-reset", "2026-03-26T13:00:00Z"),
+        ]);
+        let state = parse_rate_limit_headers(&headers);
+        assert_eq!(state.requests_limit, Some(1000));
+        assert_eq!(state.requests_remaining, Some(950));
+        assert!(state.requests_reset.is_some());
+        assert_eq!(state.tokens_limit, Some(100_000));
+        assert_eq!(state.tokens_remaining, Some(90_000));
+        assert!(state.tokens_reset.is_some());
+        assert!(!state.near_limit_notified);
+    }
+
+    #[test]
+    fn parse_rate_limit_headers_handles_missing_headers() {
+        let headers = make_headers(&[]);
+        let state = parse_rate_limit_headers(&headers);
+        assert!(state.requests_limit.is_none());
+        assert!(state.requests_remaining.is_none());
+        assert!(state.tokens_limit.is_none());
+        assert!(state.tokens_remaining.is_none());
+        assert!(!state.near_limit_notified);
+    }
+
+    #[test]
+    fn parse_rate_limit_headers_handles_malformed_values() {
+        let headers = make_headers(&[
+            ("anthropic-ratelimit-requests-limit", "not-a-number"),
+            ("anthropic-ratelimit-tokens-remaining", ""),
+        ]);
+        let state = parse_rate_limit_headers(&headers);
+        // Malformed → None, not a panic
+        assert!(state.requests_limit.is_none());
+        assert!(state.tokens_remaining.is_none());
+    }
+
+    #[test]
+    fn rate_limit_state_returns_some() {
+        // AnthropicEngine should expose its rate limit state handle
+        let engine = AnthropicEngine::new("fake-key".to_string(), "claude-3-5-haiku-20241022".to_string(), 1024);
+        assert!(engine.rate_limit_state().is_some());
+    }
+
+    #[test]
+    fn rate_limit_state_default_has_no_data() {
+        let engine = AnthropicEngine::new("fake-key".to_string(), "claude-3-5-haiku-20241022".to_string(), 1024);
+        let state = engine.rate_limit_state().unwrap();
+        let s = state.read();
+        assert!(s.requests_limit.is_none());
+        assert!(s.tokens_limit.is_none());
+        assert!(!s.near_limit_notified);
+    }
+
 }

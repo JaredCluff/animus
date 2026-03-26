@@ -5,6 +5,7 @@ pub use openai_compat::OpenAICompatEngine;
 
 use animus_core::error::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Content within a single conversation turn.
@@ -112,6 +113,12 @@ pub trait ReasoningEngine: Send + Sync {
 
     /// Get the model identifier.
     fn model_name(&self) -> &str;
+
+    /// Return a handle to the provider's current rate limit state, if tracked.
+    /// Default: None (providers that don't track rate limits need no changes).
+    fn rate_limit_state(&self) -> Option<Arc<parking_lot::RwLock<animus_core::RateLimitState>>> {
+        None
+    }
 
     /// Whether this engine supports the `/no_think` prefix for suppressing
     /// extended internal reasoning (Qwen3-style thinking models).

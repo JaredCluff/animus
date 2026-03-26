@@ -570,6 +570,30 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         Some(SmartRouter::new(plan_arc, signal_tx.clone()))
     };
 
+    // Register rate limit state for all engines with SmartRouter.
+    // rate_limit_state() returns Some(_) only for AnthropicEngine; all others return None and are skipped.
+    // INVARIANT: engine.model_name() must match the ModelSpec.model string stored in the plan for
+    // the rate limit lookup in SmartRouter::select_for_class() to find the registered state.
+    // LLM-built plans use the short model name (e.g. "claude-opus-4-6"); the default rule-based
+    // plan uses the full provider-prefixed string (e.g. "anthropic:claude-opus-4-6"). If a mismatch
+    // occurs, rate-limit routing silently falls back to the primary — no data loss, just no rerouting.
+    if let Some(ref router) = smart_router {
+        let all_engines: &[&dyn animus_cortex::ReasoningEngine] = &[
+            engine_registry.fallback(),
+            engine_registry.engine_for(CognitiveRole::Perception),
+            engine_registry.engine_for(CognitiveRole::Reflection),
+            engine_registry.engine_for(CognitiveRole::Reasoning),
+        ];
+        let mut registered = 0usize;
+        for engine in all_engines {
+            if let Some(rl_state) = engine.rate_limit_state() {
+                router.register_rate_limit_state(engine.model_name(), rl_state);
+                registered += 1;
+            }
+        }
+        tracing::info!("SmartRouter: registered rate limit state for {registered} engine(s)");
+    }
+
     if let Some(ref router) = smart_router {
         let plan = router.plan();
         let plan = plan.try_read().expect("plan readable at startup");

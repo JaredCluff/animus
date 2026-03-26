@@ -1,12 +1,25 @@
 //! Smart Router — routes AILF reasoning turns to the appropriate model.
 //!
 //! The router consults the `ModelPlan` to classify each input and select the best engine.
-//! Route health is tracked in Layer 1 (no LLM). Degradation fires a single Signal (Layer 3).
+//! Route health and rate limit state are tracked in Layer 1 (no LLM). Changes fire a
+//! single Signal (Layer 3).
+//!
+//! # Three-layer routing decisions
+//!
+//! Two independent conditions can cause the router to skip the primary model:
+//!
+//! 1. **Health degradation** — primary has `>= 3` consecutive failures (existing behavior).
+//! 2. **Rate limit proximity** — primary's remaining capacity is below [`RATE_LIMIT_NEAR_THRESHOLD`]
+//!    (10% of limit). One `Normal` Signal fires on the first crossing per window.
+//!
+//! Both conditions fall back through `route.fallbacks` in order.
 //!
 //! # Thread-local stability
 //! The router is consulted **at thread start**, not per-turn. Once a thread selects a model,
 //! it uses that model for all subsequent turns unless the model fails. This preserves
 //! reasoning continuity within a conversation.
+//!
+//! [`RATE_LIMIT_NEAR_THRESHOLD`]: animus_core::RATE_LIMIT_NEAR_THRESHOLD
 
 use crate::model_plan::{HeuristicClassifier, ModelPlan, ModelSpec, RouteStats};
 use animus_core::identity::ThreadId;
@@ -64,6 +77,8 @@ pub struct SmartRouter {
     route_health: Arc<Mutex<HashMap<String, RouteHealth>>>,
     signal_tx: mpsc::Sender<Signal>,
     source_id: ThreadId,
+    /// Per-model rate limit state handles — populated by register_rate_limit_state().
+    rate_limit_states: Arc<Mutex<HashMap<String, Arc<parking_lot::RwLock<animus_core::RateLimitState>>>>>,
 }
 
 impl SmartRouter {
@@ -85,6 +100,7 @@ impl SmartRouter {
             route_health: Arc::new(Mutex::new(HashMap::new())),
             signal_tx,
             source_id: ThreadId::new(),
+            rate_limit_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -139,6 +155,62 @@ impl SmartRouter {
         let primary_degraded = route_health.map(|h| h.degraded).unwrap_or(false);
 
         if !primary_degraded {
+            // Layer 2 + 3: rate limit check with single write-lock (atomic read + arm flag)
+            // Write lock prevents TOCTOU: reading is_near_limit() and setting near_limit_notified
+            // happen inside the same guard. Drop all rate_limit_states locks before try_send.
+            let (near_limit, should_notify) = {
+                let states = self.rate_limit_states.lock();
+                if let Some(rl_arc) = states.get(&route.primary.model) {
+                    let mut state = rl_arc.write(); // write lock — need to set flag atomically
+                    let near = state.is_near_limit(animus_core::RATE_LIMIT_NEAR_THRESHOLD);
+                    let notify = near && !state.near_limit_notified;
+                    if notify {
+                        state.near_limit_notified = true; // arm: SmartRouter owns this write
+                    }
+                    (near, notify)
+                } else {
+                    (false, false)
+                }
+            }; // all rate_limit_states locks dropped here — safe to try_send
+
+            if near_limit {
+                // Layer 3: fire one Signal on threshold crossing (try_send is non-blocking — no .await needed)
+                if should_notify {
+                    tracing::info!("Rate limit near for model '{}' — routing to fallback", route.primary.model);
+                    let _ = self.signal_tx.try_send(Signal {
+                        source_thread: self.source_id,
+                        target_thread: ThreadId::default(),
+                        priority: SignalPriority::Normal,
+                        summary: format!(
+                            "Rate limit near for model '{}' — routing to fallback",
+                            route.primary.model
+                        ),
+                        segment_refs: vec![],
+                        created: Utc::now(),
+                    });
+                }
+
+                // Route to first non-degraded fallback (plan and health still in scope — no re-acquire needed)
+                for (i, fallback) in route.fallbacks.iter().enumerate() {
+                    let fb_key = format!("{}:fallback:{}", class_name, i);
+                    let fb_degraded = health.get(&fb_key).map(|h| h.degraded).unwrap_or(false);
+                    if !fb_degraded {
+                        return RouteDecision {
+                            class_name: class_name.to_string(),
+                            model_spec: fallback.clone(),
+                            fallback_index: i + 1,
+                        };
+                    }
+                }
+
+                // No fallback available — return primary anyway
+                return RouteDecision {
+                    class_name: class_name.to_string(),
+                    model_spec: route.primary.clone(),
+                    fallback_index: 0,
+                };
+            }
+
             return RouteDecision {
                 class_name: class_name.to_string(),
                 model_spec: route.primary.clone(),
@@ -279,6 +351,16 @@ impl SmartRouter {
         tracing::info!("SmartRouter: plan updated, classifier rebuilt");
     }
 
+    /// Register a rate limit state handle for a model.
+    /// Call once per engine at startup: `router.register_rate_limit_state(engine.model_name(), engine.rate_limit_state().unwrap())`.
+    pub fn register_rate_limit_state(
+        &self,
+        model_name: &str,
+        state: Arc<parking_lot::RwLock<animus_core::RateLimitState>>,
+    ) {
+        self.rate_limit_states.lock().insert(model_name.to_string(), state);
+    }
+
     /// Get a read reference to the current plan.
     pub fn plan(&self) -> Arc<RwLock<ModelPlan>> {
         self.plan.clone()
@@ -299,6 +381,26 @@ mod tests {
     use super::*;
     use crate::model_plan::ModelPlan;
     use tokio::sync::mpsc;
+    use animus_core::rate_limit::RateLimitState;
+    use parking_lot::RwLock as ParkingRwLock;
+
+    fn make_near_limit_state() -> Arc<ParkingRwLock<RateLimitState>> {
+        Arc::new(ParkingRwLock::new(RateLimitState {
+            requests_limit: Some(1000),
+            requests_remaining: Some(50), // 5% — near limit
+            near_limit_notified: false,
+            ..Default::default()
+        }))
+    }
+
+    fn make_ok_state() -> Arc<ParkingRwLock<RateLimitState>> {
+        Arc::new(ParkingRwLock::new(RateLimitState {
+            requests_limit: Some(1000),
+            requests_remaining: Some(500), // 50% — fine
+            near_limit_notified: false,
+            ..Default::default()
+        }))
+    }
 
     fn make_router() -> (SmartRouter, mpsc::Receiver<Signal>) {
         let plan = ModelPlan::default_plan(&[
@@ -309,6 +411,59 @@ mod tests {
         let (tx, rx) = mpsc::channel(32);
         let router = SmartRouter::new(plan_arc, tx);
         (router, rx)
+    }
+
+    #[tokio::test]
+    async fn routes_to_primary_when_rate_limit_is_ok() {
+        let (router, _rx) = make_router();
+        // Register primary with healthy (50%) remaining capacity
+        router.register_rate_limit_state("ollama:qwen3.5:35b", make_ok_state());
+        let decision = router.select_for_class("Analytical").await;
+        assert_eq!(decision.fallback_index, 0, "should use primary when rate limit is healthy");
+    }
+
+    #[tokio::test]
+    async fn routes_to_fallback_when_primary_near_limit() {
+        let (router, _rx) = make_router();
+        // Register the Analytical primary as near-limit
+        let state = make_near_limit_state();
+        router.register_rate_limit_state("ollama:qwen3.5:35b", state);
+        let decision = router.select_for_class("Analytical").await;
+        // Should have used a fallback (fallback_index > 0)
+        assert!(decision.fallback_index > 0, "expected fallback route, got primary");
+    }
+
+    #[tokio::test]
+    async fn fires_signal_on_first_near_limit_crossing() {
+        let (router, mut rx) = make_router();
+        let state = make_near_limit_state();
+        router.register_rate_limit_state("ollama:qwen3.5:35b", state);
+        router.select_for_class("Analytical").await;
+        // Signal should have been sent with the right priority and content
+        let signal = rx.try_recv().expect("expected a Signal to be fired");
+        assert_eq!(signal.priority, SignalPriority::Normal);
+        assert!(
+            signal.summary.contains("Rate limit near"),
+            "signal summary should describe the near-limit condition, got: {}",
+            signal.summary
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_fire_duplicate_signal_when_already_notified() {
+        let (router, mut rx) = make_router();
+        let state = Arc::new(ParkingRwLock::new(RateLimitState {
+            requests_limit: Some(1000),
+            requests_remaining: Some(50),
+            near_limit_notified: true, // already fired — flag was set by a prior routing call
+            ..Default::default()
+        }));
+        router.register_rate_limit_state("ollama:qwen3.5:35b", state);
+        let decision = router.select_for_class("Analytical").await;
+        // No new Signal (flag was already set)
+        assert!(rx.try_recv().is_err(), "should not fire duplicate Signal");
+        // But routing must still avoid the primary — signaling and routing are independent
+        assert!(decision.fallback_index > 0, "should still route to fallback when near-limit, even if no new signal fired");
     }
 
     #[tokio::test]
