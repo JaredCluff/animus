@@ -115,6 +115,8 @@ pub struct OpenAICompatEngine {
     max_tokens: usize,
     /// Ollama `num_ctx` — KV-cache / context window size. `None` = server default.
     num_ctx: Option<usize>,
+    /// Ollama `kv_cache_type` — KV-cache quantization ("q8_0", "q4_0", "f16").
+    kv_cache_type: Option<String>,
     http: reqwest::Client,
 }
 
@@ -134,15 +136,18 @@ impl OpenAICompatEngine {
             model: model.to_string(),
             max_tokens,
             num_ctx: None,
+            kv_cache_type: None,
             http,
         })
     }
 
     /// Convenience constructor for Ollama (no auth required).
-    /// Sets `num_ctx = 32768` so the full 32k context window is available.
+    /// Sets `num_ctx = 32768` and `kv_cache_type = "q8_0"` (8-bit KV cache)
+    /// so the full 32k context window fits comfortably in VRAM.
     pub fn for_ollama(ollama_url: &str, model: &str, max_tokens: usize) -> Result<Self> {
         let mut engine = Self::new(ollama_url, "", model, max_tokens)?;
         engine.num_ctx = Some(32_768);
+        engine.kv_cache_type = Some("q8_0".to_string());
         Ok(engine)
     }
 
@@ -287,7 +292,12 @@ impl ReasoningEngine for OpenAICompatEngine {
         let oai_tools = tools.map(tools_to_oai);
         let has_tools = oai_tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
 
-        let options = self.num_ctx.map(|n| serde_json::json!({"num_ctx": n}));
+        let options = match (self.num_ctx, self.kv_cache_type.as_deref()) {
+            (Some(n), Some(kv)) => Some(serde_json::json!({"num_ctx": n, "kv_cache_type": kv})),
+            (Some(n), None)     => Some(serde_json::json!({"num_ctx": n})),
+            (None,    Some(kv)) => Some(serde_json::json!({"kv_cache_type": kv})),
+            (None,    None)     => None,
+        };
 
         let req = ChatRequest {
             model: &self.model,
