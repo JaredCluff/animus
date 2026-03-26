@@ -51,6 +51,7 @@ impl EngineRegistry {
 pub enum Provider {
     Anthropic,
     Ollama,
+    OpenAI,
     Mock,
 }
 
@@ -61,6 +62,7 @@ impl std::str::FromStr for Provider {
         match s.to_lowercase().as_str() {
             "anthropic" => Ok(Self::Anthropic),
             "ollama" => Ok(Self::Ollama),
+            "openai" | "openai-compat" | "openai_compat" => Ok(Self::OpenAI),
             "mock" => Ok(Self::Mock),
             _ => Err(format!("unknown provider: {s}")),
         }
