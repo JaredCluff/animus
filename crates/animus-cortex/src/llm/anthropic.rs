@@ -155,6 +155,7 @@ pub struct AnthropicEngine {
     auth: Auth,
     model: String,
     max_tokens: usize,
+    rate_limit_state: std::sync::Arc<parking_lot::RwLock<RateLimitState>>,
 }
 
 impl AnthropicEngine {
@@ -168,6 +169,7 @@ impl AnthropicEngine {
             auth: Auth::ApiKey(api_key),
             model,
             max_tokens,
+            rate_limit_state: std::sync::Arc::new(parking_lot::RwLock::new(RateLimitState::default())),
         }
     }
 
@@ -182,6 +184,7 @@ impl AnthropicEngine {
             auth: Auth::OAuth(token),
             model,
             max_tokens,
+            rate_limit_state: std::sync::Arc::new(parking_lot::RwLock::new(RateLimitState::default())),
         }
     }
 
@@ -196,6 +199,7 @@ impl AnthropicEngine {
             auth: Auth::ClaudeCode,
             model: model.to_string(),
             max_tokens,
+            rate_limit_state: std::sync::Arc::new(parking_lot::RwLock::new(RateLimitState::default())),
         }
     }
 
@@ -426,6 +430,7 @@ impl ReasoningEngine for AnthropicEngine {
             .map_err(|e| AnimusError::Llm(format!("HTTP request failed: {e}")))?;
 
         let status = response.status();
+        let response_headers = response.headers().clone(); // save BEFORE consuming body
         let body = response
             .text()
             .await
@@ -447,6 +452,21 @@ impl ReasoningEngine for AnthropicEngine {
                 &body[..body.len().min(500)]
             ))
         })?;
+
+        // Layer 1: update rate limit state from response headers (no LLM)
+        {
+            let parsed = parse_rate_limit_headers(&response_headers);
+            let mut state = self.rate_limit_state.write();
+            // Preserve near_limit_notified across the overwrite:
+            // parse_rate_limit_headers() always returns false for this field,
+            // so we save and restore it based on whether we're still near limit.
+            let was_notified = state.near_limit_notified;
+            let now_near = parsed.is_near_limit(animus_core::RATE_LIMIT_NEAR_THRESHOLD);
+            *state = parsed;
+            // If still near limit, keep the flag (prevent duplicate Signal from SmartRouter).
+            // If recovered, reset it so the next threshold crossing fires again.
+            state.near_limit_notified = if now_near { was_notified } else { false };
+        }
 
         let content = api_response
             .content
@@ -488,6 +508,10 @@ impl ReasoningEngine for AnthropicEngine {
             tool_calls,
             stop_reason,
         })
+    }
+
+    fn rate_limit_state(&self) -> Option<std::sync::Arc<parking_lot::RwLock<animus_core::RateLimitState>>> {
+        Some(self.rate_limit_state.clone())
     }
 
     fn context_limit(&self) -> usize {
@@ -628,5 +652,22 @@ mod tests {
         // Malformed → None, not a panic
         assert!(state.requests_limit.is_none());
         assert!(state.tokens_remaining.is_none());
+    }
+
+    #[test]
+    fn rate_limit_state_returns_some() {
+        // AnthropicEngine should expose its rate limit state handle
+        let engine = AnthropicEngine::new("fake-key".to_string(), "claude-3-5-haiku-20241022".to_string(), 1024);
+        assert!(engine.rate_limit_state().is_some());
+    }
+
+    #[test]
+    fn rate_limit_state_default_has_no_data() {
+        let engine = AnthropicEngine::new("fake-key".to_string(), "claude-3-5-haiku-20241022".to_string(), 1024);
+        let state = engine.rate_limit_state().unwrap();
+        let s = state.read();
+        assert!(s.requests_limit.is_none());
+        assert!(s.tokens_limit.is_none());
+        assert!(!s.near_limit_notified);
     }
 }
