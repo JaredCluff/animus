@@ -63,11 +63,47 @@ Tracks what's been shipped and what's next. Organized by layer from the design s
 - Screen Recording: same (once desktop control is built)
 - Accessibility: same (for mouse/keyboard control)
 
-**Full federation protocol**
-- DNS-SD discovery of peer AILF instances on LAN
-- Ed25519 signature verification on federated segments (identity keypair is present, signing is not)
+**Full federation protocol + Role-Capability Mesh** *(2026-03-26)*
+
+Federated Animus instances operate as a Role-Capability Mesh — not an org chart. Roles are
+cognitive functions dynamically assigned based on live capability attestation. Any instance
+can hold any role it has the capability for. Roles are yielded when capability drops below
+the role's requirement; the instance retains other roles it can still fulfill.
+
+*Roles (cognitive functions)*
+- `Coordinator` — holds mission context, synthesizes across instances, authorizes novel actions
+- `Strategist` — deep analytical reasoning, long-horizon planning (requires Tier 1–2)
+- `Analyst` — domain-specific reasoning and evaluation
+- `Executor` — carries out well-defined tasks (works at any tier)
+- `Observer` — sensing, perception, monitoring (works at any tier)
+- `Standby` — alive but degraded/idle, no active roles, ready to re-assume on recovery
+
+*Capability Attestation (ties into CapabilityProbe)*
+Each instance continuously publishes a signed attestation:
+`{instance_id, cognitive_tier, active_roles, available_domains, load, signed_at}` — signed with Ed25519 keypair (keypair already in place). Peers query attestations to maintain the mesh state.
+
+*Succession*
+When a role is yielded (capability drop):
+1. Yielding instance nominates best successor (it has the best view of peers)
+2. If too degraded to nominate: highest-tier instance meeting role requirements wins, tiebroken by stability score
+3. Claim-based system — no complex consensus protocol needed
+
+*Knowledge Transfer (HandoffBundle)*
+- VectorFS-native: yielding instance exports active goals, recent context segments (already embedded), thread summaries, mission parameters
+- Transmitted via existing federation channel as segment data
+- Receiving instance ingests into VectorFS with provenance (source_instance, transfer_reason)
+- Immediate similarity search bootstraps context — no re-embedding needed
+- Transfer model doesn't need to be the reasoning model (VectorFS ops, not LLM reasoning)
+
+*What to build*
+- `RoleRegistry`: role definitions with min capability requirements per role
+- `CapabilityAttestation`: live state, signed, published to peers (extends CapabilityProbe)
+- `HandoffBundle`: VectorFS export/import for role transitions
+- `SuccessionPolicy`: per-role nomination/election rules
+- `RoleMesh`: live map of who holds what, backed by verified attestations
+- DNS-SD discovery of peer instances on LAN (foundation for mesh formation)
+- Ed25519 signature verification on federated segments
 - Trust model: federated knowledge starts at low confidence, gains via independent validation
-- Federated goals: organizational coordination across instances
 
 ### Medium Priority
 
