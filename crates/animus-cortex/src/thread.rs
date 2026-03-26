@@ -55,6 +55,47 @@ impl<S: VectorStore> ReasoningThread<S> {
         }
     }
 
+    /// Classify whether a user input warrants extended thinking.
+    ///
+    /// Returns `true` for complex inputs (code, analysis, multi-step questions),
+    /// `false` for simple conversational exchanges that can skip the thinking phase.
+    fn needs_thinking(input: &str) -> bool {
+        let lower = input.to_lowercase();
+
+        // Code blocks always warrant thinking
+        if input.contains("```") || (input.contains("    ") && input.contains('\n')) {
+            return true;
+        }
+
+        // Long messages likely need analysis
+        if input.len() > 300 {
+            return true;
+        }
+
+        // Short messages → no thinking needed
+        let word_count = input.split_whitespace().count();
+        if word_count <= 5 {
+            return false;
+        }
+
+        // Deep reasoning signal phrases
+        const THINK_SIGNALS: &[&str] = &[
+            "why ", "how do", "how does", "how can", "how would",
+            "explain", "analyze", "analyse", "design", "debug",
+            "implement", "refactor", "compare", "evaluate", "difference",
+            "plan", "architecture", "strategy", "help me",
+            "figure out", "what if", "should i", "is there a way",
+            "walk me through", "step by step", "break down",
+            "pros and cons", "trade-off", "tradeoff",
+        ];
+        if THINK_SIGNALS.iter().any(|kw| lower.contains(kw)) {
+            return true;
+        }
+
+        // Default: skip thinking for conversational exchanges
+        false
+    }
+
     /// Process a user message: store it, assemble context, reason.
     ///
     /// Returns `ReasoningOutput` so the runtime can inspect `stop_reason` and
@@ -88,7 +129,7 @@ impl<S: VectorStore> ReasoningThread<S> {
             self.stored_turn_ids.drain(..self.stored_turn_ids.len() - MAX_ANCHOR_IDS);
         }
 
-        // Add to conversation history
+        // Add to conversation history (stores the real user text, not the think-control version)
         self.conversation.push(Turn::text(Role::User, user_input));
 
         // Assemble context: anchor on stored turns, retrieve similar knowledge
@@ -116,8 +157,31 @@ impl<S: VectorStore> ReasoningThread<S> {
             sys
         };
 
+        // Build the conversation slice passed to the engine.
+        // If the engine supports think-control and the input doesn't warrant
+        // extended reasoning, prepend /no_think to the last user turn so the
+        // model skips its thinking phase. The stored conversation is unmodified.
+        let engine_conversation: std::borrow::Cow<[Turn]> =
+            if engine.supports_think_control() && !Self::needs_thinking(user_input) {
+                let mut turns = self.conversation.clone();
+                if let Some(last) = turns.last_mut() {
+                    if last.role == Role::User {
+                        let original = last.content.iter()
+                            .filter_map(|c| if let crate::llm::TurnContent::Text(t) = c { Some(t.as_str()) } else { None })
+                            .collect::<Vec<_>>().join("\n");
+                        last.content = vec![crate::llm::TurnContent::Text(
+                            format!("/no_think\n{original}")
+                        )];
+                    }
+                }
+                tracing::debug!("think-control: skipping thinking phase for short/simple input");
+                std::borrow::Cow::Owned(turns)
+            } else {
+                std::borrow::Cow::Borrowed(&self.conversation)
+            };
+
         // Call the LLM
-        let output = engine.reason(&enriched_system, &self.conversation, tools).await?;
+        let output = engine.reason(&enriched_system, &engine_conversation, tools).await?;
 
         // Track which knowledge segments were retrieved (not conversation anchors).
         // Used for implicit feedback now and explicit feedback via /accept, /correct.

@@ -112,6 +112,14 @@ pub trait ReasoningEngine: Send + Sync {
 
     /// Get the model identifier.
     fn model_name(&self) -> &str;
+
+    /// Whether this engine supports the `/no_think` prefix for suppressing
+    /// extended internal reasoning (Qwen3-style thinking models).
+    /// When `true`, the thread layer may prepend `/no_think\n` to the user
+    /// message to skip the thinking phase for simple inputs.
+    fn supports_think_control(&self) -> bool {
+        false
+    }
 }
 
 /// Mock reasoning engine for testing.

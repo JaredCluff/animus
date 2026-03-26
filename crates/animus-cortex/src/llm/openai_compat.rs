@@ -117,6 +117,8 @@ pub struct OpenAICompatEngine {
     num_ctx: Option<usize>,
     /// Ollama `kv_cache_type` — KV-cache quantization ("q8_0", "q4_0", "f16").
     kv_cache_type: Option<String>,
+    /// Whether the model supports `/no_think` think-control prefix (Qwen3-style).
+    think_control: bool,
     http: reqwest::Client,
 }
 
@@ -137,17 +139,19 @@ impl OpenAICompatEngine {
             max_tokens,
             num_ctx: None,
             kv_cache_type: None,
+            think_control: false,
             http,
         })
     }
 
     /// Convenience constructor for Ollama (no auth required).
-    /// Sets `num_ctx = 32768` and `kv_cache_type = "q8_0"` (8-bit KV cache)
-    /// so the full 32k context window fits comfortably in VRAM.
+    /// Sets `num_ctx = 32768`, `kv_cache_type = "q8_0"`, and enables
+    /// think-control (dynamic `/no_think` suppression for simple inputs).
     pub fn for_ollama(ollama_url: &str, model: &str, max_tokens: usize) -> Result<Self> {
         let mut engine = Self::new(ollama_url, "", model, max_tokens)?;
         engine.num_ctx = Some(32_768);
         engine.kv_cache_type = Some("q8_0".to_string());
+        engine.think_control = true;
         Ok(engine)
     }
 
@@ -380,5 +384,9 @@ impl ReasoningEngine for OpenAICompatEngine {
 
     fn model_name(&self) -> &str {
         &self.model
+    }
+
+    fn supports_think_control(&self) -> bool {
+        self.think_control
     }
 }
