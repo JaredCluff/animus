@@ -44,6 +44,7 @@ Tracks what's been shipped and what's next. Organized by layer from the design s
 - Tier 2 attention filter: embedding cosine similarity threshold (configurable, default 0.25)
 - Consent commands: `/consent list|allow|deny`
 - Audit export: `/audit export [json|csv]`
+- Multi-LLM: Ollama + OpenAI-compatible backends; per-role provider overrides (ANIMUS_LLM_PROVIDER, ANIMUS_{REASONING,REFLECTION,PERCEPTION}_PROVIDER)
 
 ---
 
@@ -69,11 +70,6 @@ Tracks what's been shipped and what's next. Organized by layer from the design s
 - Federated goals: organizational coordination across instances
 
 ### Medium Priority
-
-**Multi-LLM support**
-- Ollama as reasoning backend (for fully local operation — currently Ollama is embeddings only)
-- OpenAI-compatible endpoint support
-- Per-role model selection: reasoning vs. reflection vs. perception can use different models
 
 **Inter-thread signaling (formal)**
 - Typed Signal messages: Info / Normal / Urgent priorities
