@@ -120,7 +120,8 @@ impl Tool for ShellExecTool {
                     result = format!("Command completed with exit code {}", output.status.code().unwrap_or(-1));
                 }
                 if result.len() > 50_000 {
-                    let boundary = result.floor_char_boundary(50_000);
+                    let mut boundary = 50_000;
+                    while boundary > 0 && !result.is_char_boundary(boundary) { boundary -= 1; }
                     result = format!("{}...\n[truncated]", &result[..boundary]);
                 }
                 Ok(ToolResult { content: result, is_error: !output.status.success() })
