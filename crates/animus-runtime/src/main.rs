@@ -12,6 +12,8 @@ use animus_core::AnimusIdentity;
 use animus_cortex::engine_registry::{CognitiveRole, EngineRegistry};
 use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::llm::openai_compat::OpenAICompatEngine;
+use animus_cortex::model_plan::ModelPlan;
+use animus_cortex::smart_router::SmartRouter;
 use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
 use animus_cortex::tools::{Tool, ToolContext, ToolRegistry};
@@ -162,6 +164,40 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Build a `ModelPlan` by asking the fallback LLM engine to reason about available models.
+/// Returns None if the LLM call fails or the response cannot be parsed.
+/// The caller falls back to `ModelPlan::default_plan()` on None.
+async fn build_model_plan_via_llm(
+    available_models: &[String],
+    config_hash: &str,
+    registry: &EngineRegistry,
+) -> Option<ModelPlan> {
+    use animus_cortex::llm::{Role, Turn};
+
+    let prompt = ModelPlan::build_prompt(available_models);
+    let engine = registry.fallback();
+
+    let result = engine.reason(
+        "You are configuring your own cognitive routing plan. Respond with JSON only.",
+        &[Turn::text(Role::User, &prompt)],
+        None,
+    ).await;
+
+    match result {
+        Ok(output) if !output.content.is_empty() => {
+            ModelPlan::parse_from_response(&output.content, config_hash.to_string())
+        }
+        Ok(_) => {
+            tracing::warn!("model plan build: LLM returned empty response");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("model plan build: LLM call failed: {e}");
+            None
+        }
+    }
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -400,6 +436,102 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     watcher_registry.start();
     tracing::info!("Watcher registry started (3 watchers: comms, segment_pressure, sensorium_health)");
 
+    // ── Model Plan + Smart Router ─────────────────────────────────────────────────
+    // Animus builds and owns its own cognitive routing plan. The plan is persisted
+    // and reused until the available model set changes. Cortex substrate tracks
+    // RouteStats; AILF reasoning thread can reach in via introspective tools.
+    let smart_router: Option<SmartRouter> = {
+        let plan_path = data_dir.join("model_plan.json");
+
+        // Discover available models for config hash computation
+        let mut available_models: Vec<String> = Vec::new();
+
+        // Ollama: query /api/tags for local model list
+        if config.cortex.llm_provider.to_lowercase() == "ollama" || config.cortex.openai_base_url.contains("11434") {
+            let ollama_url = if config.cortex.openai_base_url.is_empty() {
+                "http://localhost:11434"
+            } else {
+                config.cortex.openai_base_url.trim_end_matches('/')
+            };
+            let tags_url = format!("{}/api/tags", ollama_url);
+            match reqwest::Client::new().get(&tags_url).timeout(std::time::Duration::from_secs(5)).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Some(models) = body["models"].as_array() {
+                            for m in models {
+                                if let Some(name) = m["name"].as_str() {
+                                    available_models.push(format!("ollama:{}", name));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => tracing::debug!("Could not query Ollama model list — using config model only"),
+            }
+        }
+
+        // Always include the explicitly configured model
+        let configured = format!("{}:{}", config.cortex.llm_provider, config.cortex.model_id);
+        if !available_models.iter().any(|m| m == &configured) {
+            available_models.push(configured);
+        }
+
+        let config_hash = ModelPlan::config_hash_for(&available_models);
+
+        // Try to load existing plan
+        let existing = ModelPlan::load(&plan_path)
+            .filter(|p| p.config_hash == config_hash);
+
+        let plan = if let Some(p) = existing {
+            tracing::info!("Model plan loaded from cache (hash: {}...)", &config_hash[..8]);
+            p
+        } else {
+            tracing::info!(
+                "Building new model plan from {} available models",
+                available_models.len()
+            );
+
+            // Try to build via LLM — use the fallback engine (first reachable)
+            let built = build_model_plan_via_llm(
+                &available_models,
+                &config_hash,
+                &engine_registry,
+            ).await;
+
+            match built {
+                Some(p) => {
+                    if let Err(e) = p.save(&plan_path) {
+                        tracing::warn!("Could not persist model plan: {e}");
+                    } else {
+                        tracing::info!("Model plan built and saved (reason: {})", p.build_reason);
+                    }
+                    p
+                }
+                None => {
+                    tracing::warn!("LLM plan build failed — using rule-based default plan");
+                    let p = ModelPlan::default_plan(&available_models);
+                    if let Err(e) = p.save(&plan_path) {
+                        tracing::warn!("Could not persist default model plan: {e}");
+                    }
+                    p
+                }
+            }
+        };
+
+        let plan_arc = std::sync::Arc::new(tokio::sync::RwLock::new(plan));
+        Some(SmartRouter::new(plan_arc, signal_tx.clone()))
+    };
+
+    if let Some(ref router) = smart_router {
+        let plan = router.plan();
+        let plan = plan.try_read().expect("plan readable at startup");
+        tracing::info!(
+            "Smart router active: {} task classes, build reason: {}",
+            plan.task_classes.len(),
+            plan.build_reason
+        );
+    }
+
     // ── Task Manager ──────────────────────────────────────────────────────────────
     let task_manager = TaskManager::new(
         signal_tx.clone(),
@@ -438,6 +570,11 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::snapshot_memory::SnapshotMemoryTool));
         reg.register(Box::new(animus_cortex::tools::list_snapshots::ListSnapshotsTool));
         reg.register(Box::new(animus_cortex::tools::restore_snapshot::RestoreSnapshotTool));
+        // Introspective tools — AILF reasoning thread reaches into the Cortex substrate
+        reg.register(Box::new(animus_cortex::tools::get_route_stats::GetRouteStatsTool));
+        reg.register(Box::new(animus_cortex::tools::propose_route_amendment::ProposeRouteAmendmentTool));
+        reg.register(Box::new(animus_cortex::tools::get_classification_patterns::GetClassificationPatternsTool));
+        reg.register(Box::new(animus_cortex::tools::update_classification_pattern::UpdateClassificationPatternTool));
         reg
     };
     let tool_definitions = tool_registry.definitions();
@@ -492,6 +629,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         api_tracker: Some(api_tracker.clone()),
         nats_client: nats_publish_client.clone(),
         federation_tx: Some(federation_broadcast_tx.clone()),
+        smart_router: smart_router.clone(),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
