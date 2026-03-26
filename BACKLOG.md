@@ -71,6 +71,36 @@ Tracks what's been shipped and what's next. Organized by layer from the design s
 
 ### Medium Priority
 
+**Smart Model Router + Think Budget Engine** *(2026-03-26)*
+
+A provider-agnostic layer that sits between the runtime and the engine registry:
+
+*Think Budget Engine*
+- Extend current `needs_thinking` bool → `ThinkLevel { Off | Minimal(budget) | Full(budget) }`
+- Per-provider application: Anthropic uses `thinking: {type: "enabled", budget_tokens: N}` in request; Qwen/Ollama uses `/no_think` prefix (Off) or no prefix (Minimal/Full); others ignored
+- Budget scales with task complexity (short chat = 0, deep analysis = 8k+)
+
+*Task Classifier*
+- Classify inputs: `Conversational | Technical | Analytical | Creative | ToolExecution`
+- Used by both the think budget engine and the model router
+
+*Model Registry*
+- Models tagged with: task strengths, provider, think-control mechanism, cost tier
+- Config-driven (TOML/env); built-in defaults per provider
+
+*Smart Router*
+- For a classified task: select top model from registry for that task type
+- Apply appropriate think policy for the selected model+provider
+- Failure/timeout → fall back to next model in chain
+- Continue down chain until no models remain, then error
+
+*Fallback Chain example*:
+- `Analytical`: [claude-opus-4-6, qwen3.5:35b, qwen3.5:9b]
+- `Conversational`: [qwen3.5:9b, qwen3.5:4b, claude-haiku-4-5]
+- `Technical`: [claude-opus-4-6, qwen3.5:35b]
+
+Foundation already in place: `supports_think_control()` engine flag, `needs_thinking()` heuristic, `ReasoningEngine` trait, `EngineRegistry` per-role dispatch.
+
 **Inter-thread signaling (formal)**
 - Typed Signal messages: Info / Normal / Urgent priorities
 - Currently threads communicate but without the formal Signal type from the spec
