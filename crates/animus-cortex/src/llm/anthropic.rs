@@ -85,7 +85,7 @@ fn claude_credentials_exist() -> bool {
 /// Refreshes the token automatically if expired and saves the new credentials.
 async fn get_claude_code_token(client: &reqwest::Client) -> Result<String> {
     let path = claude_credentials_path();
-    let data = std::fs::read_to_string(&path).map_err(|e| {
+    let data = tokio::fs::read_to_string(&path).await.map_err(|e| {
         AnimusError::Llm(format!("cannot read Claude Code credentials at {}: {e}", path.display()))
     })?;
     let mut creds: ClaudeCodeCredentials = serde_json::from_str(&data).map_err(|e| {

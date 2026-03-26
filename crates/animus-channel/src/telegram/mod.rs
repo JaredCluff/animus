@@ -232,19 +232,22 @@ impl ChannelPlugin for TelegramChannel {
             // runtime deletes the file before this task has finished reading it.
             let _ = tokio::fs::remove_file(&audio_path).await;
         } else if let Some(image_path) = msg.image {
-            // Send photo with caption (truncated to 1024 chars for Telegram caption limit)
-            let caption = if msg.text.len() > 1024 {
-                Some(&msg.text[..1024])
-            } else if msg.text.is_empty() {
+            // Send photo with caption (truncated to 1024 UTF-8 chars for Telegram caption limit)
+            let split_at = msg.text
+                .char_indices()
+                .nth(1024)
+                .map(|(i, _)| i)
+                .unwrap_or(msg.text.len());
+            let caption = if split_at == 0 {
                 None
             } else {
-                Some(msg.text.as_str())
+                Some(&msg.text[..split_at])
             };
             self.client.send_photo(chat_id, &image_path, caption).await?;
             // Send remaining text as a separate message if caption was truncated
-            if msg.text.len() > 1024 {
+            if split_at < msg.text.len() {
                 self.client
-                    .send_message(chat_id, &msg.text[1024..], reply_to)
+                    .send_message(chat_id, &msg.text[split_at..], reply_to)
                     .await?;
             }
         } else {

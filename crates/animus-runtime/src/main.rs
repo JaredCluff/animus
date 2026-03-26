@@ -1592,16 +1592,13 @@ async fn init_embedding(
             }
         }
         EmbeddingProviderKind::OpenAI => {
-            // OpenAI embedding bridge — dimensionality must be specified in config.
-            // Requires OPENAI_API_KEY env var and an `animus-bridge-openai` implementation.
-            // Until the bridge crate is linked, fall back to synthetic with a warning.
-            let dim = if cfg.dimensionality > 0 { cfg.dimensionality } else { 1536 };
-            tracing::warn!(
-                "OpenAI embedding provider selected but animus-bridge-openai is not linked. \
-                 Falling back to SyntheticEmbedding ({dim} dims). \
-                 See https://github.com/JaredCluff/animus-bridge-openai"
-            );
-            (Arc::new(SyntheticEmbedding::new(dim)), dim)
+            // OpenAI embedding bridge is not linked — this would produce synthetic embeddings
+            // that are incompatible with any real embeddings already stored, corrupting VectorFS.
+            // Fail loudly rather than silently producing garbage embeddings.
+            eprintln!("Fatal: embedding provider 'openai' is not implemented. \
+                Use 'ollama' (with mxbai-embed-large or similar) or 'synthetic'. \
+                See docs/embedding-providers.md for configuration.");
+            std::process::exit(1);
         }
     }
 }

@@ -83,7 +83,8 @@ impl Tool for TelegramSendTool {
                 .mime_str("image/jpeg")
                 .map_err(|e| format!("MIME error: {e}"))?;
 
-            let caption = if text.len() > 1024 { &text[..1024] } else { text };
+            let caption_end = text.char_indices().nth(1024).map(|(i, _)| i).unwrap_or(text.len());
+            let caption = &text[..caption_end];
 
             let form = reqwest::multipart::Form::new()
                 .text("chat_id", chat_id.to_string())

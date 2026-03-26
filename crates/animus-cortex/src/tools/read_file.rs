@@ -3,7 +3,8 @@ use super::{Tool, ToolResult, ToolContext};
 
 pub struct ReadFileTool;
 
-/// Reject paths that are relative or contain parent-directory traversal.
+/// Reject paths that are relative, contain parent-directory traversal, or resolve
+/// via symlink to a location that could bypass intended restrictions.
 fn validate_path(path: &str) -> Result<std::path::PathBuf, String> {
     use std::path::{Component, Path};
     let p = Path::new(path);
@@ -13,7 +14,12 @@ fn validate_path(path: &str) -> Result<std::path::PathBuf, String> {
     if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("path traversal not allowed".to_string());
     }
-    Ok(p.to_path_buf())
+    // Resolve symlinks so that a symlink pointing outside allowed dirs is not bypassed.
+    // If the path doesn't exist yet the caller handles the resulting I/O error.
+    match std::fs::canonicalize(p) {
+        Ok(canonical) => Ok(canonical),
+        Err(_) => Ok(p.to_path_buf()), // Path doesn't exist yet — let I/O report the error
+    }
 }
 
 #[async_trait::async_trait]

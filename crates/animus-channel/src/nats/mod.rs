@@ -85,6 +85,7 @@ impl ChannelPlugin for NatsChannel {
             let subject = subject.clone();
             let reply_prefix = self.config.reply_prefix.clone();
             let excluded = self.excluded_subjects.clone();
+            let trusted_prefixes = self.config.trusted_subject_prefixes.clone();
 
             let mut sub = client
                 .subscribe(subject.clone())
@@ -145,12 +146,16 @@ impl ChannelPlugin for NatsChannel {
                     let effective_thread_id = conversation_id_override
                         .unwrap_or_else(|| reply_subject.clone());
 
-                    // sender.channel_user_id uses inbound_subject (not thread_id) so that
-                    // principal resolution can match "nats:animus.in.claude".
+                    // Trust is granted only to messages on subjects matching the configured
+                    // trusted_subject_prefixes (default: "animus.in."). For full security
+                    // configure NATS server authentication in addition to this subject guard.
+                    let is_trusted = trusted_prefixes
+                        .iter()
+                        .any(|prefix| inbound_subject.starts_with(prefix.as_str()));
                     let sender = SenderIdentity {
                         name: "nats".to_string(),
                         channel_user_id: inbound_subject.clone(),
-                        is_trusted: true,
+                        is_trusted,
                     };
 
                     let mut channel_msg = ChannelMessage::new(
