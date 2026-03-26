@@ -28,6 +28,7 @@ pub mod propose_route_amendment;
 pub mod get_classification_patterns;
 pub mod update_classification_pattern;
 pub mod get_capability_state;
+pub mod get_mesh_roles;
 
 use crate::llm::ToolDefinition;
 use crate::task_manager::TaskManager;
@@ -36,6 +37,7 @@ use crate::watcher::WatcherRegistry;
 use crate::perception::SelfEventFilter;
 use crate::smart_router::SmartRouter;
 use animus_core::capability::CapabilityState;
+use animus_core::mesh::RoleMesh;
 use animus_core::{ApiTracker, EmbeddingService, Signal};
 use animus_core::identity::SegmentId;
 use animus_vectorfs::VectorStore;
@@ -79,6 +81,9 @@ pub struct ToolContext {
     /// Capability state — introspective tool reads current cognitive tier and probe metrics.
     /// None when capability probe is not initialized.
     pub capability_state: Option<Arc<parking_lot::RwLock<CapabilityState>>>,
+    /// Role mesh — introspective tool reads current role assignments and attestations.
+    /// None when federation is not configured.
+    pub role_mesh: Option<Arc<parking_lot::RwLock<RoleMesh>>>,
 }
 
 /// A tool the AILF can use to interact with the world.

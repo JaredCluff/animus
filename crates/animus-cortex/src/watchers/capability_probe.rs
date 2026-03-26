@@ -212,7 +212,6 @@ impl Watcher for CapabilityProbe {
 mod tests {
     use super::*;
     use animus_core::capability::CognitiveTier;
-    use animus_core::segment::{Content, Segment, Source};
     use animus_embed::SyntheticEmbedding;
     use animus_vectorfs::store::MmapVectorStore;
     use std::sync::Arc;

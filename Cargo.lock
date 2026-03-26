@@ -63,6 +63,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "toml",
+ "tracing",
  "uuid",
 ]
 
@@ -80,9 +81,11 @@ dependencies = [
  "base64",
  "bincode",
  "chrono",
+ "ed25519-dalek",
  "futures",
  "hex",
  "parking_lot",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",

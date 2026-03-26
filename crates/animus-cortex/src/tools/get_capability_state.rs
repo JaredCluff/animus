@@ -100,6 +100,7 @@ mod tests {
             federation_tx: None,
             smart_router: None,
             capability_state: Some(Arc::new(parking_lot::RwLock::new(state))),
+            role_mesh: None,
         }
     }
 
@@ -127,6 +128,7 @@ mod tests {
             federation_tx: None,
             smart_router: None,
             capability_state: None,
+            role_mesh: None,
         };
         let result = GetCapabilityStateTool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(result.is_error);

@@ -86,6 +86,7 @@ mod tests {
             federation_tx: None,
             smart_router: None,
             capability_state: None,
+            role_mesh: None,
         };
         (ctx, rx)
     }
