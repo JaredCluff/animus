@@ -95,9 +95,19 @@ When a role is yielded (capability drop):
 - Immediate similarity search bootstraps context — no re-embedding needed
 - Transfer model doesn't need to be the reasoning model (VectorFS ops, not LLM reasoning)
 
+*Three-layer state architecture (critical — no continuous LLM burn)*
+- **Layer 1 — State Management**: `CapabilityProbe`, `RoleMesh`, attestation publisher run as pure async tasks. No LLM. No tokens. Just data structures, timers, network I/O.
+- **Layer 2 — Delta Detection**: `StateManager` watches live state, fires only on meaningful change (tier drop, role yielded/claimed, peer join/leave, fallback chain exhausted). Routine heartbeats and successful health checks → VectorFS log only, never to LLM.
+- **Layer 3 — Signal**: On delta, emit one `Signal` into existing inter-thread signal bus. Active reasoning thread receives it on next turn. LLM is notified once, adapts, moves on.
+
+`CapabilityProbe → StateManager (delta filter) → Signal bus → LLM (on change only)`
+
+Same pattern as Sensorium attention filter — already proven. LLM is an analytical resource, not a state machine.
+
 *What to build*
 - `RoleRegistry`: role definitions with min capability requirements per role
-- `CapabilityAttestation`: live state, signed, published to peers (extends CapabilityProbe)
+- `CapabilityAttestation`: live state, signed, published to peers (Layer 1 — no LLM)
+- `StateManager`: delta detector, filters continuous state → discrete change events (Layer 2)
 - `HandoffBundle`: VectorFS export/import for role transitions
 - `SuccessionPolicy`: per-role nomination/election rules
 - `RoleMesh`: live map of who holds what, backed by verified attestations
@@ -161,6 +171,11 @@ Animus builds and owns its own cognitive routing plan — not hardcoded by human
 - Config change detected (new ANIMUS_OLLAMA_URL, new API key, model added/removed)
 - Manual: `/plan rebuild` command
 - Auto: route failure rate exceeds threshold
+
+*State architecture (same principle as federation)*
+- Plan health tracking runs in Layer 1 (no LLM) — failure counts, route status, last-seen timestamps
+- LLM only notified on meaningful plan-state change (route degraded, chain exhausted, plan rebuilt)
+- Routine probe results → VectorFS log, never to LLM
 
 *Animus guidance*
 - Animus uses its built-in knowledge of model families (Claude, Qwen, Llama, Mistral, etc.)
