@@ -4,13 +4,17 @@ pub mod config;
 pub mod embedding;
 pub mod error;
 pub mod identity;
+pub mod mesh;
 pub mod segment;
 pub mod sensorium;
+pub mod succession;
 pub mod threading;
 pub mod tier;
 
 pub use api_tracker::{ApiTracker, ApiUsageSnapshot};
 pub use capability::{CapabilityState, CognitiveTier};
+pub use mesh::{AttestationFields, CapabilityAttestation, MeshRole, RoleMesh, VerifiedAttestation};
+pub use succession::SuccessionPolicy;
 pub use config::{AnimusConfig, CortexConfig, EmbeddingConfig, EmbeddingProviderKind, FederationConfig, HealthConfig, InterfaceConfig, MnemosConfig, NatsChannelConfig, PrincipalConfig, PrincipalRole, QualityGateConfig, SensoriumConfig, SnapshotConfig, VectorFSConfig};
 pub use embedding::EmbeddingService;
 pub use error::{AnimusError, Result};

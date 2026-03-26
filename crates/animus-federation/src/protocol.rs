@@ -75,3 +75,23 @@ pub struct HandshakeResponse {
 pub struct HandshakeConfirm {
     pub signature_hex: String,
 }
+
+/// Broadcast: "Here is my current capability attestation."
+///
+/// Published by each instance whenever its `CognitiveTier` changes or
+/// on the periodic heartbeat (60s). Peers verify the signature before
+/// inserting into their local `RoleMesh`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationAnnouncement {
+    pub attestation: animus_core::CapabilityAttestation,
+}
+
+/// Transfer a `HandoffBundle` to a specific successor instance.
+///
+/// Sent after a role yield; the target instance ingests the bundle
+/// into its local VectorFS via `HandoffBundle::ingest()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffTransfer {
+    pub bundle: crate::handoff::HandoffBundle,
+    pub target_instance: InstanceId,
+}

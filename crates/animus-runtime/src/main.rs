@@ -13,6 +13,7 @@ use animus_cortex::engine_registry::{CognitiveRole, EngineRegistry};
 use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::llm::openai_compat::OpenAICompatEngine;
 use animus_core::capability::CapabilityState;
+use animus_core::mesh::RoleMesh;
 use animus_cortex::model_plan::ModelPlan;
 use animus_cortex::smart_router::SmartRouter;
 use animus_cortex::scheduler::ThreadScheduler;
@@ -424,6 +425,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Conservative default: MemoryOnly until the first probe cycle completes.
     let capability_state = Arc::new(parking_lot::RwLock::new(CapabilityState::default()));
 
+    // ── Role Mesh (shared between Federation orchestrator and ToolContext) ────────
+    // Empty on startup; populated as federation peers announce attestations.
+    let role_mesh = Arc::new(parking_lot::RwLock::new(RoleMesh::default()));
+
     // ── Watcher Registry ──────────────────────────────────────────────────────────
     // Determine the probe endpoint for CapabilityProbe: use the Ollama URL if configured,
     // or the Anthropic/OpenAI base URL otherwise.
@@ -628,6 +633,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::get_classification_patterns::GetClassificationPatternsTool));
         reg.register(Box::new(animus_cortex::tools::update_classification_pattern::UpdateClassificationPatternTool));
         reg.register(Box::new(animus_cortex::tools::get_capability_state::GetCapabilityStateTool));
+        reg.register(Box::new(animus_cortex::tools::get_mesh_roles::GetMeshRolesTool));
         reg
     };
     let tool_definitions = tool_registry.definitions();
@@ -684,6 +690,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         federation_tx: Some(federation_broadcast_tx.clone()),
         smart_router: smart_router.clone(),
         capability_state: Some(capability_state.clone()),
+        role_mesh: Some(role_mesh.clone()),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
