@@ -1,6 +1,7 @@
 pub mod api_tracker;
 pub mod capability;
 pub mod config;
+pub mod rate_limit;
 pub mod embedding;
 pub mod error;
 pub mod identity;
@@ -13,6 +14,7 @@ pub mod tier;
 
 pub use api_tracker::{ApiTracker, ApiUsageSnapshot};
 pub use capability::{CapabilityState, CognitiveTier};
+pub use rate_limit::{RateLimitState, RATE_LIMIT_NEAR_THRESHOLD};
 pub use mesh::{AttestationFields, CapabilityAttestation, MeshRole, RoleMesh, VerifiedAttestation};
 pub use succession::SuccessionPolicy;
 pub use config::{AnimusConfig, CortexConfig, EmbeddingConfig, EmbeddingProviderKind, FederationConfig, HealthConfig, InterfaceConfig, MnemosConfig, NatsChannelConfig, PrincipalConfig, PrincipalRole, QualityGateConfig, SensoriumConfig, SnapshotConfig, VectorFSConfig};
