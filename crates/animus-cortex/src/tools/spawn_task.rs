@@ -81,6 +81,7 @@ mod tests {
             api_tracker: None,
             nats_client: None,
             federation_tx: None,
+            smart_router: None,
         }
     }
 
@@ -128,6 +129,7 @@ mod tests {
             api_tracker: None,
             nats_client: None,
             federation_tx: None,
+            smart_router: None,
         };
         let result = SpawnTaskTool.execute(
             serde_json::json!({"command": "echo hi"}),

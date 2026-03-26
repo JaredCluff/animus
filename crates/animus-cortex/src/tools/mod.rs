@@ -22,12 +22,18 @@ pub mod restore_snapshot;
 pub mod nats_publish;
 pub mod claude_instances;
 pub mod federate_segment;
+// Introspective tools — AILF reasoning thread reaches into the Cortex substrate
+pub mod get_route_stats;
+pub mod propose_route_amendment;
+pub mod get_classification_patterns;
+pub mod update_classification_pattern;
 
 use crate::llm::ToolDefinition;
 use crate::task_manager::TaskManager;
 use crate::telos::Autonomy;
 use crate::watcher::WatcherRegistry;
 use crate::perception::SelfEventFilter;
+use crate::smart_router::SmartRouter;
 use animus_core::{ApiTracker, EmbeddingService, Signal};
 use animus_core::identity::SegmentId;
 use animus_vectorfs::VectorStore;
@@ -65,6 +71,9 @@ pub struct ToolContext {
     /// Federation broadcast channel — send a SegmentId to broadcast it to trusted peers.
     /// None when federation is disabled or not configured.
     pub federation_tx: Option<mpsc::Sender<SegmentId>>,
+    /// Smart router — introspective tools use this to inspect/amend the model routing plan.
+    /// None when model plan is not initialized or not yet built.
+    pub smart_router: Option<SmartRouter>,
 }
 
 /// A tool the AILF can use to interact with the world.
