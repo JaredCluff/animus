@@ -570,6 +570,22 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         Some(SmartRouter::new(plan_arc, signal_tx.clone()))
     };
 
+    // Register rate limit state for all engines with SmartRouter.
+    // rate_limit_state() returns Some(_) only for AnthropicEngine; all others return None and are skipped.
+    if let Some(ref router) = smart_router {
+        let all_engines: &[&dyn animus_cortex::ReasoningEngine] = &[
+            engine_registry.fallback(),
+            engine_registry.engine_for(CognitiveRole::Perception),
+            engine_registry.engine_for(CognitiveRole::Reflection),
+            engine_registry.engine_for(CognitiveRole::Reasoning),
+        ];
+        for engine in all_engines {
+            if let Some(rl_state) = engine.rate_limit_state() {
+                router.register_rate_limit_state(engine.model_name(), rl_state);
+            }
+        }
+    }
+
     if let Some(ref router) = smart_router {
         let plan = router.plan();
         let plan = plan.try_read().expect("plan readable at startup");
