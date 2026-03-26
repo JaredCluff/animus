@@ -23,8 +23,9 @@ Tracks what's been shipped and what's next. Organized by layer from the design s
 ### Voice
 - `macos-stt` repo: standalone macOS STT HTTP service (SFSpeechRecognizer + Swift, Bearer auth)
 - `animus-voice` crate: AnimusVoiceService — STT via macos-stt HTTP, TTS via Cartesia (MP3→OGG Opus via ffmpeg)
-- Voice toggle: `/voice on|off|status` at runtime without restart
+- Voice toggle: `/voice on|off|status` at runtime without restart; state persisted across restarts
 - Spoken-style LLM hint for voice turns (no markdown, no tables, concise)
+- `macos-stt` launchd service: `~/Library/LaunchAgents/com.jaredcluff.macos-stt.plist` (auto-start, auto-restart)
 
 ### Federation (Phase 5 — partial)
 - `federate_segment` tool: push segments to remote AILF instances
@@ -39,6 +40,10 @@ Tracks what's been shipped and what's next. Organized by layer from the design s
 - Embedding preservation on provider change
 - Multi-instance discovery (PR #37)
 - Reflection loop (background LLM memory synthesis)
+- Proactive mode: goal deadline watcher + urgent signal forwarding → Telegram; gated by autonomy mode
+- Tier 2 attention filter: embedding cosine similarity threshold (configurable, default 0.25)
+- Consent commands: `/consent list|allow|deny`
+- Audit export: `/audit export [json|csv]`
 
 ---
 
@@ -57,17 +62,6 @@ Tracks what's been shipped and what's next. Organized by layer from the design s
 - Screen Recording: same (once desktop control is built)
 - Accessibility: same (for mouse/keyboard control)
 
-**macos-stt launchd service**
-- Write `~/Library/LaunchAgents/com.jaredcluff.macos-stt.plist`
-- Auto-start on login, auto-restart on crash
-- Load `.env` vars via `EnvironmentVariables` key
-
-**Proactive mode**
-- AILF-initiated Telegram messages (not just responses)
-- Governed by Telos autonomy level: Suggest → wait for approval, Act → send directly
-- Triggers: sensorium events, goal deadlines, pattern detection
-- Gating: don't interrupt during active conversation; respect quiet hours
-
 **Full federation protocol**
 - DNS-SD discovery of peer AILF instances on LAN
 - Ed25519 signature verification on federated segments (identity keypair is present, signing is not)
@@ -81,28 +75,10 @@ Tracks what's been shipped and what's next. Organized by layer from the design s
 - OpenAI-compatible endpoint support
 - Per-role model selection: reasoning vs. reflection vs. perception can use different models
 
-**Tier 2 attention filter**
-- Embedding-based event scoring: compare sensorium events against active goal embeddings
-- Currently: rule-based (Tier 1) and full LLM (Tier 3) exist; Tier 2 is missing
-- Would dramatically reduce LLM calls for event triage
-
-**Consent policy commands**
-- `/consent list` — show active consent policies
-- `/consent allow <scope>` / `/consent deny <scope>` — add rules
-- Currently ConsentPolicy structs exist but there's no runtime command interface
-
-**Audit trail export**
-- `/audit export [json|csv]` — dump observation history
-- Currently audit entries are queryable via `/audit` but not exportable
-
 **Inter-thread signaling (formal)**
 - Typed Signal messages: Info / Normal / Urgent priorities
 - Currently threads communicate but without the formal Signal type from the spec
 - Enables: background thread notifying active thread of goal completion, sensorium alerts
-
-**Voice: persist toggle state**
-- `/voice on|off` currently resets to default on restart
-- Save to config or VectorFS so preference survives container restarts
 
 ### Lower Priority
 
