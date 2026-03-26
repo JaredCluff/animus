@@ -1,4 +1,5 @@
 pub mod api_tracker;
+pub mod capability;
 pub mod config;
 pub mod embedding;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod threading;
 pub mod tier;
 
 pub use api_tracker::{ApiTracker, ApiUsageSnapshot};
+pub use capability::{CapabilityState, CognitiveTier};
 pub use config::{AnimusConfig, CortexConfig, EmbeddingConfig, EmbeddingProviderKind, FederationConfig, HealthConfig, InterfaceConfig, MnemosConfig, NatsChannelConfig, PrincipalConfig, PrincipalRole, QualityGateConfig, SensoriumConfig, SnapshotConfig, VectorFSConfig};
 pub use embedding::EmbeddingService;
 pub use error::{AnimusError, Result};

@@ -165,6 +165,7 @@ mod tests {
             nats_client: None,
             federation_tx: None,
             smart_router: None,
+            capability_state: None,
         }
     }
 
