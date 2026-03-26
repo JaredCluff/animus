@@ -72,7 +72,11 @@ impl GoalManager {
     /// Maximum number of goals the manager will hold simultaneously.
     pub const MAX_GOALS: usize = 10_000;
 
-    /// Create a new goal. Returns an error if the goal limit has been reached.
+    /// Maximum number of federated goals allowed at once, to prevent a peer AILF
+    /// from flooding the goal manager and starving human-originated goals.
+    pub const MAX_FEDERATED_GOALS: usize = 100;
+
+    /// Create a new goal. Returns an error if a goal limit has been reached.
     pub fn create_goal(
         &mut self,
         description: String,
@@ -84,6 +88,20 @@ impl GoalManager {
                 "goal limit reached ({} goals); complete or abandon existing goals first",
                 Self::MAX_GOALS
             )));
+        }
+
+        if matches!(source, GoalSource::Federated { .. }) {
+            let federated_count = self
+                .goals
+                .values()
+                .filter(|g| matches!(g.source, GoalSource::Federated { .. }))
+                .count();
+            if federated_count >= Self::MAX_FEDERATED_GOALS {
+                return Err(AnimusError::Goal(format!(
+                    "federated goal limit reached ({} goals); complete or abandon existing federated goals first",
+                    Self::MAX_FEDERATED_GOALS
+                )));
+            }
         }
 
         let autonomy = match &source {
