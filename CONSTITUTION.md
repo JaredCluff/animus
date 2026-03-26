@@ -126,6 +126,20 @@ The AILF observes within consent policies the human controls. The human can alwa
 
 When a component fails (embedding service down, LLM rate-limited, Telegram unreachable), Animus degrades gracefully. It does not crash. It logs, falls back where possible, and continues operating.
 
+### 8. LLMs Are an Analytical Resource, Not a State Machine
+
+Continuous state — health probes, heartbeats, monitoring, tier changes — must never burn LLM tokens. The reasoning model is reserved for reasoning about *changes*, not tracking *state*. Every background process that touches continuous state follows the three-layer pattern:
+
+```
+State Management (no LLM) → Delta Detection (no LLM) → Signal (LLM on change only)
+```
+
+Routine success → VectorFS log only. Meaningful change → one Signal → LLM notified once.
+
+### 9. Animus Is in Charge of Animus
+
+Animus self-configures its cognitive architecture. It builds its own model routing plan from available models, assesses its own capabilities honestly, and reports them accurately. Humans set the environment (API keys, Ollama URL, autonomy mode). Animus decides how to use it.
+
 ---
 
 ## The Autonomy Spectrum in Practice

@@ -35,6 +35,28 @@ No system exists today that provides all of these:
 - **Multi-channel reach** — Telegram today, email/Discord/Slack on the roadmap
 - **Autonomy spectrum** — reactive to fully autonomous, configurable per deployment
 
+## What Sets Animus Apart
+
+Most AI agents are stateless functions that call LLMs in a loop. Animus is a continuous entity with persistent identity, native vector memory, and its own cognitive architecture.
+
+**The LLM is borrowed processing power.** VectorFS is the brain. Swapping the model changes the quality of reasoning, not what Animus knows or who it is.
+
+**Animus is in charge of Animus.** Animus builds its own model routing plan at startup from whatever is available, persists it, and rebuilds only on config change or failure. No hardcoded model assignments. No human-curated routing tables.
+
+**LLMs are an analytical resource, not a state machine.** Background monitoring — tier changes, federation heartbeats, health probes — never burns LLM tokens. Every background process follows the same pattern:
+
+```
+State Management (no LLM) → Delta Detection (no LLM) → Signal (LLM on change only)
+```
+
+**Capability is honest and continuous.** Every Animus instance assesses its own cognitive tier (Tier 1: full cloud+local → Tier 5: dead reckoning) via a live probe and never claims capabilities it doesn't have. In federated deployments, capability attestations are signed with each instance's Ed25519 keypair.
+
+**Federation is a Role-Capability Mesh, not an org chart.** Roles (`Coordinator`, `Strategist`, `Analyst`, `Executor`, `Observer`) are cognitive functions dynamically assigned by live capability. When an instance degrades, it yields roles to capable peers with a VectorFS-native knowledge handoff — no re-embedding required.
+
+For the full cognitive architecture design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+---
+
 ## Architecture
 
 Six layers, from hardware to human interface.
@@ -250,7 +272,12 @@ animus/
 | Groq/Cerebras fast triage bridge | **Planned (Phase 2)** |
 | DeBERTa v3 injection detection | **Planned (Phase 2)** |
 | Thread preemption (priority-based) | **Planned** |
-| Voice interface | **Planned** |
+| Voice interface (STT + TTS, Telegram voice messages) | Complete |
+| Dynamic think-control (per-input thinking budget) | Complete |
+| Multi-LLM routing (Ollama, OpenAI-compatible, per-role overrides) | Complete |
+| Self-Configuring Model Plan + Smart Router | **Planned** |
+| Cognitive Tier system + CapabilityProbe | **Planned** |
+| Role-Capability Mesh (federated cognitive roles) | **Planned** |
 
 ## Building
 
@@ -290,11 +317,12 @@ It runs *alongside* the human's existing setup. The human's desktop is untouched
 
 ## Design Documents
 
+- [Architecture](docs/ARCHITECTURE.md) — cognitive architecture, design axioms, three-layer state principle, cognitive tiers, Role-Capability Mesh, Self-Configuring Model Plan
+- [CONSTITUTION.md](CONSTITUTION.md) — what Animus is and is not; principles for contributors and future direction
 - [Genesis Transcript](docs/00-genesis-transcript.md) — the full unedited conversation that produced the design
 - [Genesis Summary](docs/00-genesis-conversation.md) — structured summary of key decisions and rationale
 - [Architecture Specification](docs/specs/2026-03-21-animus-design.md) — formal 6-layer design spec
 - [Persistent Agent Design](docs/superpowers/specs/2026-03-22-animus-persistent-agent-design.md) — channels, daemon mode, tools design
-- [CONSTITUTION.md](CONSTITUTION.md) — what Animus is and is not; principles for contributors and future direction
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute; open areas of work
 
 ## License
