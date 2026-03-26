@@ -26,6 +26,11 @@ struct ChatRequest<'a> {
     tool_choice: Option<&'static str>,
     max_tokens: usize,
     stream: bool,
+    /// Ollama-specific: controls the KV-cache / context window size.
+    /// Ignored by OpenAI (they don't error on unknown fields, but we skip
+    /// serialising it when not set to stay compatible with strict validators).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -108,6 +113,8 @@ pub struct OpenAICompatEngine {
     api_key: String,
     model: String,
     max_tokens: usize,
+    /// Ollama `num_ctx` — KV-cache / context window size. `None` = server default.
+    num_ctx: Option<usize>,
     http: reqwest::Client,
 }
 
@@ -126,13 +133,17 @@ impl OpenAICompatEngine {
             api_key: api_key.to_string(),
             model: model.to_string(),
             max_tokens,
+            num_ctx: None,
             http,
         })
     }
 
     /// Convenience constructor for Ollama (no auth required).
+    /// Sets `num_ctx = 32768` so the full 32k context window is available.
     pub fn for_ollama(ollama_url: &str, model: &str, max_tokens: usize) -> Result<Self> {
-        Self::new(ollama_url, "", model, max_tokens)
+        let mut engine = Self::new(ollama_url, "", model, max_tokens)?;
+        engine.num_ctx = Some(32_768);
+        Ok(engine)
     }
 
     /// Convenience constructor for OpenAI (requires API key).
@@ -276,6 +287,8 @@ impl ReasoningEngine for OpenAICompatEngine {
         let oai_tools = tools.map(tools_to_oai);
         let has_tools = oai_tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
 
+        let options = self.num_ctx.map(|n| serde_json::json!({"num_ctx": n}));
+
         let req = ChatRequest {
             model: &self.model,
             messages: oai_messages,
@@ -283,6 +296,7 @@ impl ReasoningEngine for OpenAICompatEngine {
             tools: oai_tools,
             max_tokens: self.max_tokens,
             stream: false,
+            options,
         };
 
         let mut request = self.http
