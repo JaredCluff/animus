@@ -46,6 +46,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
+# Playwright / Chromium deps for autonomous provider registration
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+    libgbm1 libasound2 libpango-1.0-0 libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy provider hunter scripts
+COPY animus-provider-hunter/ /opt/animus-provider-hunter/
+RUN pip3 install --no-cache-dir -r /opt/animus-provider-hunter/requirements.txt \
+    && playwright install chromium \
+    && playwright install-deps chromium
+
 # Create a non-root user for running animus
 RUN useradd -m -s /bin/bash animus
 USER animus
