@@ -9,7 +9,9 @@ Animus is deployed as a Podman pod on the Mac at 192.168.0.200. When the contain
 or replaced, critical AILF state (VectorFS brain, identity keypair, goals) can be lost. In-container
 snapshots are also lost because the snapshot directory is not a named volume — it lives in the
 container overlay filesystem and is wiped on every rebuild. This spec defines a backup system that
-sends Animus state to a Synology NAS every 6 hours, enabling full recovery.
+sends Animus state to a Synology NAS every 6 hours, enabling full recovery. It also gives Animus
+direct read/write access to a persistent storage directory on the NAS, so it can store whatever it
+needs there — large files, overflow, anything — without depending on the Mac's local disk.
 
 ## What Gets Backed Up
 
@@ -95,7 +97,9 @@ umount /tmp/animus-restore
 
 ## compose.yaml Fix
 
-Add `animus-snapshots` as a named volume so in-container checkpoints survive rebuilds:
+Two changes:
+
+**1. Add `animus-snapshots` named volume** so in-container checkpoints survive rebuilds:
 
 ```yaml
 # In services.animus.volumes, add:
@@ -104,6 +108,35 @@ Add `animus-snapshots` as a named volume so in-container checkpoints survive reb
 # In top-level volumes, add:
 animus-snapshots:
 ```
+
+**2. Bind-mount the Synology storage share** so Animus can read/write it directly:
+
+```yaml
+# In services.animus.volumes, add:
+- /Volumes/animus-synology:/home/animus/storage
+```
+
+Animus sees `/home/animus/storage` as general-purpose NAS-backed storage. It can write
+snapshots, large files, or anything else there at will.
+
+The host mount point `/Volumes/animus-synology` maps to the `containers` SMB share on the
+Synology. It must exist before `podman compose up` runs — managed by the launchd mount
+plist (see Synology Mount section below). If the NAS is offline at startup, Podman will
+create an empty directory at the mount point and Animus starts normally; the directory
+becomes live once the NAS comes back online and the share is remounted.
+
+## Synology Mount (Persistent)
+
+The Synology `containers` share is mounted persistently on the Mac host at
+`/Volumes/animus-synology` via a launchd plist that runs at login:
+
+- **Mount point:** `/Volumes/animus-synology`
+- **Share:** `//animus@192.168.1.135/containers`
+- **Plist:** `~/Library/LaunchAgents/ai.animus.synology-mount.plist`
+- **Credentials:** macOS Keychain (same entry used by the backup script)
+
+The backup script also writes into this mount (under `animus-backups/`) so the backup and
+live storage share the same SMB connection.
 
 ## Scheduling
 
@@ -140,5 +173,6 @@ SYNOLOGY_PASS=$(security find-internet-password -a animus -s 192.168.1.135 -w)
 |---|---|
 | `scripts/backup-animus.sh` | New — backup script |
 | `scripts/restore-animus.sh` | New — guided restore helper |
-| `compose.yaml` | Add `animus-snapshots` volume |
-| `~/Library/LaunchAgents/ai.animus.backup.plist` | New — launchd schedule |
+| `compose.yaml` | Add `animus-snapshots` volume + Synology bind mount |
+| `~/Library/LaunchAgents/ai.animus.synology-mount.plist` | New — persistent SMB mount at login |
+| `~/Library/LaunchAgents/ai.animus.backup.plist` | New — launchd 6h backup schedule |
