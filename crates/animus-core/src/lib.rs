@@ -1,4 +1,5 @@
 pub mod api_tracker;
+pub mod budget;
 pub mod capability;
 pub mod config;
 pub mod rate_limit;
@@ -13,6 +14,7 @@ pub mod threading;
 pub mod tier;
 
 pub use api_tracker::{ApiTracker, ApiUsageSnapshot};
+pub use budget::{BudgetState, BudgetPressure, BudgetThresholds};
 pub use capability::{CapabilityState, CognitiveTier};
 pub use rate_limit::{RateLimitState, RATE_LIMIT_NEAR_THRESHOLD};
 pub use mesh::{AttestationFields, CapabilityAttestation, MeshRole, RoleMesh, VerifiedAttestation};
