@@ -181,13 +181,9 @@ async fn build_model_plan_via_llm(
 
     let prompt = ModelPlan::build_prompt(available_models);
     // Prefer Perception engine (e.g. Cerebras) for plan building — it's free and fast.
-    // Fall back to the default engine if no named Perception engine is registered.
-    let perception_arc = registry.engine_by_spec("openai_compat", "gpt-oss-120b");
-    let engine: &dyn animus_cortex::ReasoningEngine = if let Some(ref arc) = perception_arc {
-        arc.as_ref()
-    } else {
-        registry.fallback()
-    };
+    // Fall back to the default engine if no Perception engine is registered.
+    let engine: &dyn animus_cortex::ReasoningEngine =
+        registry.engine_for(animus_cortex::CognitiveRole::Perception);
 
     let result = engine.reason(
         "You are configuring your own cognitive routing plan. Respond with JSON only.",
