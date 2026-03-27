@@ -55,7 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy provider hunter scripts
 COPY animus-provider-hunter/ /opt/animus-provider-hunter/
-RUN pip3 install --no-cache-dir -r /opt/animus-provider-hunter/requirements.txt \
+RUN pip3 install --no-cache-dir --break-system-packages -r /opt/animus-provider-hunter/requirements.txt \
     && playwright install chromium \
     && playwright install-deps chromium
 
