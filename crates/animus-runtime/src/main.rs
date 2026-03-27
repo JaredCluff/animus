@@ -1729,8 +1729,9 @@ fn estimate_cost_usd(model_name: &str, input_tokens: usize, output_tokens: usize
         (3.0, 15.0)
     } else if model_name.contains("claude-haiku") {
         (0.80, 4.0)
-    } else if model_name.contains("llama") || model_name.contains("qwen") || model_name.contains("cerebras") {
-        (0.0, 0.0) // free tier
+    } else if model_name.contains("llama") || model_name.contains("cerebras") {
+        // Free tier — covers Cerebras (llama3.1-8b), Ollama local models, etc.
+        (0.0, 0.0)
     } else {
         (1.0, 5.0) // conservative unknown
     };

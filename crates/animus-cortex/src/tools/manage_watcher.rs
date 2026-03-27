@@ -167,6 +167,8 @@ mod tests {
             smart_router: None,
             capability_state: None,
             role_mesh: None,
+            budget_state: None,
+            budget_config: None,
         }
     }
 

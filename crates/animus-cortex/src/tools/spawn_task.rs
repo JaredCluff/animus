@@ -84,6 +84,8 @@ mod tests {
             smart_router: None,
             capability_state: None,
             role_mesh: None,
+            budget_state: None,
+            budget_config: None,
         }
     }
 
@@ -134,6 +136,8 @@ mod tests {
             smart_router: None,
             capability_state: None,
             role_mesh: None,
+            budget_state: None,
+            budget_config: None,
         };
         let result = SpawnTaskTool.execute(
             serde_json::json!({"command": "echo hi"}),
