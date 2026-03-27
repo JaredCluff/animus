@@ -280,6 +280,14 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         tracing::info!("Snapshot directory: {}", snapshot_dir.display());
     }
 
+    // Budget state — load from disk, apply monthly reset if needed
+    let budget_state = {
+        let path = data_dir.join("budget_state.json");
+        let mut state = animus_core::BudgetState::load(&path);
+        state.maybe_reset();
+        Arc::new(parking_lot::RwLock::new(state))
+    };
+
     // Initialize Sensorium
     let event_bus = Arc::new(EventBus::new(1000));
 
@@ -725,6 +733,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         smart_router: smart_router.clone(),
         capability_state: Some(capability_state.clone()),
         role_mesh: Some(role_mesh.clone()),
+        budget_state: Some(budget_state.clone()),
+        budget_config: Some(config.budget.clone()),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
@@ -1656,6 +1666,25 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 // Reasoning turn executor
 // ---------------------------------------------------------------------------
 
+/// Estimate USD cost of an LLM call based on model name and token counts.
+/// Uses known per-MTok rates; falls back to a conservative estimate for unknown models.
+fn estimate_cost_usd(model_name: &str, input_tokens: usize, output_tokens: usize) -> f32 {
+    // Rates in USD per million tokens (input, output)
+    let (input_rate, output_rate): (f32, f32) = if model_name.contains("claude-opus") {
+        (15.0, 75.0)
+    } else if model_name.contains("claude-sonnet") {
+        (3.0, 15.0)
+    } else if model_name.contains("claude-haiku") {
+        (0.80, 4.0)
+    } else if model_name.contains("llama") || model_name.contains("qwen") || model_name.contains("cerebras") {
+        (0.0, 0.0) // free tier
+    } else {
+        (1.0, 5.0) // conservative unknown
+    };
+    (input_tokens as f32 * input_rate / 1_000_000.0)
+        + (output_tokens as f32 * output_rate / 1_000_000.0)
+}
+
 /// Execute a full reasoning turn (input → tool loop → response) on the active thread.
 ///
 /// Handles up to MAX_TOOL_ROUNDS of tool use, stores the response segment,
@@ -1678,7 +1707,42 @@ async fn run_reasoning_turn(
         let goals_guard = goals.lock();
         build_system_prompt(scheduler, &goals_guard, reconstitution_summary, peripheral_awareness)
     };
-    let engine = engine_registry.engine_for(CognitiveRole::Reasoning);
+
+    // Determine routing constraints from sensitivity scan and budget pressure
+    let sensitivity_scan = animus_sensorium::scan_content_sensitivity(input);
+    let pressure = {
+        let budget_thresholds = animus_core::BudgetThresholds {
+            monthly_limit_usd: tool_ctx.budget_config.as_ref()
+                .map(|c| c.monthly_limit_usd).unwrap_or(50.0),
+            careful_threshold: tool_ctx.budget_config.as_ref()
+                .map(|c| c.careful_threshold).unwrap_or(0.60),
+            emergency_threshold: tool_ctx.budget_config.as_ref()
+                .map(|c| c.emergency_threshold).unwrap_or(0.85),
+        };
+        tool_ctx.budget_state.as_ref()
+            .map(|s| s.read().pressure(&budget_thresholds))
+            .unwrap_or(animus_core::BudgetPressure::Normal)
+    };
+    // Try constraint-aware routing; fall back to default Reasoning engine on any error
+    let routed_engine_arc: Option<Arc<dyn animus_cortex::ReasoningEngine>> =
+        if let Some(ref router) = tool_ctx.smart_router {
+            match router.route_with_constraints(input, pressure, sensitivity_scan.level).await {
+                Ok(decision) => engine_registry.engine_by_spec(
+                    &decision.model_spec.provider,
+                    &decision.model_spec.model,
+                ),
+                Err(e) => {
+                    tracing::warn!("route_with_constraints failed: {e} — using default Reasoning engine");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let engine: &dyn animus_cortex::ReasoningEngine = routed_engine_arc
+        .as_deref()
+        .unwrap_or_else(|| engine_registry.engine_for(CognitiveRole::Reasoning));
+
     let tools_slice = if tool_definitions.is_empty() {
         None
     } else {
@@ -1783,6 +1847,27 @@ async fn run_reasoning_turn(
             animus_cortex::Role::Assistant,
             &output.content,
         ));
+    }
+
+    // Record spend for budget tracking
+    if let Some(ref bs) = tool_ctx.budget_state {
+        let cost_usd = estimate_cost_usd(
+            engine.model_name(),
+            output.input_tokens,
+            output.output_tokens,
+        );
+        {
+            let mut state = bs.write();
+            state.record_spend(cost_usd);
+            let budget_path = tool_ctx.data_dir.join("budget_state.json");
+            let state_clone = state.clone();
+            drop(state);
+            tokio::spawn(async move {
+                if let Err(e) = state_clone.save(&budget_path) {
+                    tracing::warn!("budget state save failed: {e}");
+                }
+            });
+        }
     }
 
     Ok(output.content)
