@@ -492,6 +492,43 @@ impl SmartRouter {
             class_name, sensitivity, pressure
         ))
     }
+
+    /// Returns ALL candidates (primary + fallbacks) that pass static constraints, in priority order.
+    /// Used by the runtime to try each in sequence on transient failures (rate limits, 503s).
+    pub async fn route_all_candidates(
+        &self,
+        input: &str,
+        pressure: BudgetPressure,
+        sensitivity: ContentSensitivity,
+    ) -> Vec<RouteDecision> {
+        let (class_name, _confidence) = self.classify_heuristic(input).await;
+        let required_floor = sensitivity.required_trust_floor();
+
+        let plan = self.plan.read().await;
+        let route = match plan.routes.get(&class_name).or_else(|| plan.routes.values().next()) {
+            Some(r) => r,
+            None => return vec![],
+        };
+
+        let candidates: Vec<(usize, &crate::model_plan::ModelSpec)> =
+            std::iter::once((0, &route.primary))
+            .chain(route.fallbacks.iter().enumerate().map(|(i, f)| (i + 1, f)))
+            .collect();
+
+        candidates.into_iter()
+            .filter(|(_, spec)| {
+                !self.is_prohibited(&spec.provider)
+                && !(sensitivity == ContentSensitivity::Critical && !Self::is_local_provider(&spec.provider))
+                && self.passes_trust(spec, required_floor)
+                && Self::passes_budget(spec, pressure)
+            })
+            .map(|(fallback_index, spec)| RouteDecision {
+                class_name: class_name.clone(),
+                model_spec: spec.clone(),
+                fallback_index,
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

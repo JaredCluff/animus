@@ -430,6 +430,33 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             }
         }
 
+        // Register optional named engines from dedicated env vars (e.g. OpenRouter)
+        for (name, provider_env, model_env, url_env, key_env, default_model, default_url) in [
+            (
+                "openrouter",
+                "ANIMUS_OPENROUTER_PROVIDER",
+                "ANIMUS_OPENROUTER_MODEL",
+                "ANIMUS_OPENROUTER_BASE_URL",
+                "ANIMUS_OPENROUTER_API_KEY",
+                "meta-llama/llama-3.3-70b-instruct:free",
+                "https://openrouter.ai/api",
+            ),
+        ] {
+            if let Ok(key) = std::env::var(key_env) {
+                let provider = std::env::var(provider_env).unwrap_or("openai_compat".to_string());
+                let model = std::env::var(model_env).unwrap_or(default_model.to_string());
+                let url = std::env::var(url_env).unwrap_or(default_url.to_string());
+                if let Some(engine) = build_engine(&provider, &model, 4096, &url, &key) {
+                    let arc: Arc<dyn animus_cortex::ReasoningEngine> = Arc::from(
+                        build_engine(&provider, &model, 4096, &url, &key).expect("built above")
+                    );
+                    registry.register_named(name, &model, arc);
+                    tracing::info!("{name} engine registered: {name}/{model}");
+                    drop(engine);
+                }
+            }
+        }
+
         registry
     };
 
@@ -1787,25 +1814,28 @@ async fn run_reasoning_turn(
             .map(|s| s.read().pressure(&budget_thresholds))
             .unwrap_or(animus_core::BudgetPressure::Normal)
     };
-    // Try constraint-aware routing; fall back to default Reasoning engine on any error
-    let routed_engine_arc: Option<Arc<dyn animus_cortex::ReasoningEngine>> =
+    // Build ordered engine candidate list from smart router, then append the Reasoning engine
+    // as a last-resort fallback. process_turn_with_engines tries each in order, automatically
+    // skipping to the next on rate-limit (429) or transient (503/overloaded) errors.
+    let candidate_arcs: Vec<Arc<dyn animus_cortex::ReasoningEngine>> =
         if let Some(ref router) = tool_ctx.smart_router {
-            match router.route_with_constraints(input, pressure, sensitivity_scan.level).await {
-                Ok(decision) => engine_registry.engine_by_spec(
-                    &decision.model_spec.provider,
-                    &decision.model_spec.model,
-                ),
-                Err(e) => {
-                    tracing::warn!("route_with_constraints failed: {e} — using default Reasoning engine");
-                    None
-                }
-            }
+            router.route_all_candidates(input, pressure, sensitivity_scan.level).await
+                .into_iter()
+                .filter_map(|d| engine_registry.engine_by_spec(&d.model_spec.provider, &d.model_spec.model))
+                .collect()
         } else {
-            None
+            vec![]
         };
-    let engine: &dyn animus_cortex::ReasoningEngine = routed_engine_arc
-        .as_deref()
-        .unwrap_or_else(|| engine_registry.engine_for(CognitiveRole::Reasoning));
+    // Collect &dyn refs; candidate_arcs and engine_registry both live for this scope
+    let mut engine_refs: Vec<&dyn animus_cortex::ReasoningEngine> =
+        candidate_arcs.iter().map(|a| a.as_ref()).collect();
+    // Always append the Reasoning engine as the final fallback
+    engine_refs.push(engine_registry.engine_for(CognitiveRole::Reasoning));
+
+    // The first (highest-priority) engine is used for tool continuation rounds and budget tracking.
+    // Tool rounds are continuations within the same minute window so rate limits are unlikely to fire again.
+    let tool_engine: &dyn animus_cortex::ReasoningEngine = *engine_refs.first()
+        .unwrap_or(&engine_registry.engine_for(CognitiveRole::Reasoning));
 
     let tools_slice = if tool_definitions.is_empty() {
         None
@@ -1820,7 +1850,7 @@ async fn run_reasoning_turn(
             .active_thread_mut()
             .ok_or_else(|| animus_core::AnimusError::Threading("no active thread".to_string()))?;
         active
-            .process_turn(input, &system, engine, embedder, tools_slice)
+            .process_turn_with_engines(input, &system, &engine_refs, embedder, tools_slice)
             .await?
     };
 
@@ -1879,7 +1909,7 @@ async fn run_reasoning_turn(
                 role: animus_cortex::Role::User,
                 content: tool_results,
             });
-            output = engine
+            output = tool_engine
                 .reason(&system, active.conversation(), tools_slice)
                 .await
                 .unwrap_or_else(|e| {
@@ -1916,7 +1946,7 @@ async fn run_reasoning_turn(
     // Record spend for budget tracking
     if let Some(ref bs) = tool_ctx.budget_state {
         let cost_usd = estimate_cost_usd(
-            engine.model_name(),
+            tool_engine.model_name(),
             output.input_tokens,
             output.output_tokens,
         );

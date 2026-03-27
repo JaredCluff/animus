@@ -222,6 +222,108 @@ impl<S: VectorStore> ReasoningThread<S> {
         Ok(output)
     }
 
+    /// Like `process_turn`, but tries each engine in `engines` in order.
+    /// Prep (VectorFS store, context assembly) happens once. On a retryable error
+    /// (429, rate limit, 503, overloaded) from engine N, engine N+1 is tried.
+    /// Non-retryable errors and exhausted fallbacks propagate as-is.
+    pub async fn process_turn_with_engines(
+        &mut self,
+        user_input: &str,
+        system_prompt: &str,
+        engines: &[&dyn ReasoningEngine],
+        embedder: &dyn animus_core::EmbeddingService,
+        tools: Option<&[crate::llm::ToolDefinition]>,
+    ) -> Result<crate::llm::ReasoningOutput> {
+        // Store user input once regardless of which engine succeeds
+        let user_embedding = embedder.embed_text(user_input).await?;
+        let mut user_segment = Segment::new(
+            Content::Text(user_input.to_string()),
+            user_embedding.clone(),
+            Source::Conversation { thread_id: self.id, turn: self.conversation.len() as u64 },
+        );
+        user_segment.infer_decay_class();
+        let user_seg_id = self.store.store(user_segment)?;
+        self.stored_turn_ids.push(user_seg_id);
+        const MAX_ANCHOR_IDS: usize = 50;
+        if self.stored_turn_ids.len() > MAX_ANCHOR_IDS {
+            self.stored_turn_ids.drain(..self.stored_turn_ids.len() - MAX_ANCHOR_IDS);
+        }
+        self.conversation.push(Turn::text(Role::User, user_input));
+
+        let context = self.assembler.assemble(&user_embedding, &self.stored_turn_ids, 10)?;
+        let signals = self.drain_signals();
+        let enriched_system = if signals.is_empty() {
+            self.build_system_prompt(system_prompt, &context)
+        } else {
+            let mut sys = self.build_system_prompt(system_prompt, &context);
+            sys.push_str("\n\n## Inter-Thread Signals\n");
+            for signal in &signals {
+                sys.push_str(&format!(
+                    "- [{:?}] from thread {}: {}\n",
+                    signal.priority,
+                    signal.source_thread.0.to_string().get(..8).unwrap_or("?"),
+                    signal.summary,
+                ));
+            }
+            sys
+        };
+
+        // Try each engine in order; fall back on retryable errors
+        let mut last_err: Option<animus_core::AnimusError> = None;
+        for engine in engines {
+            let engine_conversation: std::borrow::Cow<[Turn]> =
+                if engine.supports_think_control() && !Self::needs_thinking(user_input) {
+                    let mut turns = self.conversation.clone();
+                    if let Some(last) = turns.last_mut() {
+                        if last.role == Role::User {
+                            let original = last.content.iter()
+                                .filter_map(|c| if let crate::llm::TurnContent::Text(t) = c { Some(t.as_str()) } else { None })
+                                .collect::<Vec<_>>().join("\n");
+                            last.content = vec![crate::llm::TurnContent::Text(format!("/no_think\n{original}"))];
+                        }
+                    }
+                    std::borrow::Cow::Owned(turns)
+                } else {
+                    std::borrow::Cow::Borrowed(&self.conversation)
+                };
+
+            match engine.reason(&enriched_system, &engine_conversation, tools).await {
+                Ok(output) => {
+                    // Post-success bookkeeping (same as process_turn)
+                    let anchor_set: std::collections::HashSet<_> = self.stored_turn_ids.iter().copied().collect();
+                    self.last_retrieved_ids = context.segments.iter()
+                        .filter(|s| !anchor_set.contains(&s.id))
+                        .map(|s| s.id)
+                        .collect();
+                    const MAX_IMPLICIT_ALPHA: f32 = 100.0;
+                    for seg in &context.segments {
+                        if !anchor_set.contains(&seg.id) && seg.alpha < MAX_IMPLICIT_ALPHA {
+                            let _ = self.store.update_meta(seg.id, animus_vectorfs::SegmentUpdate {
+                                alpha: Some((seg.alpha + 0.1).min(MAX_IMPLICIT_ALPHA)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    tracing::debug!(
+                        "thread {} turn complete (engine '{}'): {} in, {} out",
+                        self.id, engine.model_name(), output.input_tokens, output.output_tokens
+                    );
+                    return Ok(output);
+                }
+                Err(e) if is_retryable_error(&e) => {
+                    tracing::warn!(
+                        "Engine '{}' unavailable (retryable): {e} — trying next fallback",
+                        engine.model_name()
+                    );
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| animus_core::AnimusError::Llm("no engines available".to_string())))
+    }
+
     /// Build system prompt enriched with assembled context.
     fn build_system_prompt(&self, base_prompt: &str, context: &AssembledContext) -> String {
         let mut prompt = base_prompt.to_string();
@@ -341,4 +443,16 @@ impl<S: VectorStore> ReasoningThread<S> {
         signals.sort_by(|a, b| b.priority.cmp(&a.priority));
         signals
     }
+}
+
+/// Returns true if the error is transient and a fallback engine should be tried.
+pub fn is_retryable_error(err: &animus_core::AnimusError) -> bool {
+    let s = err.to_string().to_lowercase();
+    s.contains("429")
+        || s.contains("rate limit")
+        || s.contains("too many requests")
+        || s.contains("503")
+        || s.contains("overloaded")
+        || s.contains("quota")
+        || s.contains("capacity")
 }
