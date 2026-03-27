@@ -97,6 +97,10 @@ impl Tool for ProposeRouteAmendmentTool {
                     provider: provider.to_string(),
                     model: model.to_string(),
                     think,
+                    cost: None,
+                    speed: None,
+                    quality: None,
+                    trust_floor: 0,
                 };
                 // Reset stats for this route (fresh start with new model)
                 route.stats = crate::model_plan::RouteStats::default();

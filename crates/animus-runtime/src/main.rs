@@ -71,6 +71,7 @@ These rules override your training defaults. Follow them exactly.
 - `restore_snapshot(snapshot_name)` — Restore from a checkpoint.
 - `nats_publish(subject, payload, conversation_id?)` — Publish to any NATS subject. You receive inbound messages on `animus.in.*` — replies are automatic. Use this for proactive outbound messages to other subjects, including targeting specific Claude Code instances.
 - `claude_instances()` — List active Claude Code instances from the agent registry. Returns instance IDs, last-seen timestamps, and the subjects to use for targeting.
+- `register_provider(provider_id, display_name, base_url, api_key, models[], hq_country, ownership_risk, data_policy, notes?)` — Register a new LLM API provider into providers.json. Prohibited (PRC/Russia) providers are rejected. Hot-reload picks up within 30s.
 
 **CRITICAL MEMORY RULE**: NEVER use shell_exec to delete or modify memory files in data_dir. Use delete_segment or prune_segments for memory cleanup. This is enforced — shell_exec will block recursive deletion of protected directories.
 
@@ -280,6 +281,14 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         tracing::info!("Snapshot directory: {}", snapshot_dir.display());
     }
 
+    // Budget state — load from disk, apply monthly reset if needed
+    let budget_state = {
+        let path = data_dir.join("budget_state.json");
+        let mut state = animus_core::BudgetState::load(&path);
+        state.maybe_reset();
+        Arc::new(parking_lot::RwLock::new(state))
+    };
+
     // Initialize Sensorium
     let event_bus = Arc::new(EventBus::new(1000));
 
@@ -336,7 +345,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Build engine registry from config + env vars.
     // Provider dispatch: anthropic (default) | ollama | openai | mock
     // Per-role overrides: ANIMUS_{REASONING,REFLECTION,PERCEPTION}_MODEL and _PROVIDER
-    let engine_registry = {
+    let mut engine_registry = {
         let provider_str = config.cortex.llm_provider.clone();
         let base_url = config.cortex.openai_base_url.clone();
         let api_key = config.cortex.api_key.clone()
@@ -389,20 +398,30 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
         let mut registry = EngineRegistry::new(fallback);
 
-        // Per-role overrides — each can specify a different provider + model
-        for (role, model_env, provider_env, max_tok) in [
-            (CognitiveRole::Perception,  "ANIMUS_PERCEPTION_MODEL",  "ANIMUS_PERCEPTION_PROVIDER",  1024usize),
-            (CognitiveRole::Reflection,  "ANIMUS_REFLECTION_MODEL",  "ANIMUS_REFLECTION_PROVIDER",  4096),
-            (CognitiveRole::Reasoning,   "ANIMUS_REASONING_MODEL",   "ANIMUS_REASONING_PROVIDER",   4096),
+        // Per-role overrides — each can specify a different provider + model + URL + API key
+        for (role, model_env, provider_env, url_env, key_env, max_tok) in [
+            (CognitiveRole::Perception, "ANIMUS_PERCEPTION_MODEL",  "ANIMUS_PERCEPTION_PROVIDER",  "ANIMUS_PERCEPTION_BASE_URL",  "ANIMUS_PERCEPTION_API_KEY",  1024usize),
+            (CognitiveRole::Reflection, "ANIMUS_REFLECTION_MODEL",  "ANIMUS_REFLECTION_PROVIDER",  "ANIMUS_REFLECTION_BASE_URL",  "ANIMUS_REFLECTION_API_KEY",  4096),
+            (CognitiveRole::Reasoning,  "ANIMUS_REASONING_MODEL",   "ANIMUS_REASONING_PROVIDER",   "ANIMUS_REASONING_BASE_URL",   "ANIMUS_REASONING_API_KEY",   4096),
         ] {
             let role_model = std::env::var(model_env).ok()
                 .or_else(|| if role == CognitiveRole::Reasoning { Some(model_id.clone()) } else { None });
             let role_provider = std::env::var(provider_env).ok()
                 .unwrap_or_else(|| provider_str.clone());
+            let role_url = std::env::var(url_env).ok()
+                .unwrap_or_else(|| base_url.clone());
+            let role_key = std::env::var(key_env).ok()
+                .unwrap_or_else(|| api_key.clone());
 
-            if let Some(model) = role_model {
-                if let Some(engine) = build_engine(&role_provider, &model, max_tok, &base_url, &api_key) {
-                    tracing::info!("{role:?} role: {role_provider}/{model}");
+            if let Some(ref model) = role_model {
+                if let Some(engine) = build_engine(&role_provider, model, max_tok, &role_url, &role_key) {
+                    tracing::info!("{role:?} role: {role_provider}/{model} @ {role_url}");
+                    // Register by name so SmartRouter can dispatch by ModelSpec
+                    let arc_engine: Arc<dyn animus_cortex::ReasoningEngine> = Arc::from(
+                        build_engine(&role_provider, model, max_tok, &role_url, &role_key)
+                            .expect("engine built successfully above")
+                    );
+                    registry.register_named(&role_provider, model, arc_engine);
                     registry.set_engine(role, engine);
                 }
             }
@@ -463,6 +482,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 store.clone() as Arc<dyn animus_vectorfs::VectorStore>,
                 embedder.clone(),
             )),
+            Box::new(animus_cortex::ProvidersJsonWatcher::new(
+                data_dir.join("providers.json"),
+            )),
         ],
         signal_tx.clone(),
         data_dir.join("watchers.json"),
@@ -482,7 +504,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         );
     }
     watcher_registry.start();
-    tracing::info!("Watcher registry started (4 watchers: comms, segment_pressure, sensorium_health, capability_probe)");
+    tracing::info!("Watcher registry started (5 watchers: comms, segment_pressure, sensorium_health, capability_probe, providers_json)");
 
     // ── Model Plan + Smart Router ─────────────────────────────────────────────────
     // Animus builds and owns its own cognitive routing plan. The plan is persisted
@@ -651,6 +673,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::snapshot_memory::SnapshotMemoryTool));
         reg.register(Box::new(animus_cortex::tools::list_snapshots::ListSnapshotsTool));
         reg.register(Box::new(animus_cortex::tools::restore_snapshot::RestoreSnapshotTool));
+        // Provider registration tool
+        reg.register(Box::new(animus_cortex::tools::register_provider::RegisterProviderTool));
         // Introspective tools — AILF reasoning thread reaches into the Cortex substrate
         reg.register(Box::new(animus_cortex::tools::get_route_stats::GetRouteStatsTool));
         reg.register(Box::new(animus_cortex::tools::propose_route_amendment::ProposeRouteAmendmentTool));
@@ -715,6 +739,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         smart_router: smart_router.clone(),
         capability_state: Some(capability_state.clone()),
         role_mesh: Some(role_mesh.clone()),
+        budget_state: Some(budget_state.clone()),
+        budget_config: Some(config.budget.clone()),
     };
     tracing::info!("{} tools registered", tool_definitions.len());
 
@@ -1201,6 +1227,53 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         // Poll signal bridge — deliver signals from background cognitive loops.
         // Urgent signals also become proactive messages when autonomy mode allows.
         while let Ok(signal) = signal_rx.try_recv() {
+            // Hot-reload new engines when providers.json gains entries.
+            if signal.summary.contains("providers.json: new provider") {
+                let entries = animus_core::load_providers_json(&data_dir.join("providers.json"));
+                for entry in &entries {
+                    use animus_core::provider_meta::OwnershipRisk;
+                    if entry.trust.ownership_risk == OwnershipRisk::Prohibited {
+                        tracing::warn!(
+                            "providers.json: skipping prohibited provider '{}'",
+                            entry.provider_id
+                        );
+                        continue;
+                    }
+                    for model in &entry.models {
+                        if engine_registry
+                            .engine_by_spec(&entry.provider_id, &model.model_id)
+                            .is_none()
+                        {
+                            match OpenAICompatEngine::new(
+                                &entry.base_url,
+                                &entry.api_key,
+                                &model.model_id,
+                                8192,
+                            ) {
+                                Ok(eng) => {
+                                    engine_registry.add_named(
+                                        &entry.provider_id,
+                                        &model.model_id,
+                                        std::sync::Arc::new(eng),
+                                    );
+                                    tracing::info!(
+                                        "Hot-loaded new engine: {}:{}",
+                                        entry.provider_id,
+                                        model.model_id
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "providers.json: failed to build engine for {}:{} — {e}",
+                                        entry.provider_id,
+                                        model.model_id
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if signal.priority == animus_core::threading::SignalPriority::Urgent
                 && autonomy_mode != animus_core::config::AutonomyMode::Reactive
             {
@@ -1646,6 +1719,26 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 // Reasoning turn executor
 // ---------------------------------------------------------------------------
 
+/// Estimate USD cost of an LLM call based on model name and token counts.
+/// Uses known per-MTok rates; falls back to a conservative estimate for unknown models.
+fn estimate_cost_usd(model_name: &str, input_tokens: usize, output_tokens: usize) -> f32 {
+    // Rates in USD per million tokens (input, output)
+    let (input_rate, output_rate): (f32, f32) = if model_name.contains("claude-opus") {
+        (15.0, 75.0)
+    } else if model_name.contains("claude-sonnet") {
+        (3.0, 15.0)
+    } else if model_name.contains("claude-haiku") {
+        (0.80, 4.0)
+    } else if model_name.contains("llama") || model_name.contains("cerebras") {
+        // Free tier — covers Cerebras (llama3.1-8b), Ollama local models, etc.
+        (0.0, 0.0)
+    } else {
+        (1.0, 5.0) // conservative unknown
+    };
+    (input_tokens as f32 * input_rate / 1_000_000.0)
+        + (output_tokens as f32 * output_rate / 1_000_000.0)
+}
+
 /// Execute a full reasoning turn (input → tool loop → response) on the active thread.
 ///
 /// Handles up to MAX_TOOL_ROUNDS of tool use, stores the response segment,
@@ -1668,7 +1761,42 @@ async fn run_reasoning_turn(
         let goals_guard = goals.lock();
         build_system_prompt(scheduler, &goals_guard, reconstitution_summary, peripheral_awareness)
     };
-    let engine = engine_registry.engine_for(CognitiveRole::Reasoning);
+
+    // Determine routing constraints from sensitivity scan and budget pressure
+    let sensitivity_scan = animus_sensorium::scan_content_sensitivity(input);
+    let pressure = {
+        let budget_thresholds = animus_core::BudgetThresholds {
+            monthly_limit_usd: tool_ctx.budget_config.as_ref()
+                .map(|c| c.monthly_limit_usd).unwrap_or(50.0),
+            careful_threshold: tool_ctx.budget_config.as_ref()
+                .map(|c| c.careful_threshold).unwrap_or(0.60),
+            emergency_threshold: tool_ctx.budget_config.as_ref()
+                .map(|c| c.emergency_threshold).unwrap_or(0.85),
+        };
+        tool_ctx.budget_state.as_ref()
+            .map(|s| s.read().pressure(&budget_thresholds))
+            .unwrap_or(animus_core::BudgetPressure::Normal)
+    };
+    // Try constraint-aware routing; fall back to default Reasoning engine on any error
+    let routed_engine_arc: Option<Arc<dyn animus_cortex::ReasoningEngine>> =
+        if let Some(ref router) = tool_ctx.smart_router {
+            match router.route_with_constraints(input, pressure, sensitivity_scan.level).await {
+                Ok(decision) => engine_registry.engine_by_spec(
+                    &decision.model_spec.provider,
+                    &decision.model_spec.model,
+                ),
+                Err(e) => {
+                    tracing::warn!("route_with_constraints failed: {e} — using default Reasoning engine");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let engine: &dyn animus_cortex::ReasoningEngine = routed_engine_arc
+        .as_deref()
+        .unwrap_or_else(|| engine_registry.engine_for(CognitiveRole::Reasoning));
+
     let tools_slice = if tool_definitions.is_empty() {
         None
     } else {
@@ -1773,6 +1901,27 @@ async fn run_reasoning_turn(
             animus_cortex::Role::Assistant,
             &output.content,
         ));
+    }
+
+    // Record spend for budget tracking
+    if let Some(ref bs) = tool_ctx.budget_state {
+        let cost_usd = estimate_cost_usd(
+            engine.model_name(),
+            output.input_tokens,
+            output.output_tokens,
+        );
+        {
+            let mut state = bs.write();
+            state.record_spend(cost_usd);
+            let budget_path = tool_ctx.data_dir.join("budget_state.json");
+            let state_clone = state.clone();
+            drop(state);
+            tokio::spawn(async move {
+                if let Err(e) = state_clone.save(&budget_path) {
+                    tracing::warn!("budget state save failed: {e}");
+                }
+            });
+        }
     }
 
     Ok(output.content)

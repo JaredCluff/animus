@@ -10,6 +10,7 @@
 //! - Layer 3: Signal fires once on degradation; AILF reasoning thread decides what to do
 
 use animus_core::error::{AnimusError, Result};
+use animus_core::{CostTier, QualityTier, SpeedTier};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,6 +46,18 @@ pub struct ModelSpec {
     pub provider: String,   // "anthropic" | "ollama" | "openai"
     pub model: String,
     pub think: ThinkLevel,
+    /// Cost tier for budget-pressure routing. None = assume Moderate (conservative).
+    #[serde(default)]
+    pub cost: Option<CostTier>,
+    /// Speed tier for latency-sensitive routing.
+    #[serde(default)]
+    pub speed: Option<SpeedTier>,
+    /// Quality tier for task-class routing.
+    #[serde(default)]
+    pub quality: Option<QualityTier>,
+    /// Minimum provider effective_trust required to use this model. 0 = any provider.
+    #[serde(default)]
+    pub trust_floor: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,23 +234,23 @@ impl ModelPlan {
 
         let mut routes = HashMap::new();
         routes.insert("Conversational".to_string(), Route {
-            primary: ModelSpec { provider: provider_for(smallest), model: smallest.to_string(), think: ThinkLevel::Off },
-            fallbacks: vec![ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Dynamic }],
+            primary: ModelSpec { provider: provider_for(smallest), model: smallest.to_string(), think: ThinkLevel::Off, cost: None, speed: None, quality: None, trust_floor: 0 },
+            fallbacks: vec![ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 }],
             stats: RouteStats::default(),
         });
         routes.insert("Analytical".to_string(), Route {
-            primary: ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Dynamic },
-            fallbacks: vec![ModelSpec { provider: provider_for(second), model: second.to_string(), think: ThinkLevel::Dynamic }],
+            primary: ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 },
+            fallbacks: vec![ModelSpec { provider: provider_for(second), model: second.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 }],
             stats: RouteStats::default(),
         });
         routes.insert("Technical".to_string(), Route {
-            primary: ModelSpec { provider: provider_for(second), model: second.to_string(), think: ThinkLevel::Dynamic },
-            fallbacks: vec![ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Dynamic }],
+            primary: ModelSpec { provider: provider_for(second), model: second.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 },
+            fallbacks: vec![ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 }],
             stats: RouteStats::default(),
         });
         routes.insert("ToolExecution".to_string(), Route {
-            primary: ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Off },
-            fallbacks: vec![ModelSpec { provider: provider_for(second), model: second.to_string(), think: ThinkLevel::Off }],
+            primary: ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Off, cost: None, speed: None, quality: None, trust_floor: 0 },
+            fallbacks: vec![ModelSpec { provider: provider_for(second), model: second.to_string(), think: ThinkLevel::Off, cost: None, speed: None, quality: None, trust_floor: 0 }],
             stats: RouteStats::default(),
         });
 
@@ -345,11 +358,19 @@ Respond with JSON only (no markdown, no explanation):
                     provider: r.primary.provider,
                     model: r.primary.model,
                     think: parse_think(r.primary.think.as_deref()),
+                    cost: None,
+                    speed: None,
+                    quality: None,
+                    trust_floor: 0,
                 },
                 fallbacks: r.fallbacks.into_iter().map(|f| ModelSpec {
                     provider: f.provider,
                     model: f.model,
                     think: parse_think(f.think.as_deref()),
+                    cost: None,
+                    speed: None,
+                    quality: None,
+                    trust_floor: 0,
                 }).collect(),
                 stats: RouteStats::default(),
             };

@@ -22,6 +22,8 @@ pub mod restore_snapshot;
 pub mod nats_publish;
 pub mod claude_instances;
 pub mod federate_segment;
+// Provider registration tool — registers new LLM API providers into providers.json
+pub mod register_provider;
 // Introspective tools — AILF reasoning thread reaches into the Cortex substrate
 pub mod get_route_stats;
 pub mod propose_route_amendment;
@@ -84,6 +86,10 @@ pub struct ToolContext {
     /// Role mesh — introspective tool reads current role assignments and attestations.
     /// None when federation is not configured.
     pub role_mesh: Option<Arc<parking_lot::RwLock<RoleMesh>>>,
+    /// Budget state handle — tools and the routing layer read current pressure.
+    pub budget_state: Option<Arc<parking_lot::RwLock<animus_core::BudgetState>>>,
+    /// Budget config — thresholds for pressure tier computation.
+    pub budget_config: Option<animus_core::BudgetConfig>,
 }
 
 /// A tool the AILF can use to interact with the world.
