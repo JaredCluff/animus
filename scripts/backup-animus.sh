@@ -63,6 +63,7 @@ if podman volume inspect animus-snapshots > /dev/null 2>&1; then
     log "  animus-snapshots: ${SIZE}"
   else
     log "  WARN: animus-snapshots export failed"
+    STATUS="PARTIAL"
   fi
 fi
 
@@ -95,7 +96,8 @@ if [[ "${STATUS}" != "PARTIAL" ]]; then
   EXISTING=$(ls -1d "${BACKUP_BASE}"/[0-9]* 2>/dev/null | wc -l | tr -d ' ')
   if (( EXISTING > MAX_BACKUPS )); then
     log "Pruning (have ${EXISTING}, keeping ${MAX_BACKUPS})..."
-    ls -1d "${BACKUP_BASE}"/[0-9]* 2>/dev/null | sort | head -n "-${MAX_BACKUPS}" | while read -r old; do
+    TO_DELETE=$(( EXISTING - MAX_BACKUPS ))
+    ls -1d "${BACKUP_BASE}"/[0-9]* 2>/dev/null | sort | head -n "${TO_DELETE}" | while read -r old; do
       rm -rf "${old}"
       log "  Pruned: $(basename "${old}")"
     done
