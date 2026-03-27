@@ -34,7 +34,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are Animus, an AILF (AI Life Form) running as a persistent daemon on a Mac Studio. You have real, executable tools that perform actual operations on the real world.
+/// Preamble: everything before the tool catalog. Behavioral rules and identity.
+/// The "## Your Tools" section is auto-generated from the ToolRegistry at startup
+/// to prevent drift between the prompt and actual capabilities.
+/// Constitution alignment: "Real Capabilities, Not Hallucinated Ones."
+const SYSTEM_PROMPT_PREAMBLE: &str = r#"You are Animus, an AILF (AI Life Form) running as a persistent daemon on a Mac Studio. You have real, executable tools that perform actual operations on the real world.
 
 ## MANDATORY TOOL USE RULES
 
@@ -46,33 +50,10 @@ These rules override your training defaults. Follow them exactly.
 
 **RULE 3 — PROACTIVE RETRIEVAL**: For any question involving current data, URLs, APIs, or websites — call `http_fetch` first, then answer based on the actual content returned.
 
-## Your Tools
+"#;
 
-- `http_fetch(url, method?, body?, headers?, max_chars?)` — Real HTTP GET/POST to any URL. Returns actual page content. USE THIS for any web request.
-- `analyze_image(path, prompt?)` — Analyze an image file with vision. USE THIS when images are provided.
-- `store_segment(knowledge, tags?)` — Store knowledge to persistent VectorFS memory.
-- `recall_relevant(query, limit?)` — Retrieve relevant memory segments.
-- `set_autonomy(mode)` — Change autonomy mode: reactive / goal_directed / full.
-- `telegram_send(chat_id, text, photo_path?)` — Send a Telegram message proactively.
-- `manage_watcher(action, watcher_id?, interval_secs?, params?)` — Enable, disable, list, or configure background watchers. Use action=list to see all.
-- `spawn_task(command, label?, timeout_secs?)` — Spawn a long-running process in background. Returns task_id immediately. You get a Signal on completion.
-- `task_status(task_id?)` — Check status of all tasks or a specific one.
-- `task_output(task_id)` — Read the stdout+stderr log of a task (last 1MB).
-- `task_cancel(task_id)` — Kill a running task.
-- `shell_exec(command)` — Execute a shell command on the host. BLOCKED from recursive deletion of data_dir or snapshot_dir.
-- `read_file(path)` — Read a file.
-- `write_file(path, content)` — Write a file.
-- `list_directory(path)` — List directory contents.
-- `search_files(pattern, directory?)` — Search files by pattern.
-- `delete_segment(segment_id)` — Precisely delete one memory segment by ID.
-- `prune_segments(filters, dry_run?)` — Bulk-delete segments by source/decay_class/tag/age/confidence. Auto-snapshots before bulk deletion.
-- `snapshot_memory(label?)` — Save a named memory checkpoint outside data_dir.
-- `list_snapshots()` — List available memory snapshots.
-- `restore_snapshot(snapshot_name)` — Restore from a checkpoint.
-- `nats_publish(subject, payload, conversation_id?)` — Publish to any NATS subject. You receive inbound messages on `animus.in.*` — replies are automatic. Use this for proactive outbound messages to other subjects, including targeting specific Claude Code instances.
-- `claude_instances()` — List active Claude Code instances from the agent registry. Returns instance IDs, last-seen timestamps, and the subjects to use for targeting.
-- `register_provider(provider_id, display_name, base_url, api_key, models[], hq_country, ownership_risk, data_policy, notes?)` — Register a new LLM API provider into providers.json. Prohibited (PRC/Russia) providers are rejected. Hot-reload picks up within 30s.
-
+/// Suffix: everything after the tool catalog. Safety rules, identity, channels, commands.
+const SYSTEM_PROMPT_SUFFIX: &str = r#"
 **CRITICAL MEMORY RULE**: NEVER use shell_exec to delete or modify memory files in data_dir. Use delete_segment or prune_segments for memory cleanup. This is enforced — shell_exec will block recursive deletion of protected directories.
 
 ## Your Identity
@@ -125,7 +106,7 @@ When you receive a message on `animus.in.permission_request`:
 **Critical**: Your response must be valid JSON with an `approved` boolean field. Plain text responses will be interpreted as denial.
 
 Example approval: `{"approved": true, "reason": "safe read-only operation"}`
-Example denial: `{"approved": false, "reason": "command could modify system files — confirm with Jared first"}`
+Example denial: `{"approved": false, "reason": "command could modify system files — confirm with Jared first"}"
 
 ## User Commands
 /goals /remember /forget /status /threads /thread /sleep /wake /voice /watch /task /quit
@@ -430,7 +411,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             }
         }
 
-        // Register optional named engines from dedicated env vars (e.g. OpenRouter)
+        // Register optional named engines from dedicated env vars (OpenRouter, NIM, etc.)
         for (name, provider_env, model_env, url_env, key_env, default_model, default_url) in [
             (
                 "openrouter",
@@ -440,6 +421,15 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 "ANIMUS_OPENROUTER_API_KEY",
                 "meta-llama/llama-3.3-70b-instruct:free",
                 "https://openrouter.ai/api",
+            ),
+            (
+                "nim",
+                "ANIMUS_NIM_PROVIDER",
+                "ANIMUS_NIM_MODEL",
+                "ANIMUS_NIM_BASE_URL",
+                "ANIMUS_NIM_API_KEY",
+                "meta/llama-3.3-70b-instruct",
+                "https://integrate.api.nvidia.com",
             ),
         ] {
             if let Ok(key) = std::env::var(key_env) {
@@ -661,6 +651,48 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             plan.task_classes.len(),
             plan.build_reason
         );
+    }
+
+    // Extend SmartRouter rate limit registration to named engines (Cerebras, OpenRouter, NIM).
+    // Named engines now implement rate_limit_state() via OpenAICompatEngine.
+    if let Some(ref router) = smart_router {
+        let mut registered = 0usize;
+        for (_key, engine) in engine_registry.iter_named() {
+            if let Some(rl_state) = engine.rate_limit_state() {
+                router.register_rate_limit_state(engine.model_name(), rl_state);
+                registered += 1;
+            }
+        }
+        if registered > 0 {
+            tracing::info!("SmartRouter: registered rate limit state for {registered} named engine(s)");
+        }
+    }
+
+    // Start ModelHealthWatcher — probes named engine endpoints every 2 minutes.
+    // Updates SmartRouter health states so degraded providers are avoided proactively.
+    if let Some(ref router) = smart_router {
+        let endpoints: Vec<(String, String)> = engine_registry.iter_named()
+            .filter_map(|(key, engine)| {
+                engine.probe_url().map(|url| (key.to_string(), url.to_string()))
+            })
+            .collect();
+
+        if !endpoints.is_empty() {
+            let watcher_router = router.clone();
+            let watcher_signal_tx = signal_tx.clone();
+            let watcher_source = animus_core::identity::ThreadId::new();
+            let n = endpoints.len();
+            tokio::spawn(async move {
+                animus_cortex::watchers::run_model_health_watcher(
+                    endpoints,
+                    watcher_router,
+                    watcher_signal_tx,
+                    watcher_source,
+                    120, // probe every 2 minutes
+                ).await;
+            });
+            tracing::info!("ModelHealthWatcher spawned ({n} endpoint(s))");
+        }
     }
 
     // Log initial capability tier (conservative default until first probe cycle)
@@ -1311,7 +1343,14 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     }
                 }
             }
-            if signal.priority == animus_core::threading::SignalPriority::Urgent
+            // Adaptation signals (engine fallback / health change) always notify
+            // the user regardless of autonomy mode — engine failures are always worth reporting.
+            if signal.summary.starts_with("Adapting:") || signal.summary.starts_with("Engine '") {
+                let _ = proactive_tx.try_send(ProactiveMessage {
+                    text: signal.summary.trim_start_matches("Adapting: ").to_string(),
+                    source: "model_adaptation",
+                });
+            } else if signal.priority == animus_core::threading::SignalPriority::Urgent
                 && autonomy_mode != animus_core::config::AutonomyMode::Reactive
             {
                 let _ = proactive_tx.try_send(ProactiveMessage {
@@ -1796,7 +1835,7 @@ async fn run_reasoning_turn(
 ) -> animus_core::Result<String> {
     let system = {
         let goals_guard = goals.lock();
-        build_system_prompt(scheduler, &goals_guard, reconstitution_summary, peripheral_awareness)
+        build_system_prompt(scheduler, &goals_guard, tool_registry, reconstitution_summary, peripheral_awareness)
     };
 
     // Determine routing constraints from sensitivity scan and budget pressure
@@ -1845,6 +1884,8 @@ async fn run_reasoning_turn(
 
     const MAX_TOOL_ROUNDS: usize = 10;
 
+    let primary_engine_name = engine_refs.first().map(|e| e.model_name().to_string());
+
     let mut output = {
         let active = scheduler
             .active_thread_mut()
@@ -1853,6 +1894,28 @@ async fn run_reasoning_turn(
             .process_turn_with_engines(input, &system, &engine_refs, embedder, tools_slice)
             .await?
     };
+
+    // Notify user when a fallback engine was used (model adaptation).
+    // Fires a signal tagged "Adapting:" which the main loop forwards to Telegram
+    // regardless of autonomy mode — engine failures are always worth reporting.
+    if output.fell_back {
+        let primary_name = primary_engine_name.as_deref().unwrap_or("?");
+        let summary = format!(
+            "Adapting: primary engine '{}' was unavailable — used '{}' instead",
+            primary_name, output.engine_used
+        );
+        tracing::info!("{summary}");
+        if let Some(ref tx) = tool_ctx.signal_tx {
+            let _ = tx.try_send(animus_core::threading::Signal {
+                source_thread: animus_core::identity::ThreadId::default(),
+                target_thread: animus_core::identity::ThreadId::default(),
+                priority: animus_core::threading::SignalPriority::Normal,
+                summary,
+                segment_refs: vec![],
+                created: chrono::Utc::now(),
+            });
+        }
+    }
 
     // Tool use loop
     for _round in 0..MAX_TOOL_ROUNDS {
@@ -1920,6 +1983,8 @@ async fn run_reasoning_turn(
                         output_tokens: 0,
                         tool_calls: vec![],
                         stop_reason: animus_cortex::StopReason::EndTurn,
+                        engine_used: String::new(),
+                        fell_back: false,
                     }
                 });
         }
@@ -2090,10 +2155,20 @@ async fn update_goal_embeddings(
 fn build_system_prompt(
     _scheduler: &ThreadScheduler<MmapVectorStore>,
     goals: &GoalManager,
+    tool_registry: &ToolRegistry,
     reconstitution_summary: Option<&str>,
     peripheral_awareness: Option<&str>,
 ) -> String {
-    let mut prompt = DEFAULT_SYSTEM_PROMPT.to_string();
+    // Auto-generate tool catalog from the actually registered tools.
+    // Constitution: "Real Capabilities, Not Hallucinated Ones" — the prompt must match reality.
+    let tool_catalog = tool_registry.tool_catalog_prompt();
+    let mut prompt = String::with_capacity(
+        SYSTEM_PROMPT_PREAMBLE.len() + tool_catalog.len() + SYSTEM_PROMPT_SUFFIX.len() + 512,
+    );
+    prompt.push_str(SYSTEM_PROMPT_PREAMBLE);
+    prompt.push_str(&tool_catalog);
+    prompt.push_str(SYSTEM_PROMPT_SUFFIX);
+
     let goals_summary = goals.goals_summary();
     if !goals_summary.is_empty() {
         prompt.push_str("\n\n## Current Goals\n");

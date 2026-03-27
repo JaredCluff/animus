@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Mounts the Synology 'containers' SMB share at ~/synology/containers.
 # Idempotent — safe to call multiple times. Retries 3x on failure.
+# NOTE: mount_smbfs on macOS embeds credentials in the process argv; this is a
+# known macOS limitation with no workaround via this tool. The window is narrow
+# (duration of the mount_smbfs call only) and the risk is low on a home network.
 set -uo pipefail
 
 MOUNT_POINT="${HOME}/synology/containers"
@@ -19,14 +22,19 @@ if mount | grep -qF "${MOUNT_POINT}"; then
 fi
 
 [[ -f "${CREDS_FILE}" ]] || { echo "ERROR: ${CREDS_FILE} not found. Create it with the Synology password (chmod 600)." >&2; exit 1; }
-PASS=$(cat "${CREDS_FILE}")
 
-for i in $(seq 1 ${MAX_RETRIES}); do
+PERMS=$(stat -f "%OLp" "${CREDS_FILE}")
+[[ "${PERMS}" == "600" ]] || { echo "ERROR: ${CREDS_FILE} must be chmod 600 (currently ${PERMS})." >&2; exit 1; }
+
+PASS=$(cat "${CREDS_FILE}")
+[[ -n "${PASS}" ]] || { echo "ERROR: ${CREDS_FILE} is empty." >&2; exit 1; }
+
+for (( i=1; i<=MAX_RETRIES; i++ )); do
   if mount_smbfs "//${SYNOLOGY_USER}:${PASS}@${SYNOLOGY_HOST}/${SYNOLOGY_SHARE}" "${MOUNT_POINT}" 2>/dev/null; then
     echo "Mounted //${SYNOLOGY_HOST}/${SYNOLOGY_SHARE} at ${MOUNT_POINT}"
     exit 0
   fi
-  if [[ $i -lt ${MAX_RETRIES} ]]; then
+  if (( i < MAX_RETRIES )); then
     echo "Mount attempt $i failed — retrying in ${RETRY_DELAY}s..."
     sleep ${RETRY_DELAY}
   fi
