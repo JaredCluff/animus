@@ -1,3 +1,4 @@
+pub mod capability_registry;
 pub mod engine_registry;
 pub mod model_plan;
 pub mod smart_router;
@@ -14,6 +15,7 @@ pub mod telos;
 pub mod thread;
 pub mod tools;
 
+pub use capability_registry::CapabilityRegistry;
 pub use engine_registry::{CognitiveRole, EngineConfig, EngineRegistry, Provider};
 pub use model_plan::{HeuristicClassifier, ModelPlan, ModelSpec, Route, RouteStats, TaskClass, ThinkLevel};
 pub use smart_router::{RouteDecision, RouteHealth, SmartRouter};
