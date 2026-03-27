@@ -96,10 +96,12 @@ pub struct ReasoningOutput {
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
     /// The model name that produced this output.
-    /// Set by `process_turn_with_engines` — empty string when calling `reason()` directly.
+    /// Each `reason()` implementation populates this with `self.model_name()` as a baseline.
+    /// `process_turn_with_engines` overwrites it with the winning engine's name and sets
+    /// `fell_back` when the primary engine was skipped.
     pub engine_used: String,
     /// True when a fallback engine was used because the primary was unavailable.
-    /// Set by `process_turn_with_engines`.
+    /// Set (and may override the value from `reason()`) by `process_turn_with_engines`.
     pub fell_back: bool,
 }
 

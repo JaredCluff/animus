@@ -17,7 +17,8 @@
 //! Write authority is intentionally split by operation:
 //!
 //! - `SmartRouter` sets the flag `true` ("arm") when it fires the Signal.
-//! - `AnthropicEngine::reason()` resets the flag `false` ("reset") when capacity recovers.
+//! - `AnthropicEngine::reason()` and `OpenAICompatEngine::reason()` reset the flag `false`
+//!   ("reset") when capacity recovers, via [`RateLimitState::apply_update`].
 //!
 //! This ensures exactly one Signal per threshold crossing without a central coordinator.
 //! Use [`RateLimitState::apply_update`] to apply a parsed update while preserving this flag
@@ -58,7 +59,8 @@ pub struct RateLimitState {
     ///
     /// Write authority is split by operation — each writer has exactly one direction:
     /// - `SmartRouter` sets this `true` ("arm") when it fires the Signal.
-    /// - `AnthropicEngine::reason()` resets this `false` ("reset") when capacity recovers.
+    /// - `AnthropicEngine::reason()` and `OpenAICompatEngine::reason()` reset this `false`
+    ///   ("reset") when capacity recovers, via [`RateLimitState::apply_update`].
     ///
     /// When updating the whole struct from parsed response headers, use
     /// [`RateLimitState::apply_update`] rather than a plain `*state = parsed` — the plain
