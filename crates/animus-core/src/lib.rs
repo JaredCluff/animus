@@ -22,7 +22,7 @@ pub use capability::{CapabilityState, CognitiveTier};
 pub use content_sensitivity::{ContentSensitivity, SensitivityScan};
 pub use rate_limit::{RateLimitState, RATE_LIMIT_NEAR_THRESHOLD};
 pub use mesh::{AttestationFields, CapabilityAttestation, MeshRole, RoleMesh, VerifiedAttestation};
-pub use provider_catalog::{known_providers, provider_trust_map};
+pub use provider_catalog::{known_providers, load_providers_json, provider_trust_map, ProviderEntry, ProviderModelEntry};
 pub use provider_meta::{CostTier, DataPolicy, OwnershipRisk, ProviderTrustProfile, QualityTier, SpeedTier};
 pub use succession::SuccessionPolicy;
 pub use config::{AnimusConfig, BudgetConfig, CortexConfig, EmbeddingConfig, EmbeddingProviderKind, FederationConfig, HealthConfig, InterfaceConfig, MnemosConfig, NatsChannelConfig, PrincipalConfig, PrincipalRole, QualityGateConfig, RegistrationConfig, SensoriumConfig, SnapshotConfig, VectorFSConfig};

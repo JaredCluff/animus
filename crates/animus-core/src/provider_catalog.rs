@@ -1,5 +1,7 @@
 // crates/animus-core/src/provider_catalog.rs
-use crate::provider_meta::{DataPolicy, OwnershipRisk, ProviderTrustProfile};
+use crate::provider_meta::{CostTier, DataPolicy, OwnershipRisk, ProviderTrustProfile, QualityTier, SpeedTier};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Static catalog of known LLM providers with pre-evaluated trust profiles.
 /// Used by SmartRouter at startup and by TrustEvaluator as a fallback seed.
@@ -72,6 +74,35 @@ pub fn provider_trust_map() -> std::collections::HashMap<String, ProviderTrustPr
         .into_iter()
         .map(|p| (p.provider_id.clone(), p))
         .collect()
+}
+
+/// A provider entry in providers.json — written by AccountRegistrar, read by ProvidersJsonWatcher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEntry {
+    pub provider_id: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub models: Vec<ProviderModelEntry>,
+    pub trust: ProviderTrustProfile,
+    pub registered_at: DateTime<Utc>,
+    pub registration_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelEntry {
+    pub model_id: String,
+    pub cost_tier: CostTier,
+    pub speed_tier: SpeedTier,
+    pub quality_tier: QualityTier,
+}
+
+/// Load and deserialize providers.json, returning an empty vec on any error.
+pub fn load_providers_json(path: &std::path::Path) -> Vec<ProviderEntry> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

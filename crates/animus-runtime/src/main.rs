@@ -344,7 +344,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Build engine registry from config + env vars.
     // Provider dispatch: anthropic (default) | ollama | openai | mock
     // Per-role overrides: ANIMUS_{REASONING,REFLECTION,PERCEPTION}_MODEL and _PROVIDER
-    let engine_registry = {
+    let mut engine_registry = {
         let provider_str = config.cortex.llm_provider.clone();
         let base_url = config.cortex.openai_base_url.clone();
         let api_key = config.cortex.api_key.clone()
@@ -481,6 +481,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 store.clone() as Arc<dyn animus_vectorfs::VectorStore>,
                 embedder.clone(),
             )),
+            Box::new(animus_cortex::ProvidersJsonWatcher::new(
+                data_dir.join("providers.json"),
+            )),
         ],
         signal_tx.clone(),
         data_dir.join("watchers.json"),
@@ -500,7 +503,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         );
     }
     watcher_registry.start();
-    tracing::info!("Watcher registry started (4 watchers: comms, segment_pressure, sensorium_health, capability_probe)");
+    tracing::info!("Watcher registry started (5 watchers: comms, segment_pressure, sensorium_health, capability_probe, providers_json)");
 
     // ── Model Plan + Smart Router ─────────────────────────────────────────────────
     // Animus builds and owns its own cognitive routing plan. The plan is persisted
@@ -1221,6 +1224,53 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         // Poll signal bridge — deliver signals from background cognitive loops.
         // Urgent signals also become proactive messages when autonomy mode allows.
         while let Ok(signal) = signal_rx.try_recv() {
+            // Hot-reload new engines when providers.json gains entries.
+            if signal.summary.contains("providers.json: new provider") {
+                let entries = animus_core::load_providers_json(&data_dir.join("providers.json"));
+                for entry in &entries {
+                    use animus_core::provider_meta::OwnershipRisk;
+                    if entry.trust.ownership_risk == OwnershipRisk::Prohibited {
+                        tracing::warn!(
+                            "providers.json: skipping prohibited provider '{}'",
+                            entry.provider_id
+                        );
+                        continue;
+                    }
+                    for model in &entry.models {
+                        if engine_registry
+                            .engine_by_spec(&entry.provider_id, &model.model_id)
+                            .is_none()
+                        {
+                            match OpenAICompatEngine::new(
+                                &entry.base_url,
+                                &entry.api_key,
+                                &model.model_id,
+                                8192,
+                            ) {
+                                Ok(eng) => {
+                                    engine_registry.add_named(
+                                        &entry.provider_id,
+                                        &model.model_id,
+                                        std::sync::Arc::new(eng),
+                                    );
+                                    tracing::info!(
+                                        "Hot-loaded new engine: {}:{}",
+                                        entry.provider_id,
+                                        model.model_id
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "providers.json: failed to build engine for {}:{} — {e}",
+                                        entry.provider_id,
+                                        model.model_id
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if signal.priority == animus_core::threading::SignalPriority::Urgent
                 && autonomy_mode != animus_core::config::AutonomyMode::Reactive
             {
