@@ -186,7 +186,22 @@ impl SmartRouter {
         let route_health = health.get(class_name);
         let primary_degraded = route_health.map(|h| h.degraded).unwrap_or(false);
         // CRITICAL-2: also gate on ModelHealthWatcher probe status, not just consecutive failures
-        let primary_healthy = self.is_engine_healthy(&route.primary);
+        let primary = match route.primary() {
+            Some(p) => p,
+            None => {
+                return RouteDecision {
+                    class_name: class_name.to_string(),
+                    model_spec: ModelSpec {
+                        provider: "anthropic".to_string(),
+                        model: "fallback".to_string(),
+                        think: crate::model_plan::ThinkLevel::Dynamic,
+                        cost: None, speed: None, quality: None, trust_floor: 0,
+                    },
+                    fallback_index: 0,
+                };
+            }
+        };
+        let primary_healthy = self.is_engine_healthy(primary);
 
         if !primary_degraded && primary_healthy {
             // Layer 2 + 3: rate limit check with single write-lock (atomic read + arm flag)
@@ -194,7 +209,7 @@ impl SmartRouter {
             // happen inside the same guard. Drop all rate_limit_states locks before try_send.
             let (near_limit, should_notify) = {
                 let states = self.rate_limit_states.lock();
-                if let Some(rl_arc) = states.get(&route.primary.model) {
+                if let Some(rl_arc) = states.get(&primary.model) {
                     let mut state = rl_arc.write(); // write lock — need to set flag atomically
                     let near = state.is_near_limit(animus_core::RATE_LIMIT_NEAR_THRESHOLD);
                     let notify = near && !state.near_limit_notified;
@@ -210,14 +225,14 @@ impl SmartRouter {
             if near_limit {
                 // Layer 3: fire one Signal on threshold crossing (try_send is non-blocking — no .await needed)
                 if should_notify {
-                    tracing::info!("Rate limit near for model '{}' — routing to fallback", route.primary.model);
+                    tracing::info!("Rate limit near for model '{}' — routing to fallback", primary.model);
                     let _ = self.signal_tx.try_send(Signal {
                         source_thread: self.source_id,
                         target_thread: ThreadId::default(),
                         priority: SignalPriority::Normal,
                         summary: format!(
                             "Rate limit near for model '{}' — routing to fallback",
-                            route.primary.model
+                            primary.model
                         ),
                         segment_refs: vec![],
                         created: Utc::now(),
@@ -225,7 +240,7 @@ impl SmartRouter {
                 }
 
                 // Route to first non-degraded, healthy fallback
-                for (i, fallback) in route.fallbacks.iter().enumerate() {
+                for (i, fallback) in route.fallbacks().iter().enumerate() {
                     let fb_key = format!("{}:fallback:{}", class_name, i);
                     let fb_degraded = health.get(&fb_key).map(|h| h.degraded).unwrap_or(false);
                     if !fb_degraded && self.is_engine_healthy(fallback) {
@@ -240,20 +255,20 @@ impl SmartRouter {
                 // No fallback available — return primary anyway
                 return RouteDecision {
                     class_name: class_name.to_string(),
-                    model_spec: route.primary.clone(),
+                    model_spec: primary.clone(),
                     fallback_index: 0,
                 };
             }
 
             return RouteDecision {
                 class_name: class_name.to_string(),
-                model_spec: route.primary.clone(),
+                model_spec: primary.clone(),
                 fallback_index: 0,
             };
         }
 
         // Primary degraded or unhealthy — try fallbacks
-        for (i, fallback) in route.fallbacks.iter().enumerate() {
+        for (i, fallback) in route.fallbacks().iter().enumerate() {
             let fb_key = format!("{}:fallback:{}", class_name, i);
             let fb_degraded = health.get(&fb_key).map(|h| h.degraded).unwrap_or(false);
             if !fb_degraded && self.is_engine_healthy(fallback) {
@@ -267,7 +282,7 @@ impl SmartRouter {
 
         // All degraded/unhealthy — fire Urgent signal and return primary anyway.
         // MAJOR-1: clone primary spec BEFORE dropping plan to eliminate TOCTOU with update_plan().
-        let primary_spec = route.primary.clone();
+        let primary_spec = primary.clone();
         drop(health);
         drop(plan);
         let summary = format!("All models in route '{}' are degraded — chain exhausted", class_name);
@@ -473,9 +488,7 @@ impl SmartRouter {
 
         // Build candidate list: primary first, then fallbacks
         let candidates: Vec<(usize, &crate::model_plan::ModelSpec)> =
-            std::iter::once((0, &route.primary))
-            .chain(route.fallbacks.iter().enumerate().map(|(i, f)| (i + 1, f)))
-            .collect();
+            route.candidates.iter().enumerate().collect();
 
         for (fallback_index, spec) in candidates {
             // Hard prohibition check
@@ -534,9 +547,7 @@ impl SmartRouter {
         };
 
         let candidates: Vec<(usize, &crate::model_plan::ModelSpec)> =
-            std::iter::once((0, &route.primary))
-            .chain(route.fallbacks.iter().enumerate().map(|(i, f)| (i + 1, f)))
-            .collect();
+            route.candidates.iter().enumerate().collect();
 
         candidates.into_iter()
             .filter(|(_, spec)| {
@@ -585,11 +596,12 @@ mod tests {
         }))
     }
 
-    fn make_router() -> (SmartRouter, mpsc::Receiver<Signal>) {
-        let plan = ModelPlan::default_plan(&[
-            "ollama:qwen3.5:35b".to_string(),
-            "ollama:qwen3.5:9b".to_string(),
-        ]);
+    async fn make_router_async() -> (SmartRouter, mpsc::Receiver<Signal>) {
+        use crate::capability_registry::CapabilityRegistry;
+        use crate::model_plan::default_task_classes;
+        let available = vec!["ollama:qwen3.5:35b".to_string(), "ollama:qwen3.5:9b".to_string()];
+        let registry = CapabilityRegistry::build(None, &[], &available).await;
+        let plan = ModelPlan::build_from_capabilities(&registry, &available, default_task_classes());
         let plan_arc = Arc::new(RwLock::new(plan));
         let (tx, rx) = mpsc::channel(32);
         let router = SmartRouter::new(plan_arc, tx);
@@ -598,19 +610,19 @@ mod tests {
 
     #[tokio::test]
     async fn routes_to_primary_when_rate_limit_is_ok() {
-        let (router, _rx) = make_router();
+        let (router, _rx) = make_router_async().await;
         // Register primary with healthy (50%) remaining capacity
-        router.register_rate_limit_state("ollama:qwen3.5:35b", make_ok_state());
+        router.register_rate_limit_state("qwen3.5:35b", make_ok_state());
         let decision = router.select_for_class("Analytical").await;
         assert_eq!(decision.fallback_index, 0, "should use primary when rate limit is healthy");
     }
 
     #[tokio::test]
     async fn routes_to_fallback_when_primary_near_limit() {
-        let (router, _rx) = make_router();
+        let (router, _rx) = make_router_async().await;
         // Register the Analytical primary as near-limit
         let state = make_near_limit_state();
-        router.register_rate_limit_state("ollama:qwen3.5:35b", state);
+        router.register_rate_limit_state("qwen3.5:35b", state);
         let decision = router.select_for_class("Analytical").await;
         // Should have used a fallback (fallback_index > 0)
         assert!(decision.fallback_index > 0, "expected fallback route, got primary");
@@ -618,9 +630,9 @@ mod tests {
 
     #[tokio::test]
     async fn fires_signal_on_first_near_limit_crossing() {
-        let (router, mut rx) = make_router();
+        let (router, mut rx) = make_router_async().await;
         let state = make_near_limit_state();
-        router.register_rate_limit_state("ollama:qwen3.5:35b", state);
+        router.register_rate_limit_state("qwen3.5:35b", state);
         router.select_for_class("Analytical").await;
         // Signal should have been sent with the right priority and content
         let signal = rx.try_recv().expect("expected a Signal to be fired");
@@ -634,14 +646,14 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_fire_duplicate_signal_when_already_notified() {
-        let (router, mut rx) = make_router();
+        let (router, mut rx) = make_router_async().await;
         let state = Arc::new(ParkingRwLock::new(RateLimitState {
             requests_limit: Some(1000),
             requests_remaining: Some(50),
             near_limit_notified: true, // already fired — flag was set by a prior routing call
             ..Default::default()
         }));
-        router.register_rate_limit_state("ollama:qwen3.5:35b", state);
+        router.register_rate_limit_state("qwen3.5:35b", state);
         let decision = router.select_for_class("Analytical").await;
         // No new Signal (flag was already set)
         assert!(rx.try_recv().is_err(), "should not fire duplicate Signal");
@@ -651,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_returns_decision() {
-        let (router, _rx) = make_router();
+        let (router, _rx) = make_router_async().await;
         let (decision, _escalate) = router.route("implement a rust function").await;
         assert!(!decision.class_name.is_empty());
         assert!(!decision.model_spec.model.is_empty());
@@ -659,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_success_clears_failures() {
-        let (router, _rx) = make_router();
+        let (router, _rx) = make_router_async().await;
         router.record_failure("Technical").await;
         router.record_failure("Technical").await;
         router.record_success("Technical", 500).await;
@@ -671,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_failure_degrades_after_threshold() {
-        let (router, mut rx) = make_router();
+        let (router, mut rx) = make_router_async().await;
         router.record_failure("Technical").await;
         router.record_failure("Technical").await;
         router.record_failure("Technical").await; // threshold hit
@@ -687,7 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_route_falls_back() {
-        let (router, _rx) = make_router();
+        let (router, _rx) = make_router_async().await;
         // Mark "Analytical" primary as degraded
         {
             let mut h = router.route_health.lock();
@@ -699,7 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_stats_accumulate() {
-        let (router, _rx) = make_router();
+        let (router, _rx) = make_router_async().await;
         router.record_success("Technical", 300).await;
         router.record_success("Technical", 700).await;
         let stats = router.route_stats_snapshot().await;
@@ -710,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn prohibited_provider_never_selected() {
-        let (router, _rx) = make_router();
+        let (router, _rx) = make_router_async().await;
         assert!(router.is_prohibited("qwen-api"), "qwen-api must be prohibited");
         assert!(router.is_prohibited("deepseek-api"), "deepseek-api must be prohibited");
         assert!(!router.is_prohibited("anthropic"), "anthropic must not be prohibited");

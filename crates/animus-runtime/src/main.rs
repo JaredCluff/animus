@@ -150,41 +150,14 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Build a `ModelPlan` by asking the fallback LLM engine to reason about available models.
-/// Returns None if the LLM call fails or the response cannot be parsed.
-/// The caller falls back to `ModelPlan::default_plan()` on None.
-async fn build_model_plan_via_llm(
+/// Build a `ModelPlan` deterministically from capability profiles.
+/// No LLM tokens consumed — scoring is pure arithmetic over `ModelCapabilityProfile`.
+async fn build_model_plan_from_capabilities(
     available_models: &[String],
-    config_hash: &str,
-    registry: &EngineRegistry,
-) -> Option<ModelPlan> {
-    use animus_cortex::llm::{Role, Turn};
-
-    let prompt = ModelPlan::build_prompt(available_models);
-    // Prefer Perception engine (e.g. Cerebras) for plan building — it's free and fast.
-    // Fall back to the default engine if no Perception engine is registered.
-    let engine: &dyn animus_cortex::ReasoningEngine =
-        registry.engine_for(animus_cortex::CognitiveRole::Perception);
-
-    let result = engine.reason(
-        "You are configuring your own cognitive routing plan. Respond with JSON only.",
-        &[Turn::text(Role::User, &prompt)],
-        None,
-    ).await;
-
-    match result {
-        Ok(output) if !output.content.is_empty() => {
-            ModelPlan::parse_from_response(&output.content, config_hash.to_string())
-        }
-        Ok(_) => {
-            tracing::warn!("model plan build: LLM returned empty response");
-            None
-        }
-        Err(e) => {
-            tracing::warn!("model plan build: LLM call failed: {e}");
-            None
-        }
-    }
+    registry: &animus_cortex::capability_registry::CapabilityRegistry,
+) -> ModelPlan {
+    use animus_cortex::model_plan::default_task_classes;
+    ModelPlan::build_from_capabilities(registry, available_models, default_task_classes())
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -526,6 +499,56 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // Animus builds and owns its own cognitive routing plan. The plan is persisted
     // and reused until the available model set changes. Cortex substrate tracks
     // RouteStats; AILF reasoning thread can reach in via introspective tools.
+
+    // Discover available models early — needed for CapabilityRegistry build.
+    let mut available_models_pre: Vec<String> = Vec::new();
+    if config.cortex.llm_provider.to_lowercase() == "ollama" || config.cortex.openai_base_url.contains("11434") {
+        let ollama_url_pre = if config.cortex.openai_base_url.is_empty() {
+            "http://localhost:11434"
+        } else {
+            config.cortex.openai_base_url.trim_end_matches('/')
+        };
+        let tags_url_pre = format!("{}/api/tags", ollama_url_pre);
+        if let Ok(resp) = reqwest::Client::new().get(&tags_url_pre).timeout(std::time::Duration::from_secs(5)).send().await {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(models) = body["models"].as_array() {
+                        for m in models {
+                            if let Some(name) = m["name"].as_str() {
+                                available_models_pre.push(format!("ollama:{}", name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let configured_pre = format!("{}:{}", config.cortex.llm_provider, config.cortex.model_id);
+    if !available_models_pre.iter().any(|m| m == &configured_pre) {
+        available_models_pre.push(configured_pre);
+    }
+    for id in engine_registry.named_model_ids() {
+        if !available_models_pre.iter().any(|m| m == &id) {
+            available_models_pre.push(id);
+        }
+    }
+
+    // Build CapabilityRegistry: static profiles + optional Ollama probe
+    let ollama_base_for_registry = if config.cortex.llm_provider.to_lowercase() == "ollama" || config.cortex.openai_base_url.contains("11434") {
+        Some(if config.cortex.openai_base_url.is_empty() {
+            "http://localhost:11434".to_string()
+        } else {
+            config.cortex.openai_base_url.trim_end_matches('/').to_string()
+        })
+    } else {
+        None
+    };
+    let capability_registry = animus_cortex::capability_registry::CapabilityRegistry::build(
+        ollama_base_for_registry.as_deref(),
+        &[],
+        &available_models_pre,
+    ).await;
+
     let smart_router: Option<SmartRouter> = {
         let plan_path = data_dir.join("model_plan.json");
 
@@ -580,35 +603,21 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             p
         } else {
             tracing::info!(
-                "Building new model plan from {} available models",
+                "Building new model plan from {} available models (capability scoring)",
                 available_models.len()
             );
 
-            // Try to build via LLM — use the fallback engine (first reachable)
-            let built = build_model_plan_via_llm(
+            let p = build_model_plan_from_capabilities(
                 &available_models,
-                &config_hash,
-                &engine_registry,
+                &capability_registry,
             ).await;
 
-            match built {
-                Some(p) => {
-                    if let Err(e) = p.save(&plan_path) {
-                        tracing::warn!("Could not persist model plan: {e}");
-                    } else {
-                        tracing::info!("Model plan built and saved (reason: {})", p.build_reason);
-                    }
-                    p
-                }
-                None => {
-                    tracing::warn!("LLM plan build failed — using rule-based default plan");
-                    let p = ModelPlan::default_plan(&available_models);
-                    if let Err(e) = p.save(&plan_path) {
-                        tracing::warn!("Could not persist default model plan: {e}");
-                    }
-                    p
-                }
+            if let Err(e) = p.save(&plan_path) {
+                tracing::warn!("Could not persist model plan: {e}");
+            } else {
+                tracing::info!("Model plan built and saved (reason: {})", p.build_reason);
             }
+            p
         };
 
         let plan_arc = std::sync::Arc::new(tokio::sync::RwLock::new(plan));
