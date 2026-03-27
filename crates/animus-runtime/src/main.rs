@@ -543,11 +543,13 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     } else {
         None
     };
-    let capability_registry = animus_cortex::capability_registry::CapabilityRegistry::build(
-        ollama_base_for_registry.as_deref(),
-        &[],
-        &available_models_pre,
-    ).await;
+    let capability_registry = std::sync::Arc::new(
+        animus_cortex::capability_registry::CapabilityRegistry::build(
+            ollama_base_for_registry.as_deref(),
+            &[],
+            &available_models_pre,
+        ).await
+    );
 
     let smart_router: Option<SmartRouter> = {
         let plan_path = data_dir.join("model_plan.json");
@@ -621,7 +623,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         };
 
         let plan_arc = std::sync::Arc::new(tokio::sync::RwLock::new(plan));
-        Some(SmartRouter::new(plan_arc, signal_tx.clone()))
+        Some(SmartRouter::new(plan_arc, signal_tx.clone(), capability_registry.clone()))
     };
 
     // Register rate limit state for all engines with SmartRouter.

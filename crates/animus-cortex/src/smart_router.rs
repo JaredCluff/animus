@@ -96,12 +96,15 @@ pub struct SmartRouter {
     /// Engine availability — keyed by "provider:model", updated by ModelHealthWatcher.
     /// `true` = available (default when not yet probed), `false` = unavailable.
     engine_health: Arc<parking_lot::Mutex<HashMap<String, bool>>>,
+    /// Capability profiles for all available models — used by ModelScorer at routing time.
+    capability_registry: Arc<crate::capability_registry::CapabilityRegistry>,
 }
 
 impl SmartRouter {
     pub fn new(
         plan: Arc<RwLock<ModelPlan>>,
         signal_tx: mpsc::Sender<Signal>,
+        capability_registry: Arc<crate::capability_registry::CapabilityRegistry>,
     ) -> Self {
         let classifier = {
             // Safe at construction time — no concurrent writers exist yet.
@@ -129,6 +132,7 @@ impl SmartRouter {
             trust_registry: Arc::new(parking_lot::Mutex::new(trust_map)),
             prohibited_providers: Arc::new(parking_lot::Mutex::new(prohibited)),
             engine_health: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            capability_registry,
         }
     }
 
@@ -149,144 +153,145 @@ impl SmartRouter {
     /// Select the best available `ModelSpec` for an input using heuristics.
     /// If confidence is below threshold, the caller should escalate to the Perception engine.
     /// Returns `(RouteDecision, needs_perception_escalation)`.
-    pub async fn route(&self, input: &str) -> (RouteDecision, bool) {
+    pub async fn route(&self, input: &str, pressure: BudgetPressure) -> (RouteDecision, bool) {
         let (class_name, confidence) = self.classify_heuristic(input).await;
         let needs_escalation = confidence < HEURISTIC_CONFIDENCE_THRESHOLD;
-
-        let decision = self.select_for_class(&class_name).await;
+        let decision = self.select_for_class(&class_name, pressure).await;
         (decision, needs_escalation)
     }
 
-    /// Select a `RouteDecision` for a given task class name, respecting fallback order
-    /// and skipping degraded or probe-unhealthy primaries.
-    pub async fn select_for_class(&self, class_name: &str) -> RouteDecision {
+    /// Select the best available model for a task class using live scoring.
+    ///
+    /// Scores all candidates in the route against current runtime state, returns
+    /// the highest-scoring non-zero candidate. Falls back to first candidate with
+    /// an Urgent Signal if all score 0.
+    pub async fn select_for_class(
+        &self,
+        class_name: &str,
+        pressure: BudgetPressure,
+    ) -> RouteDecision {
+        use crate::model_scorer::{ModelScorer, ScoringContext};
+
         let plan = self.plan.read().await;
-        let health = self.route_health.lock();
 
-        let route = plan.routes.get(class_name)
-            .or_else(|| plan.routes.values().next()); // fall back to any route
-
-        let Some(route) = route else {
-            // No plan at all — return a stub that the runtime will handle via EngineRegistry fallback
-            return RouteDecision {
-                class_name: class_name.to_string(),
-                model_spec: ModelSpec {
-                    provider: "anthropic".to_string(),
-                    model: "fallback".to_string(),
-                    think: crate::model_plan::ThinkLevel::Dynamic,
-                    cost: None,
-                    speed: None,
-                    quality: None,
-                    trust_floor: 0,
-                },
-                fallback_index: 0,
-            };
-        };
-
-        let route_health = health.get(class_name);
-        let primary_degraded = route_health.map(|h| h.degraded).unwrap_or(false);
-        // CRITICAL-2: also gate on ModelHealthWatcher probe status, not just consecutive failures
-        let primary = match route.primary() {
-            Some(p) => p,
+        let route = match plan.routes.get(class_name).or_else(|| plan.routes.values().next()) {
+            Some(r) => r,
             None => {
-                return RouteDecision {
-                    class_name: class_name.to_string(),
-                    model_spec: ModelSpec {
-                        provider: "anthropic".to_string(),
-                        model: "fallback".to_string(),
-                        think: crate::model_plan::ThinkLevel::Dynamic,
-                        cost: None, speed: None, quality: None, trust_floor: 0,
-                    },
-                    fallback_index: 0,
-                };
+                drop(plan);
+                return self.stub_decision(class_name);
             }
         };
-        let primary_healthy = self.is_engine_healthy(primary);
 
-        if !primary_degraded && primary_healthy {
-            // Layer 2 + 3: rate limit check with single write-lock (atomic read + arm flag)
-            // Write lock prevents TOCTOU: reading is_near_limit() and setting near_limit_notified
-            // happen inside the same guard. Drop all rate_limit_states locks before try_send.
-            let (near_limit, should_notify) = {
+        let task_class = plan.task_classes.iter().find(|tc| tc.name == class_name).cloned();
+        let mut best: Option<(usize, ModelSpec, f32)> = None;
+
+        for (idx, spec) in route.candidates.iter().enumerate() {
+            let model_key = format!("{}:{}", spec.provider, spec.model);
+            let engine_available = self.is_engine_healthy(spec);
+
+            let (remaining_pct, rpm_ceiling, near_limit, should_notify) = {
                 let states = self.rate_limit_states.lock();
-                if let Some(rl_arc) = states.get(&primary.model) {
-                    let mut state = rl_arc.write(); // write lock — need to set flag atomically
+                if let Some(rl_arc) = states.get(&model_key) {
+                    let mut state = rl_arc.write();
+                    let pct = match (state.requests_limit, state.requests_remaining) {
+                        (Some(lim), Some(rem)) if lim > 0 => rem as f32 / lim as f32,
+                        _ => 1.0,
+                    };
+                    let ceiling = state.requests_limit;
                     let near = state.is_near_limit(animus_core::RATE_LIMIT_NEAR_THRESHOLD);
                     let notify = near && !state.near_limit_notified;
-                    if notify {
-                        state.near_limit_notified = true; // arm: SmartRouter owns this write
-                    }
-                    (near, notify)
+                    if notify { state.near_limit_notified = true; }
+                    (pct, ceiling, near, notify)
                 } else {
-                    (false, false)
+                    (1.0, None, false, false)
                 }
-            }; // all rate_limit_states locks dropped here — safe to try_send
+            };
 
-            if near_limit {
-                // Layer 3: fire one Signal on threshold crossing (try_send is non-blocking — no .await needed)
-                if should_notify {
-                    tracing::info!("Rate limit near for model '{}' — routing to fallback", primary.model);
-                    let _ = self.signal_tx.try_send(Signal {
-                        source_thread: self.source_id,
-                        target_thread: ThreadId::default(),
-                        priority: SignalPriority::Normal,
-                        summary: format!(
-                            "Rate limit near for model '{}' — routing to fallback",
-                            primary.model
-                        ),
-                        segment_refs: vec![],
-                        created: Utc::now(),
-                    });
-                }
-
-                // Route to first non-degraded, healthy fallback
-                for (i, fallback) in route.fallbacks().iter().enumerate() {
-                    let fb_key = format!("{}:fallback:{}", class_name, i);
-                    let fb_degraded = health.get(&fb_key).map(|h| h.degraded).unwrap_or(false);
-                    if !fb_degraded && self.is_engine_healthy(fallback) {
-                        return RouteDecision {
-                            class_name: class_name.to_string(),
-                            model_spec: fallback.clone(),
-                            fallback_index: i + 1,
-                        };
-                    }
-                }
-
-                // No fallback available — return primary anyway
-                return RouteDecision {
-                    class_name: class_name.to_string(),
-                    model_spec: primary.clone(),
-                    fallback_index: 0,
-                };
+            // Fire near-limit signal as soon as we detect the crossing — regardless of which
+            // candidate ends up selected.
+            if near_limit && should_notify {
+                tracing::info!("Rate limit near for model '{model_key}' — routing to fallback");
+                let _ = self.signal_tx.try_send(Signal {
+                    source_thread: self.source_id,
+                    target_thread: ThreadId::default(),
+                    priority: SignalPriority::Normal,
+                    summary: format!("Rate limit near for model '{model_key}' — routing to fallback"),
+                    segment_refs: vec![],
+                    created: Utc::now(),
+                });
             }
 
+            let profile_opt = self.capability_registry.get(&spec.provider, &spec.model);
+            let rpm_ceiling = profile_opt
+                .and_then(|p| p.rate_limit_rpm_ceiling)
+                .or(rpm_ceiling);
+
+            let learned = route.learned_quality_for(&model_key);
+
+            let context = ScoringContext {
+                rate_limit_remaining_pct: remaining_pct,
+                rate_limit_rpm_ceiling: rpm_ceiling,
+                budget_pressure: pressure,
+                engine_available,
+                learned_quality: learned,
+            };
+
+            let raw_score = if let (Some(profile), Some(ref tc)) = (profile_opt, &task_class) {
+                ModelScorer::score(profile, &tc.to_weights(), &context)
+            } else if engine_available && ModelScorer::passes_budget(
+                &animus_core::model_capability::ModelCapabilityProfile {
+                    provider: spec.provider.clone(),
+                    model_id: spec.model.clone(),
+                    parameter_count_b: None, release_date: None, context_window: None,
+                    reasoning_support: animus_core::model_capability::ReasoningSupport::None,
+                    generation_tok_per_sec: None,
+                    prefill_speed: animus_core::model_capability::PrefillSpeed::Moderate,
+                    rate_limit_rpm_ceiling: None, rate_limit_tpd_ceiling: None,
+                    cost_tier: spec.cost.unwrap_or(CostTier::Moderate),
+                    cost_per_mtok_input: None, cost_per_mtok_output: None,
+                    trust_score: 2,
+                    data_policy: animus_core::provider_meta::DataPolicy::Unknown,
+                    profile_source: animus_core::model_capability::ProfileSource::Inferred,
+                },
+                pressure,
+            ) {
+                0.3_f32
+            } else {
+                0.0
+            };
+
+            // Near-limit penalty: scale score by remaining capacity fraction so a healthy
+            // candidate at 100% always wins over a near-exhausted one at 5%.
+            let score = if near_limit {
+                raw_score * remaining_pct
+            } else {
+                raw_score
+            };
+
+            if score > 0.0 {
+                match &best {
+                    None => best = Some((idx, spec.clone(), score)),
+                    Some((_, _, best_score)) if score > *best_score => {
+                        best = Some((idx, spec.clone(), score));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let emergency_spec = route.candidates.first().cloned();
+        drop(plan);
+
+        if let Some((idx, spec, _)) = best {
             return RouteDecision {
                 class_name: class_name.to_string(),
-                model_spec: primary.clone(),
-                fallback_index: 0,
+                model_spec: spec,
+                fallback_index: idx,
             };
         }
 
-        // Primary degraded or unhealthy — try fallbacks
-        for (i, fallback) in route.fallbacks().iter().enumerate() {
-            let fb_key = format!("{}:fallback:{}", class_name, i);
-            let fb_degraded = health.get(&fb_key).map(|h| h.degraded).unwrap_or(false);
-            if !fb_degraded && self.is_engine_healthy(fallback) {
-                return RouteDecision {
-                    class_name: class_name.to_string(),
-                    model_spec: fallback.clone(),
-                    fallback_index: i + 1,
-                };
-            }
-        }
-
-        // All degraded/unhealthy — fire Urgent signal and return primary anyway.
-        // MAJOR-1: clone primary spec BEFORE dropping plan to eliminate TOCTOU with update_plan().
-        let primary_spec = primary.clone();
-        drop(health);
-        drop(plan);
-        let summary = format!("All models in route '{}' are degraded — chain exhausted", class_name);
-        tracing::error!("{}", summary);
+        let summary = format!("All models in route '{}' scored 0 — chain exhausted", class_name);
+        tracing::error!("{summary}");
         let _ = self.signal_tx.try_send(Signal {
             source_thread: self.source_id,
             target_thread: ThreadId::default(),
@@ -298,13 +303,31 @@ impl SmartRouter {
 
         RouteDecision {
             class_name: class_name.to_string(),
-            model_spec: primary_spec,
+            model_spec: emergency_spec.unwrap_or_else(|| self.stub_spec()),
             fallback_index: 0,
         }
     }
 
+    fn stub_decision(&self, class_name: &str) -> RouteDecision {
+        RouteDecision {
+            class_name: class_name.to_string(),
+            model_spec: self.stub_spec(),
+            fallback_index: 0,
+        }
+    }
+
+    fn stub_spec(&self) -> ModelSpec {
+        ModelSpec {
+            provider: "anthropic".to_string(),
+            model: "fallback".to_string(),
+            think: crate::model_plan::ThinkLevel::Dynamic,
+            cost: None, speed: None, quality: None, trust_floor: 0,
+        }
+    }
+
+
     /// Record a successful turn for a route — updates RouteStats (Layer 1).
-    pub async fn record_success(&self, class_name: &str, latency_ms: u64) {
+    pub async fn record_success(&self, class_name: &str, model_key: &str, latency_ms: u64) {
         {
             let mut health = self.route_health.lock();
             let h = health.entry(class_name.to_string()).or_default();
@@ -321,11 +344,15 @@ impl SmartRouter {
             route.stats.turn_count += 1;
             route.stats.total_latency_ms += latency_ms;
             route.stats.last_turn = Some(Utc::now());
+            let model_stats = route.model_stats.entry(model_key.to_string()).or_default();
+            model_stats.turn_count += 1;
+            model_stats.total_latency_ms += latency_ms;
+            model_stats.last_turn = Some(Utc::now());
         }
     }
 
     /// Record a failure for a route. Fires a Signal if the route degrades (Layer 2 → Layer 3).
-    pub async fn record_failure(&self, class_name: &str) {
+    pub async fn record_failure(&self, class_name: &str, model_key: &str) {
         let newly_degraded = {
             let mut health = self.route_health.lock();
             let h = health.entry(class_name.to_string()).or_default();
@@ -344,6 +371,9 @@ impl SmartRouter {
             if let Some(route) = plan.routes.get_mut(class_name) {
                 route.stats.failure_count += 1;
                 route.stats.turn_count += 1;
+                let model_stats = route.model_stats.entry(model_key.to_string()).or_default();
+                model_stats.failure_count += 1;
+                model_stats.turn_count += 1;
             }
         }
 
@@ -365,10 +395,12 @@ impl SmartRouter {
     }
 
     /// Record a quality gate correction for a route (from VectorFS feedback).
-    pub async fn record_correction(&self, class_name: &str) {
+    pub async fn record_correction(&self, class_name: &str, model_key: &str) {
         let mut plan = self.plan.write().await;
         if let Some(route) = plan.routes.get_mut(class_name) {
             route.stats.correction_count += 1;
+            let model_stats = route.model_stats.entry(model_key.to_string()).or_default();
+            model_stats.correction_count += 1;
         }
     }
 
@@ -604,26 +636,27 @@ mod tests {
         let plan = ModelPlan::build_from_capabilities(&registry, &available, default_task_classes());
         let plan_arc = Arc::new(RwLock::new(plan));
         let (tx, rx) = mpsc::channel(32);
-        let router = SmartRouter::new(plan_arc, tx);
+        let registry_arc = Arc::new(registry);
+        let router = SmartRouter::new(plan_arc, tx, registry_arc);
         (router, rx)
     }
 
     #[tokio::test]
     async fn routes_to_primary_when_rate_limit_is_ok() {
         let (router, _rx) = make_router_async().await;
-        // Register primary with healthy (50%) remaining capacity
-        router.register_rate_limit_state("qwen3.5:35b", make_ok_state());
-        let decision = router.select_for_class("Analytical").await;
+        // Register primary with healthy (50%) remaining capacity using the full model key
+        router.register_rate_limit_state("ollama:qwen3.5:35b", make_ok_state());
+        let decision = router.select_for_class("Analytical", BudgetPressure::Normal).await;
         assert_eq!(decision.fallback_index, 0, "should use primary when rate limit is healthy");
     }
 
     #[tokio::test]
     async fn routes_to_fallback_when_primary_near_limit() {
         let (router, _rx) = make_router_async().await;
-        // Register the Analytical primary as near-limit
+        // Register the Analytical primary as near-limit using the full model key
         let state = make_near_limit_state();
-        router.register_rate_limit_state("qwen3.5:35b", state);
-        let decision = router.select_for_class("Analytical").await;
+        router.register_rate_limit_state("ollama:qwen3.5:35b", state);
+        let decision = router.select_for_class("Analytical", BudgetPressure::Normal).await;
         // Should have used a fallback (fallback_index > 0)
         assert!(decision.fallback_index > 0, "expected fallback route, got primary");
     }
@@ -632,8 +665,8 @@ mod tests {
     async fn fires_signal_on_first_near_limit_crossing() {
         let (router, mut rx) = make_router_async().await;
         let state = make_near_limit_state();
-        router.register_rate_limit_state("qwen3.5:35b", state);
-        router.select_for_class("Analytical").await;
+        router.register_rate_limit_state("ollama:qwen3.5:35b", state);
+        router.select_for_class("Analytical", BudgetPressure::Normal).await;
         // Signal should have been sent with the right priority and content
         let signal = rx.try_recv().expect("expected a Signal to be fired");
         assert_eq!(signal.priority, SignalPriority::Normal);
@@ -653,8 +686,8 @@ mod tests {
             near_limit_notified: true, // already fired — flag was set by a prior routing call
             ..Default::default()
         }));
-        router.register_rate_limit_state("qwen3.5:35b", state);
-        let decision = router.select_for_class("Analytical").await;
+        router.register_rate_limit_state("ollama:qwen3.5:35b", state);
+        let decision = router.select_for_class("Analytical", BudgetPressure::Normal).await;
         // No new Signal (flag was already set)
         assert!(rx.try_recv().is_err(), "should not fire duplicate Signal");
         // But routing must still avoid the primary — signaling and routing are independent
@@ -664,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn route_returns_decision() {
         let (router, _rx) = make_router_async().await;
-        let (decision, _escalate) = router.route("implement a rust function").await;
+        let (decision, _escalate) = router.route("implement a rust function", BudgetPressure::Normal).await;
         assert!(!decision.class_name.is_empty());
         assert!(!decision.model_spec.model.is_empty());
     }
@@ -672,9 +705,9 @@ mod tests {
     #[tokio::test]
     async fn record_success_clears_failures() {
         let (router, _rx) = make_router_async().await;
-        router.record_failure("Technical").await;
-        router.record_failure("Technical").await;
-        router.record_success("Technical", 500).await;
+        router.record_failure("Technical", "ollama:qwen3.5:35b").await;
+        router.record_failure("Technical", "ollama:qwen3.5:35b").await;
+        router.record_success("Technical", "ollama:qwen3.5:35b", 500).await;
         let health = router.route_health_snapshot();
         let h = health.get("Technical").unwrap();
         assert_eq!(h.consecutive_failures, 0);
@@ -684,9 +717,9 @@ mod tests {
     #[tokio::test]
     async fn record_failure_degrades_after_threshold() {
         let (router, mut rx) = make_router_async().await;
-        router.record_failure("Technical").await;
-        router.record_failure("Technical").await;
-        router.record_failure("Technical").await; // threshold hit
+        router.record_failure("Technical", "ollama:qwen3.5:35b").await;
+        router.record_failure("Technical", "ollama:qwen3.5:35b").await;
+        router.record_failure("Technical", "ollama:qwen3.5:35b").await; // threshold hit
 
         let health = router.route_health_snapshot();
         assert!(health["Technical"].degraded);
@@ -700,20 +733,17 @@ mod tests {
     #[tokio::test]
     async fn degraded_route_falls_back() {
         let (router, _rx) = make_router_async().await;
-        // Mark "Analytical" primary as degraded
-        {
-            let mut h = router.route_health.lock();
-            h.entry("Analytical".to_string()).or_default().degraded = true;
-        }
-        let decision = router.select_for_class("Analytical").await;
+        // Mark the primary engine as unavailable — scorer checks engine_available, not route_health
+        router.set_engine_health("ollama:qwen3.5:35b", false);
+        let decision = router.select_for_class("Analytical", BudgetPressure::Normal).await;
         assert_eq!(decision.fallback_index, 1); // using first fallback
     }
 
     #[tokio::test]
     async fn route_stats_accumulate() {
         let (router, _rx) = make_router_async().await;
-        router.record_success("Technical", 300).await;
-        router.record_success("Technical", 700).await;
+        router.record_success("Technical", "ollama:qwen3.5:35b", 300).await;
+        router.record_success("Technical", "ollama:qwen3.5:35b", 700).await;
         let stats = router.route_stats_snapshot().await;
         let s = &stats["Technical"];
         assert_eq!(s.turn_count, 2);
@@ -749,5 +779,60 @@ mod tests {
         assert!(SmartRouter::passes_budget(&spec_free, BudgetPressure::Emergency));
         assert!(!SmartRouter::passes_budget(&spec_expensive, BudgetPressure::Emergency));
         assert!(SmartRouter::passes_budget(&spec_expensive, BudgetPressure::Normal));
+    }
+
+    #[tokio::test]
+    async fn scorer_prefers_higher_capability_candidate() {
+        use crate::capability_registry::CapabilityRegistry;
+        use crate::model_plan::{Route, RouteStats, ThinkLevel, default_task_classes};
+        use animus_core::budget::BudgetPressure;
+
+        // Build a plan with two candidates: first is small/old, second is large/recent
+        // The scorer should pick the second for an Analytical (quality-heavy) task
+        let small_old = ModelSpec {
+            provider: "ollama".to_string(), model: "tinyllama:1b".to_string(),
+            think: ThinkLevel::Off, cost: Some(CostTier::Free),
+            speed: None, quality: None, trust_floor: 0,
+        };
+        let large_recent = ModelSpec {
+            provider: "ollama".to_string(), model: "qwen3.5:35b".to_string(),
+            think: ThinkLevel::Dynamic, cost: Some(CostTier::Free),
+            speed: None, quality: None, trust_floor: 0,
+        };
+
+        let mut routes = std::collections::HashMap::new();
+        for tc in default_task_classes() {
+            routes.insert(tc.name.clone(), Route {
+                // Deliberately put small_old first (plan order) to test scorer overrides it
+                candidates: vec![small_old.clone(), large_recent.clone()],
+                model_stats: std::collections::HashMap::new(),
+                stats: RouteStats::default(),
+            });
+        }
+
+        let plan = ModelPlan {
+            id: uuid::Uuid::new_v4(), created: chrono::Utc::now(),
+            config_hash: "test".to_string(),
+            task_classes: default_task_classes(),
+            routes,
+            build_reason: "test".to_string(),
+        };
+
+        let (tx, _rx) = mpsc::channel(32);
+        // Use a registry with actual profiles so ModelScorer can differentiate them
+        let registry = Arc::new(
+            CapabilityRegistry::build(None, &[], &[
+                "ollama:tinyllama:1b".to_string(),
+                "ollama:qwen3.5:35b".to_string(),
+            ]).await
+        );
+        let router = SmartRouter::new(Arc::new(RwLock::new(plan)), tx, registry);
+
+        let decision = router.select_for_class("Analytical", BudgetPressure::Normal).await;
+        // The scorer should pick qwen3.5:35b (larger, newer, has extended thinking)
+        // over tinyllama:1b even though tinyllama is first in the candidate list
+        assert_eq!(decision.model_spec.model, "qwen3.5:35b",
+            "Analytical class should prefer 35B model over 1B via live scoring, got: {}",
+            decision.model_spec.model);
     }
 }
