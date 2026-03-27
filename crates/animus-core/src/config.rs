@@ -56,6 +56,13 @@ pub struct AnimusConfig {
     /// Voice input/output configuration (STT + TTS).
     #[serde(default)]
     pub voice: VoiceConfig,
+
+    /// Budget tracking and routing pressure configuration.
+    #[serde(default)]
+    pub budget: BudgetConfig,
+    /// Autonomous provider registration identity and timeouts.
+    #[serde(default)]
+    pub registration: RegistrationConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +206,76 @@ impl Default for SnapshotConfig {
             interval_secs: 3600, // hourly
             max_snapshots: 24,
             snapshot_dir: String::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Budget
+// ---------------------------------------------------------------------------
+
+/// Budget and routing pressure configuration.
+/// All thresholds are fractions of the monthly limit (0.0–1.0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    /// Monthly spend ceiling in USD. Override: ANIMUS_BUDGET_MONTHLY_USD
+    pub monthly_limit_usd: f32,
+    /// Spend fraction that triggers Careful pressure. Override: ANIMUS_BUDGET_CAREFUL_PCT
+    pub careful_threshold: f32,
+    /// Spend fraction that triggers Emergency pressure. Override: ANIMUS_BUDGET_EMERGENCY_PCT
+    pub emergency_threshold: f32,
+    /// If true, block all non-Free routing when budget is exceeded. Override: ANIMUS_BUDGET_HARD_CAP=1
+    pub hard_cap: bool,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            monthly_limit_usd: 50.0,
+            careful_threshold: 0.60,
+            emergency_threshold: 0.85,
+            hard_cap: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+/// Identity and timeout configuration for autonomous provider account registration.
+/// Identity fields default to empty — must be set via env vars or config file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistrationConfig {
+    /// Override: ANIMUS_REG_FIRST_NAME
+    pub first_name: String,
+    /// Override: ANIMUS_REG_LAST_NAME
+    pub last_name: String,
+    /// ISO date YYYY-MM-DD. Override: ANIMUS_REG_DOB
+    pub dob: String,
+    /// Primary phone (NANP, digits only). Override: ANIMUS_REG_PHONE_PRIMARY
+    pub phone_primary: String,
+    /// Fallback phone. Override: ANIMUS_REG_PHONE_FALLBACK
+    pub phone_fallback: String,
+    /// Seconds to wait for SMS code via Telegram. Override: ANIMUS_REG_SMS_TIMEOUT_SECS
+    pub sms_timeout_secs: u64,
+    /// Seconds to wait for CAPTCHA solution via Telegram. Override: ANIMUS_REG_CAPTCHA_TIMEOUT_SECS
+    pub captcha_timeout_secs: u64,
+    /// Seconds to wait for verification email. Override: ANIMUS_REG_EMAIL_TIMEOUT_SECS
+    pub email_timeout_secs: u64,
+}
+
+impl Default for RegistrationConfig {
+    fn default() -> Self {
+        Self {
+            first_name: String::new(),
+            last_name: String::new(),
+            dob: String::new(),
+            phone_primary: String::new(),
+            phone_fallback: String::new(),
+            sms_timeout_secs: 300,
+            captcha_timeout_secs: 300,
+            email_timeout_secs: 120,
         }
     }
 }
@@ -640,6 +717,8 @@ impl Default for AnimusConfig {
             security: SecurityConfig::default(),
             snapshot: SnapshotConfig::default(),
             voice: VoiceConfig::default(),
+            budget: BudgetConfig::default(),
+            registration: RegistrationConfig::default(),
         }
     }
 }
@@ -840,6 +919,42 @@ impl AnimusConfig {
             if !id.is_empty() {
                 self.voice.cartesia_voice_id = id;
             }
+        }
+
+        // Budget overrides
+        if let Ok(v) = std::env::var("ANIMUS_BUDGET_MONTHLY_USD") {
+            if let Ok(n) = v.parse::<f32>() {
+                self.budget.monthly_limit_usd = n;
+            }
+        }
+        if let Ok(v) = std::env::var("ANIMUS_BUDGET_CAREFUL_PCT") {
+            if let Ok(n) = v.parse::<f32>() {
+                self.budget.careful_threshold = n;
+            }
+        }
+        if let Ok(v) = std::env::var("ANIMUS_BUDGET_EMERGENCY_PCT") {
+            if let Ok(n) = v.parse::<f32>() {
+                self.budget.emergency_threshold = n;
+            }
+        }
+        if std::env::var("ANIMUS_BUDGET_HARD_CAP").as_deref() == Ok("1") {
+            self.budget.hard_cap = true;
+        }
+
+        // Registration overrides
+        if let Ok(v) = std::env::var("ANIMUS_REG_FIRST_NAME") { self.registration.first_name = v; }
+        if let Ok(v) = std::env::var("ANIMUS_REG_LAST_NAME") { self.registration.last_name = v; }
+        if let Ok(v) = std::env::var("ANIMUS_REG_DOB") { self.registration.dob = v; }
+        if let Ok(v) = std::env::var("ANIMUS_REG_PHONE_PRIMARY") { self.registration.phone_primary = v; }
+        if let Ok(v) = std::env::var("ANIMUS_REG_PHONE_FALLBACK") { self.registration.phone_fallback = v; }
+        if let Ok(v) = std::env::var("ANIMUS_REG_SMS_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse::<u64>() { self.registration.sms_timeout_secs = n; }
+        }
+        if let Ok(v) = std::env::var("ANIMUS_REG_CAPTCHA_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse::<u64>() { self.registration.captcha_timeout_secs = n; }
+        }
+        if let Ok(v) = std::env::var("ANIMUS_REG_EMAIL_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse::<u64>() { self.registration.email_timeout_secs = n; }
         }
     }
 
