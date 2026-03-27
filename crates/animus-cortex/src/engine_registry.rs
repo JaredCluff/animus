@@ -72,6 +72,12 @@ impl EngineRegistry {
     pub fn named_model_ids(&self) -> Vec<String> {
         self.by_name.keys().cloned().collect()
     }
+
+    /// Iterate over all named engines as ("provider:model", Arc<Engine>) pairs.
+    /// Used by ModelHealthWatcher to discover probe endpoints.
+    pub fn iter_named(&self) -> impl Iterator<Item = (&str, Arc<dyn ReasoningEngine>)> + '_ {
+        self.by_name.iter().map(|(k, v)| (k.as_str(), v.clone()))
+    }
 }
 
 /// LLM provider type.

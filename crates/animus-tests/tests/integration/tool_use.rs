@@ -130,6 +130,8 @@ fn test_reasoning_output_with_tool_calls() {
             input: serde_json::json!({"path": "/tmp/x"}),
         }],
         stop_reason: StopReason::ToolUse,
+        engine_used: String::new(),
+        fell_back: false,
     };
     assert_eq!(output.stop_reason, StopReason::ToolUse);
     assert_eq!(output.tool_calls.len(), 1);

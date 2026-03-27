@@ -93,6 +93,9 @@ pub struct SmartRouter {
     trust_registry: Arc<parking_lot::Mutex<ProviderTrustRegistry>>,
     /// Providers that are always blocked regardless of content or budget pressure.
     prohibited_providers: Arc<parking_lot::Mutex<ProhibitedSet>>,
+    /// Engine availability — keyed by "provider:model", updated by ModelHealthWatcher.
+    /// `true` = available (default when not yet probed), `false` = unavailable.
+    engine_health: Arc<parking_lot::Mutex<HashMap<String, bool>>>,
 }
 
 impl SmartRouter {
@@ -128,6 +131,7 @@ impl SmartRouter {
                     .collect();
                 Arc::new(parking_lot::Mutex::new(prohibited))
             },
+            engine_health: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -382,6 +386,24 @@ impl SmartRouter {
         tracing::info!("SmartRouter: plan updated, classifier rebuilt");
     }
 
+    /// Update the availability state of an engine (called by ModelHealthWatcher).
+    /// Key is "provider:model" — must match the ModelSpec in the plan.
+    pub fn set_engine_health(&self, key: &str, available: bool) {
+        self.engine_health.lock().insert(key.to_string(), available);
+    }
+
+    /// Check if an engine is currently available.
+    /// Returns `true` (optimistic) when not yet probed.
+    pub fn is_engine_available(&self, key: &str) -> bool {
+        *self.engine_health.lock().get(key).unwrap_or(&true)
+    }
+
+    /// Check if the engine for a ModelSpec is healthy.
+    fn is_engine_healthy(&self, spec: &crate::model_plan::ModelSpec) -> bool {
+        let key = format!("{}:{}", spec.provider, spec.model);
+        self.is_engine_available(&key)
+    }
+
     /// Register a rate limit state handle for a model.
     /// Call once per engine at startup: `router.register_rate_limit_state(engine.model_name(), engine.rate_limit_state().unwrap())`.
     pub fn register_rate_limit_state(
@@ -521,6 +543,7 @@ impl SmartRouter {
                 && !(sensitivity == ContentSensitivity::Critical && !Self::is_local_provider(&spec.provider))
                 && self.passes_trust(spec, required_floor)
                 && Self::passes_budget(spec, pressure)
+                && self.is_engine_healthy(spec)
             })
             .map(|(fallback_index, spec)| RouteDecision {
                 class_name: class_name.clone(),

@@ -1,11 +1,13 @@
 pub mod capability_probe;
 pub mod comms;
+pub mod model_health;
 pub mod providers;
 pub mod segment_pressure;
 pub mod sensorium_health;
 
 pub use capability_probe::CapabilityProbe;
 pub use comms::CommsWatcher;
+pub use model_health::run_model_health_watcher;
 pub use providers::ProvidersJsonWatcher;
 pub use segment_pressure::SegmentPressureWatcher;
 pub use sensorium_health::SensoriumHealthWatcher;

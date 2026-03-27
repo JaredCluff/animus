@@ -43,6 +43,24 @@ pub fn known_providers() -> Vec<ProviderTrustProfile> {
             effective_trust: 3,
             notes: "Local inference — no data leaves the host. Weights may be from any origin.".to_string(),
         },
+        ProviderTrustProfile {
+            provider_id: "nim".to_string(),
+            display_name: "NVIDIA NIM".to_string(),
+            hq_country: "US".to_string(),
+            ownership_risk: OwnershipRisk::Clean,
+            data_policy: DataPolicy::ShortWindow,
+            effective_trust: 3,
+            notes: "NVIDIA inference cloud; OpenAI-compatible API; $25 free credits tier.".to_string(),
+        },
+        ProviderTrustProfile {
+            provider_id: "openrouter".to_string(),
+            display_name: "OpenRouter".to_string(),
+            hq_country: "US".to_string(),
+            ownership_risk: OwnershipRisk::Clean,
+            data_policy: DataPolicy::ShortWindow,
+            effective_trust: 2,
+            notes: "US-based API aggregator; routes to many providers; free tier models available.".to_string(),
+        },
         // ── Prohibited ───────────────────────────────────────────────────────
         // PRC National Intelligence Law 2017 requires entities to cooperate with
         // state intelligence. This applies to API endpoints regardless of model quality.

@@ -159,6 +159,69 @@ impl ToolRegistry {
             })
             .collect()
     }
+
+    /// Generate a system-prompt-ready tool catalog from the actually registered tools.
+    ///
+    /// This prevents the system prompt from drifting out of sync with the tool registry.
+    /// Constitution alignment: "Real Capabilities, Not Hallucinated Ones" — the prompt
+    /// must describe exactly the tools that exist, no more, no less.
+    pub fn tool_catalog_prompt(&self) -> String {
+        let mut out = String::from("## Your Tools\n\n");
+        for tool in &self.tools {
+            let params = tool.parameters_schema();
+            let param_str = format_params_for_prompt(&params);
+
+            out.push_str(&format!("- `{}`{}\n", tool.name(), param_str));
+
+            // Description on its own line for clarity
+            let desc = tool.description();
+            // Wrap long descriptions
+            if desc.len() > 120 {
+                out.push_str(&format!("  {}\n", desc));
+            } else {
+                out.push_str(&format!("  {}\n", desc));
+            }
+
+            // Autonomy level annotation
+            let autonomy_label = match tool.required_autonomy() {
+                Autonomy::Inform => "Inform",
+                Autonomy::Suggest => "Suggest",
+                Autonomy::Act => "Act",
+                Autonomy::Full => "Full",
+            };
+            out.push_str(&format!("  (requires: {})\n", autonomy_label));
+        }
+        out
+    }
+}
+
+/// Format the parameters from a JSON Schema into a compact `(param1, param2?)` string.
+fn format_params_for_prompt(schema: &serde_json::Value) -> String {
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return String::new();
+    };
+    let required: std::collections::HashSet<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    if props.is_empty() {
+        return String::new();
+    }
+
+    let params: Vec<String> = props
+        .keys()
+        .map(|k| {
+            if required.contains(k.as_str()) {
+                k.clone()
+            } else {
+                format!("{}?", k)
+            }
+        })
+        .collect();
+
+    format!("({})", params.join(", "))
 }
 
 impl Default for ToolRegistry {

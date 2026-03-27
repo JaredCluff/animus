@@ -270,7 +270,8 @@ impl<S: VectorStore> ReasoningThread<S> {
 
         // Try each engine in order; fall back on retryable errors
         let mut last_err: Option<animus_core::AnimusError> = None;
-        for engine in engines {
+        for (engine_index, engine) in engines.iter().enumerate() {
+            let engine = *engine;
             let engine_conversation: std::borrow::Cow<[Turn]> =
                 if engine.supports_think_control() && !Self::needs_thinking(user_input) {
                     let mut turns = self.conversation.clone();
@@ -288,7 +289,10 @@ impl<S: VectorStore> ReasoningThread<S> {
                 };
 
             match engine.reason(&enriched_system, &engine_conversation, tools).await {
-                Ok(output) => {
+                Ok(mut output) => {
+                    // Tag output with which engine responded and whether it was a fallback.
+                    output.engine_used = engine.model_name().to_string();
+                    output.fell_back = engine_index > 0;
                     // Post-success bookkeeping (same as process_turn)
                     let anchor_set: std::collections::HashSet<_> = self.stored_turn_ids.iter().copied().collect();
                     self.last_retrieved_ids = context.segments.iter()
@@ -305,8 +309,8 @@ impl<S: VectorStore> ReasoningThread<S> {
                         }
                     }
                     tracing::debug!(
-                        "thread {} turn complete (engine '{}'): {} in, {} out",
-                        self.id, engine.model_name(), output.input_tokens, output.output_tokens
+                        "thread {} turn complete (engine '{}', fallback={}): {} in, {} out",
+                        self.id, output.engine_used, output.fell_back, output.input_tokens, output.output_tokens
                     );
                     return Ok(output);
                 }

@@ -95,6 +95,12 @@ pub struct ReasoningOutput {
     pub output_tokens: usize,
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
+    /// The model name that produced this output.
+    /// Set by `process_turn_with_engines` — empty string when calling `reason()` directly.
+    pub engine_used: String,
+    /// True when a fallback engine was used because the primary was unavailable.
+    /// Set by `process_turn_with_engines`.
+    pub fell_back: bool,
 }
 
 /// Trait abstracting LLM providers.
@@ -126,6 +132,13 @@ pub trait ReasoningEngine: Send + Sync {
     /// message to skip the thinking phase for simple inputs.
     fn supports_think_control(&self) -> bool {
         false
+    }
+
+    /// Return the base URL of this engine's API endpoint.
+    /// Used by ModelHealthWatcher to probe availability (GET /v1/models).
+    /// Default: None (engines without a discoverable URL, e.g. Anthropic SDK path).
+    fn probe_url(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -163,6 +176,8 @@ impl ReasoningEngine for MockEngine {
             output_tokens: self.response.len() / 4,
             tool_calls: vec![],
             stop_reason: StopReason::EndTurn,
+            engine_used: String::new(),
+            fell_back: false,
         })
     }
 
@@ -221,6 +236,8 @@ mod tests {
             output_tokens: 5,
             tool_calls: vec![],
             stop_reason: StopReason::EndTurn,
+            engine_used: String::new(),
+            fell_back: false,
         };
         assert!(output.tool_calls.is_empty());
         assert_eq!(output.stop_reason, StopReason::EndTurn);

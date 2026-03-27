@@ -500,6 +500,8 @@ impl ReasoningEngine for AnthropicEngine {
             output_tokens: api_response.usage.output_tokens,
             tool_calls,
             stop_reason,
+            engine_used: String::new(),
+            fell_back: false,
         })
     }
 

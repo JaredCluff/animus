@@ -6,9 +6,11 @@
 //! - LM Studio, vLLM, LocalAI, etc.
 
 use animus_core::error::{AnimusError, Result};
+use animus_core::rate_limit::{RateLimitState, RATE_LIMIT_NEAR_THRESHOLD};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 use super::{ReasoningEngine, ReasoningOutput, Role, StopReason, ToolCall, ToolDefinition, Turn, TurnContent};
 
@@ -120,6 +122,9 @@ pub struct OpenAICompatEngine {
     /// Whether the model supports `/no_think` think-control prefix (Qwen3-style).
     think_control: bool,
     http: reqwest::Client,
+    /// Rate limit state — updated from `x-ratelimit-*` response headers.
+    /// Shared with SmartRouter so near-limit conditions trigger proactive rerouting.
+    rate_limit_state: Arc<parking_lot::RwLock<RateLimitState>>,
 }
 
 impl OpenAICompatEngine {
@@ -141,6 +146,7 @@ impl OpenAICompatEngine {
             kv_cache_type: None,
             think_control: false,
             http,
+            rate_limit_state: Arc::new(parking_lot::RwLock::new(RateLimitState::default())),
         })
     }
 
@@ -269,6 +275,24 @@ fn turns_to_messages(system: &str, turns: &[Turn]) -> Vec<ChatMessage> {
     messages
 }
 
+/// Parse OpenAI-style rate limit headers from a response.
+/// Cerebras and OpenRouter both use the `x-ratelimit-*` header convention.
+fn parse_oai_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> RateLimitState {
+    let get_u32 = |name: &str| -> Option<u32> {
+        headers.get(name)?.to_str().ok()?.parse().ok()
+    };
+    RateLimitState {
+        requests_limit: get_u32("x-ratelimit-limit-requests"),
+        requests_remaining: get_u32("x-ratelimit-remaining-requests"),
+        requests_reset: None,
+        tokens_limit: get_u32("x-ratelimit-limit-tokens"),
+        tokens_remaining: get_u32("x-ratelimit-remaining-tokens"),
+        tokens_reset: None,
+        last_updated: chrono::Utc::now(),
+        near_limit_notified: false,
+    }
+}
+
 fn tools_to_oai(tools: &[ToolDefinition]) -> Vec<OaiTool> {
     tools.iter().map(|t| OaiTool {
         kind: "function",
@@ -332,6 +356,14 @@ impl ReasoningEngine for OpenAICompatEngine {
             return Err(AnimusError::Llm(format!("openai-compat: {status}: {body}")));
         }
 
+        // Capture rate limit headers before consuming the body (headers are on the response, body consumes it)
+        let rl_parsed = parse_oai_rate_limit_headers(resp.headers());
+        {
+            let mut state = self.rate_limit_state.write();
+            let current_notified = state.near_limit_notified;
+            *state = rl_parsed.apply_update(current_notified, RATE_LIMIT_NEAR_THRESHOLD);
+        }
+
         let chat_resp: ChatResponse = resp
             .json()
             .await
@@ -373,6 +405,8 @@ impl ReasoningEngine for OpenAICompatEngine {
             output_tokens: chat_resp.usage.completion_tokens,
             tool_calls,
             stop_reason,
+            engine_used: String::new(),
+            fell_back: false,
         })
     }
 
@@ -388,5 +422,13 @@ impl ReasoningEngine for OpenAICompatEngine {
 
     fn supports_think_control(&self) -> bool {
         self.think_control
+    }
+
+    fn rate_limit_state(&self) -> Option<Arc<parking_lot::RwLock<animus_core::RateLimitState>>> {
+        Some(self.rate_limit_state.clone())
+    }
+
+    fn probe_url(&self) -> Option<&str> {
+        Some(&self.base_url)
     }
 }
