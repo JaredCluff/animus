@@ -337,45 +337,47 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             .unwrap_or_default();
 
-        // Helper: build an engine for a given provider/model/max_tokens
+        // Helper: build an engine for a given provider/model/max_tokens.
+        // Returns Arc so the same instance can be registered under both a cognitive role
+        // and a named "provider:model" key without duplicating the rate_limit_state handle (CRITICAL-1).
         let build_engine = |provider: &str, model: &str, max_tokens: usize, url: &str, key: &str|
-            -> Option<Box<dyn animus_cortex::ReasoningEngine>>
+            -> Option<Arc<dyn animus_cortex::ReasoningEngine>>
         {
             match provider.to_lowercase().as_str() {
                 "ollama" => {
                     match OpenAICompatEngine::for_ollama(url, model, max_tokens) {
-                        Ok(e) => { tracing::info!("LLM engine: ollama/{model} @ {url}"); Some(Box::new(e)) }
+                        Ok(e) => { tracing::info!("LLM engine: ollama/{model} @ {url}"); Some(Arc::new(e)) }
                         Err(e) => { eprintln!("Warning: ollama engine init failed: {e}"); None }
                     }
                 }
                 "openai" | "openai-compat" | "openai_compat" => {
                     match OpenAICompatEngine::new(url, key, model, max_tokens) {
-                        Ok(e) => { tracing::info!("LLM engine: openai-compat/{model} @ {url}"); Some(Box::new(e)) }
+                        Ok(e) => { tracing::info!("LLM engine: openai-compat/{model} @ {url}"); Some(Arc::new(e)) }
                         Err(e) => { eprintln!("Warning: openai-compat engine init failed: {e}"); None }
                     }
                 }
                 "mock" => {
                     tracing::warn!("LLM engine: mock (no real reasoning)");
-                    Some(Box::new(animus_cortex::MockEngine::new("mock")))
+                    Some(Arc::new(animus_cortex::MockEngine::new("mock")))
                 }
                 _ => {
                     // anthropic (default)
                     match AnthropicEngine::from_best_available(model, max_tokens) {
-                        Ok(e) => { tracing::info!("LLM engine: anthropic/{model}"); Some(Box::new(e)) }
+                        Ok(e) => { tracing::info!("LLM engine: anthropic/{model}"); Some(Arc::new(e)) }
                         Err(e) => { eprintln!("Warning: Anthropic engine init failed: {e}"); None }
                     }
                 }
             }
         };
 
-        let fallback: Box<dyn animus_cortex::ReasoningEngine> =
+        let fallback: Arc<dyn animus_cortex::ReasoningEngine> =
             build_engine(&provider_str, &model_id, 4096, &base_url, &api_key)
             .unwrap_or_else(|| {
                 eprintln!("Warning: Could not initialize LLM engine. Running with mock.");
                 eprintln!("For Anthropic: mount ~/.claude/.credentials.json or set ANTHROPIC_API_KEY");
                 eprintln!("For Ollama:    set ANIMUS_LLM_PROVIDER=ollama ANIMUS_OLLAMA_URL=http://host:11434");
                 eprintln!("For OpenAI:    set ANIMUS_LLM_PROVIDER=openai ANIMUS_OPENAI_API_KEY=sk-...");
-                Box::new(animus_cortex::MockEngine::new(
+                Arc::new(animus_cortex::MockEngine::new(
                     "I'm running without an LLM connection. Set ANIMUS_LLM_PROVIDER and related vars.",
                 ))
             });
@@ -398,15 +400,12 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 .unwrap_or_else(|| api_key.clone());
 
             if let Some(ref model) = role_model {
-                if let Some(engine) = build_engine(&role_provider, model, max_tok, &role_url, &role_key) {
+                // CRITICAL-1: single Arc shared between set_engine and register_named so that
+                // both paths observe the same rate_limit_state handle.
+                if let Some(arc_engine) = build_engine(&role_provider, model, max_tok, &role_url, &role_key) {
                     tracing::info!("{role:?} role: {role_provider}/{model} @ {role_url}");
-                    // Register by name so SmartRouter can dispatch by ModelSpec
-                    let arc_engine: Arc<dyn animus_cortex::ReasoningEngine> = Arc::from(
-                        build_engine(&role_provider, model, max_tok, &role_url, &role_key)
-                            .expect("engine built successfully above")
-                    );
-                    registry.register_named(&role_provider, model, arc_engine);
-                    registry.set_engine(role, engine);
+                    registry.register_named(&role_provider, model, arc_engine.clone());
+                    registry.set_engine(role, arc_engine);
                 }
             }
         }
@@ -432,17 +431,14 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 "https://integrate.api.nvidia.com",
             ),
         ] {
-            if let Ok(key) = std::env::var(key_env) {
+            if let Ok(api_key) = std::env::var(key_env) {
                 let provider = std::env::var(provider_env).unwrap_or("openai_compat".to_string());
                 let model = std::env::var(model_env).unwrap_or(default_model.to_string());
                 let url = std::env::var(url_env).unwrap_or(default_url.to_string());
-                if let Some(engine) = build_engine(&provider, &model, 4096, &url, &key) {
-                    let arc: Arc<dyn animus_cortex::ReasoningEngine> = Arc::from(
-                        build_engine(&provider, &model, 4096, &url, &key).expect("built above")
-                    );
+                // CRITICAL-1: build once, Arc-wrap once — no duplicate engine instance.
+                if let Some(arc) = build_engine(&provider, &model, 4096, &url, &api_key) {
                     registry.register_named(name, &model, arc);
                     tracing::info!("{name} engine registered: {name}/{model}");
-                    drop(engine);
                 }
             }
         }
@@ -668,27 +664,35 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         }
     }
 
-    // Start ModelHealthWatcher — probes named engine endpoints every 2 minutes.
-    // Updates SmartRouter health states so degraded providers are avoided proactively.
-    if let Some(ref router) = smart_router {
-        let endpoints: Vec<(String, String)> = engine_registry.iter_named()
+    // How often the ModelHealthWatcher probes registered engine endpoints (MINOR-4: named constant).
+    const MODEL_HEALTH_PROBE_INTERVAL_SECS: u64 = 120;
+
+    // Start ModelHealthWatcher — probes named engine endpoints on the above interval.
+    // CRITICAL-4: endpoints stored in a shared Arc<Mutex<Vec>> so hot-loaded engines can be
+    // added to the probe list at runtime without restarting the watcher.
+    let health_endpoints: Arc<parking_lot::Mutex<Vec<(String, String)>>> = {
+        let initial: Vec<(String, String)> = engine_registry.iter_named()
             .filter_map(|(key, engine)| {
                 engine.probe_url().map(|url| (key.to_string(), url.to_string()))
             })
             .collect();
+        Arc::new(parking_lot::Mutex::new(initial))
+    };
 
-        if !endpoints.is_empty() {
+    if let Some(ref router) = smart_router {
+        if !health_endpoints.lock().is_empty() {
             let watcher_router = router.clone();
             let watcher_signal_tx = signal_tx.clone();
             let watcher_source = animus_core::identity::ThreadId::new();
-            let n = endpoints.len();
+            let watcher_endpoints = health_endpoints.clone();
+            let n = watcher_endpoints.lock().len();
             tokio::spawn(async move {
                 animus_cortex::watchers::run_model_health_watcher(
-                    endpoints,
+                    watcher_endpoints,
                     watcher_router,
                     watcher_signal_tx,
                     watcher_source,
-                    120, // probe every 2 minutes
+                    MODEL_HEALTH_PROBE_INTERVAL_SECS,
                 ).await;
             });
             tracing::info!("ModelHealthWatcher spawned ({n} endpoint(s))");
@@ -1320,10 +1324,20 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                                 8192,
                             ) {
                                 Ok(eng) => {
+                                    let eng_arc = std::sync::Arc::new(eng);
+                                    // CRITICAL-4: register with health watcher so probe coverage
+                                    // extends to hot-loaded engines without restarting the watcher.
+                                    // All hot-loaded engines are OpenAI-compat; probe URL = base_url.
+                                    if !entry.base_url.is_empty() {
+                                        health_endpoints.lock().push((
+                                            format!("{}:{}", entry.provider_id, model.model_id),
+                                            entry.base_url.clone(),
+                                        ));
+                                    }
                                     engine_registry.add_named(
                                         &entry.provider_id,
                                         &model.model_id,
-                                        std::sync::Arc::new(eng),
+                                        eng_arc,
                                     );
                                     tracing::info!(
                                         "Hot-loaded new engine: {}:{}",
@@ -1346,17 +1360,22 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             // Adaptation signals (engine fallback / health change) always notify
             // the user regardless of autonomy mode — engine failures are always worth reporting.
             if signal.summary.starts_with("Adapting:") || signal.summary.starts_with("Engine '") {
-                let _ = proactive_tx.try_send(ProactiveMessage {
+                // MAJOR-5: warn instead of silently dropping adaptation signals when channel is full.
+                if let Err(e) = proactive_tx.try_send(ProactiveMessage {
                     text: signal.summary.trim_start_matches("Adapting: ").to_string(),
                     source: "model_adaptation",
-                });
+                }) {
+                    tracing::warn!("adaptation signal dropped — proactive channel full: {e}");
+                }
             } else if signal.priority == animus_core::threading::SignalPriority::Urgent
                 && autonomy_mode != animus_core::config::AutonomyMode::Reactive
             {
-                let _ = proactive_tx.try_send(ProactiveMessage {
+                if let Err(e) = proactive_tx.try_send(ProactiveMessage {
                     text: signal.summary.clone(),
                     source: "signal",
-                });
+                }) {
+                    tracing::warn!("urgent signal dropped — proactive channel full: {e}");
+                }
             }
             if let Some(active) = scheduler.active_thread_mut() {
                 active.deliver_signal(signal);

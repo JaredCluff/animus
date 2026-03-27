@@ -32,6 +32,14 @@ pub enum AnimusError {
     #[error("LLM error: {0}")]
     Llm(String),
 
+    /// Transient rate-limit response (HTTP 429). Retryable with a fallback engine.
+    #[error("LLM rate limited: {0}")]
+    LlmRateLimited(String),
+
+    /// Transient service-unavailable response (HTTP 503/529). Retryable with a fallback engine.
+    #[error("LLM service unavailable: {0}")]
+    LlmServiceUnavailable(String),
+
     #[error("identity error: {0}")]
     Identity(String),
 

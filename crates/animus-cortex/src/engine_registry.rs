@@ -15,15 +15,20 @@ pub enum CognitiveRole {
 }
 
 /// Routes cognitive functions to appropriate LLM engines.
+///
+/// All engines are stored as `Arc<dyn ReasoningEngine>` so that a single
+/// engine instance can be registered under both a cognitive role and a named
+/// "provider:model" key. This ensures that rate-limit state updates observed
+/// through either path are visible to both the SmartRouter and the EngineRegistry.
 pub struct EngineRegistry {
-    engines: HashMap<CognitiveRole, Box<dyn ReasoningEngine>>,
+    engines: HashMap<CognitiveRole, Arc<dyn ReasoningEngine>>,
     /// Secondary lookup by "provider:model" string — used by SmartRouter spec-based dispatch.
     by_name: HashMap<String, Arc<dyn ReasoningEngine>>,
-    fallback: Box<dyn ReasoningEngine>,
+    fallback: Arc<dyn ReasoningEngine>,
 }
 
 impl EngineRegistry {
-    pub fn new(fallback: Box<dyn ReasoningEngine>) -> Self {
+    pub fn new(fallback: Arc<dyn ReasoningEngine>) -> Self {
         Self {
             engines: HashMap::new(),
             by_name: HashMap::new(),
@@ -32,7 +37,10 @@ impl EngineRegistry {
     }
 
     /// Assign an engine to a cognitive role.
-    pub fn set_engine(&mut self, role: CognitiveRole, engine: Box<dyn ReasoningEngine>) {
+    ///
+    /// Pass the same `Arc` you used (or will use) for `register_named` so that both
+    /// paths share a single engine instance — and therefore a single rate-limit state.
+    pub fn set_engine(&mut self, role: CognitiveRole, engine: Arc<dyn ReasoningEngine>) {
         self.engines.insert(role, engine);
     }
 
@@ -50,7 +58,7 @@ impl EngineRegistry {
         self.by_name.get(&key).cloned()
     }
 
-    /// Get the engine for a cognitive role, falling back to default.
+    /// Get a reference to the engine for a cognitive role, falling back to the default engine.
     pub fn engine_for(&self, role: CognitiveRole) -> &dyn ReasoningEngine {
         self.engines
             .get(&role)
@@ -58,7 +66,16 @@ impl EngineRegistry {
             .unwrap_or(self.fallback.as_ref())
     }
 
-    /// Get the fallback engine (for backwards compatibility).
+    /// Get a cloned Arc to the engine for a cognitive role, falling back to the default engine.
+    /// Use when you need to store or share the engine beyond a single function call.
+    pub fn engine_for_arc(&self, role: CognitiveRole) -> Arc<dyn ReasoningEngine> {
+        self.engines
+            .get(&role)
+            .cloned()
+            .unwrap_or_else(|| self.fallback.clone())
+    }
+
+    /// Get a reference to the fallback engine.
     pub fn fallback(&self) -> &dyn ReasoningEngine {
         self.fallback.as_ref()
     }
@@ -125,15 +142,15 @@ mod tests {
 
     #[test]
     fn test_registry_returns_assigned_engine() {
-        let mut registry = EngineRegistry::new(Box::new(MockEngine::new("fallback")));
-        registry.set_engine(CognitiveRole::Reasoning, Box::new(MockEngine::new("opus")));
+        let mut registry = EngineRegistry::new(Arc::new(MockEngine::new("fallback")));
+        registry.set_engine(CognitiveRole::Reasoning, Arc::new(MockEngine::new("opus")));
 
         assert_eq!(registry.engine_for(CognitiveRole::Reasoning).model_name(), "mock-engine");
     }
 
     #[test]
     fn test_registry_falls_back_to_default() {
-        let registry = EngineRegistry::new(Box::new(MockEngine::new("fallback")));
+        let registry = EngineRegistry::new(Arc::new(MockEngine::new("fallback")));
         let engine = registry.engine_for(CognitiveRole::Perception);
         assert_eq!(engine.model_name(), "mock-engine");
     }
@@ -149,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_register_named_and_engine_by_spec() {
-        let mut registry = EngineRegistry::new(Box::new(MockEngine::new("fallback")));
+        let mut registry = EngineRegistry::new(Arc::new(MockEngine::new("fallback")));
         let engine = Arc::new(MockEngine::new("claude-opus-4"));
         registry.register_named("anthropic", "claude-opus-4", engine);
 
@@ -160,16 +177,30 @@ mod tests {
 
     #[test]
     fn test_engine_by_spec_returns_none_for_unknown() {
-        let registry = EngineRegistry::new(Box::new(MockEngine::new("fallback")));
+        let registry = EngineRegistry::new(Arc::new(MockEngine::new("fallback")));
         assert!(registry.engine_by_spec("anthropic", "unknown-model").is_none());
     }
 
     #[test]
     fn test_add_named_delegates_to_register_named() {
-        let mut registry = EngineRegistry::new(Box::new(MockEngine::new("fallback")));
+        let mut registry = EngineRegistry::new(Arc::new(MockEngine::new("fallback")));
         let engine = Arc::new(MockEngine::new("llama3"));
         registry.add_named("ollama", "llama3", engine);
 
         assert!(registry.engine_by_spec("ollama", "llama3").is_some());
+    }
+
+    #[test]
+    fn test_shared_arc_same_instance() {
+        // Critical invariant: set_engine and register_named share the same Arc,
+        // so rate_limit_state updates are visible through both paths.
+        let mut registry = EngineRegistry::new(Arc::new(MockEngine::new("fallback")));
+        let engine = Arc::new(MockEngine::new("shared"));
+        registry.set_engine(CognitiveRole::Reasoning, engine.clone());
+        registry.register_named("test", "shared", engine.clone());
+
+        let by_role = registry.engine_for_arc(CognitiveRole::Reasoning);
+        let by_name = registry.engine_by_spec("test", "shared").unwrap();
+        assert!(Arc::ptr_eq(&by_role, &by_name));
     }
 }

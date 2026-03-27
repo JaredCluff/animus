@@ -103,12 +103,20 @@ impl SmartRouter {
         plan: Arc<RwLock<ModelPlan>>,
         signal_tx: mpsc::Sender<Signal>,
     ) -> Self {
-        // Build classifier from current plan (synchronously — plan is already loaded)
-        // We need a blocking read here. Use try_read for now, fall back to default.
         let classifier = {
             // Safe at construction time — no concurrent writers exist yet.
             let guard = plan.try_read().expect("SmartRouter::new: plan lock contention");
             HeuristicClassifier::from_plan(&guard)
+        };
+
+        // Call provider_trust_map() once; derive both trust_registry and prohibited_providers from it.
+        let trust_map = provider_trust_map();
+        let prohibited: ProhibitedSet = {
+            use animus_core::provider_meta::OwnershipRisk;
+            trust_map.values()
+                .filter(|p| p.ownership_risk == OwnershipRisk::Prohibited)
+                .map(|p| p.provider_id.clone())
+                .collect()
         };
 
         Self {
@@ -118,19 +126,8 @@ impl SmartRouter {
             signal_tx,
             source_id: ThreadId::new(),
             rate_limit_states: Arc::new(Mutex::new(HashMap::new())),
-            trust_registry: {
-                let map = provider_trust_map();
-                Arc::new(parking_lot::Mutex::new(map))
-            },
-            prohibited_providers: {
-                use animus_core::provider_meta::OwnershipRisk;
-                let map = provider_trust_map();
-                let prohibited: ProhibitedSet = map.values()
-                    .filter(|p| p.ownership_risk == OwnershipRisk::Prohibited)
-                    .map(|p| p.provider_id.clone())
-                    .collect();
-                Arc::new(parking_lot::Mutex::new(prohibited))
-            },
+            trust_registry: Arc::new(parking_lot::Mutex::new(trust_map)),
+            prohibited_providers: Arc::new(parking_lot::Mutex::new(prohibited)),
             engine_health: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
@@ -161,7 +158,7 @@ impl SmartRouter {
     }
 
     /// Select a `RouteDecision` for a given task class name, respecting fallback order
-    /// and skipping degraded primaries.
+    /// and skipping degraded or probe-unhealthy primaries.
     pub async fn select_for_class(&self, class_name: &str) -> RouteDecision {
         let plan = self.plan.read().await;
         let health = self.route_health.lock();
@@ -188,8 +185,10 @@ impl SmartRouter {
 
         let route_health = health.get(class_name);
         let primary_degraded = route_health.map(|h| h.degraded).unwrap_or(false);
+        // CRITICAL-2: also gate on ModelHealthWatcher probe status, not just consecutive failures
+        let primary_healthy = self.is_engine_healthy(&route.primary);
 
-        if !primary_degraded {
+        if !primary_degraded && primary_healthy {
             // Layer 2 + 3: rate limit check with single write-lock (atomic read + arm flag)
             // Write lock prevents TOCTOU: reading is_near_limit() and setting near_limit_notified
             // happen inside the same guard. Drop all rate_limit_states locks before try_send.
@@ -225,11 +224,11 @@ impl SmartRouter {
                     });
                 }
 
-                // Route to first non-degraded fallback (plan and health still in scope — no re-acquire needed)
+                // Route to first non-degraded, healthy fallback
                 for (i, fallback) in route.fallbacks.iter().enumerate() {
                     let fb_key = format!("{}:fallback:{}", class_name, i);
                     let fb_degraded = health.get(&fb_key).map(|h| h.degraded).unwrap_or(false);
-                    if !fb_degraded {
+                    if !fb_degraded && self.is_engine_healthy(fallback) {
                         return RouteDecision {
                             class_name: class_name.to_string(),
                             model_spec: fallback.clone(),
@@ -253,11 +252,11 @@ impl SmartRouter {
             };
         }
 
-        // Primary degraded — try fallbacks
+        // Primary degraded or unhealthy — try fallbacks
         for (i, fallback) in route.fallbacks.iter().enumerate() {
             let fb_key = format!("{}:fallback:{}", class_name, i);
             let fb_degraded = health.get(&fb_key).map(|h| h.degraded).unwrap_or(false);
-            if !fb_degraded {
+            if !fb_degraded && self.is_engine_healthy(fallback) {
                 return RouteDecision {
                     class_name: class_name.to_string(),
                     model_spec: fallback.clone(),
@@ -266,7 +265,9 @@ impl SmartRouter {
             }
         }
 
-        // All degraded — fire Urgent signal and return primary anyway
+        // All degraded/unhealthy — fire Urgent signal and return primary anyway.
+        // MAJOR-1: clone primary spec BEFORE dropping plan to eliminate TOCTOU with update_plan().
+        let primary_spec = route.primary.clone();
         drop(health);
         drop(plan);
         let summary = format!("All models in route '{}' are degraded — chain exhausted", class_name);
@@ -280,14 +281,9 @@ impl SmartRouter {
             created: Utc::now(),
         });
 
-        // Return primary as last resort
-        let plan = self.plan.read().await;
-        let route = plan.routes.get(class_name)
-            .or_else(|| plan.routes.values().next())
-            .expect("route must exist since we got here");
         RouteDecision {
             class_name: class_name.to_string(),
-            model_spec: route.primary.clone(),
+            model_spec: primary_spec,
             fallback_index: 0,
         }
     }
@@ -500,6 +496,11 @@ impl SmartRouter {
             // Budget check
             if !Self::passes_budget(spec, pressure) {
                 tracing::debug!("Skipping {}:{} — budget pressure {:?}", spec.provider, spec.model, pressure);
+                continue;
+            }
+            // MAJOR-4: engine health check — skip engines the health watcher has marked unavailable
+            if !self.is_engine_healthy(spec) {
+                tracing::debug!("Skipping {}:{} — engine unavailable", spec.provider, spec.model);
                 continue;
             }
             return Ok(RouteDecision {

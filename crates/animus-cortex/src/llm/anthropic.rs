@@ -437,13 +437,15 @@ impl ReasoningEngine for AnthropicEngine {
             .map_err(|e| AnimusError::Llm(format!("failed to read response: {e}")))?;
 
         if !status.is_success() {
+            let status_u16 = status.as_u16();
             let error_msg = serde_json::from_str::<ApiError>(&body)
                 .map(|e| e.error.message)
-                .unwrap_or(body);
-            return Err(AnimusError::Llm(format!(
-                "API error ({}): {error_msg}",
-                status
-            )));
+                .unwrap_or_else(|_| body.clone());
+            return Err(match status_u16 {
+                429 => AnimusError::LlmRateLimited(format!("anthropic: {error_msg}")),
+                503 | 529 => AnimusError::LlmServiceUnavailable(format!("anthropic: {error_msg}")),
+                _ => AnimusError::Llm(format!("anthropic: API error ({status}): {error_msg}")),
+            });
         }
 
         let api_response: ApiResponse = serde_json::from_str(&body).map_err(|e| {
@@ -500,7 +502,7 @@ impl ReasoningEngine for AnthropicEngine {
             output_tokens: api_response.usage.output_tokens,
             tool_calls,
             stop_reason,
-            engine_used: String::new(),
+            engine_used: self.model_name().to_string(),
             fell_back: false,
         })
     }

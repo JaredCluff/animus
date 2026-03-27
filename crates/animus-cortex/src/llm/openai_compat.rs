@@ -281,13 +281,19 @@ fn parse_oai_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> RateLim
     let get_u32 = |name: &str| -> Option<u32> {
         headers.get(name)?.to_str().ok()?.parse().ok()
     };
+    // Reset headers are ISO 8601 timestamps or relative durations (provider-specific).
+    // Parse as DateTime<Utc> when the value is a full timestamp.
+    let get_datetime = |name: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+        let s = headers.get(name)?.to_str().ok()?;
+        s.parse::<chrono::DateTime<chrono::Utc>>().ok()
+    };
     RateLimitState {
         requests_limit: get_u32("x-ratelimit-limit-requests"),
         requests_remaining: get_u32("x-ratelimit-remaining-requests"),
-        requests_reset: None,
+        requests_reset: get_datetime("x-ratelimit-reset-requests"),
         tokens_limit: get_u32("x-ratelimit-limit-tokens"),
         tokens_remaining: get_u32("x-ratelimit-remaining-tokens"),
-        tokens_reset: None,
+        tokens_reset: get_datetime("x-ratelimit-reset-tokens"),
         last_updated: chrono::Utc::now(),
         near_limit_notified: false,
     }
@@ -352,8 +358,13 @@ impl ReasoningEngine for OpenAICompatEngine {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            let status_u16 = status.as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(AnimusError::Llm(format!("openai-compat: {status}: {body}")));
+            return Err(match status_u16 {
+                429 => AnimusError::LlmRateLimited(format!("openai-compat: {body}")),
+                503 | 529 => AnimusError::LlmServiceUnavailable(format!("openai-compat: {body}")),
+                _ => AnimusError::Llm(format!("openai-compat: {status}: {body}")),
+            });
         }
 
         // Capture rate limit headers before consuming the body (headers are on the response, body consumes it)
@@ -405,7 +416,7 @@ impl ReasoningEngine for OpenAICompatEngine {
             output_tokens: chat_resp.usage.completion_tokens,
             tool_calls,
             stop_reason,
-            engine_used: String::new(),
+            engine_used: self.model_name().to_string(),
             fell_back: false,
         })
     }

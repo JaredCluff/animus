@@ -451,12 +451,9 @@ impl<S: VectorStore> ReasoningThread<S> {
 
 /// Returns true if the error is transient and a fallback engine should be tried.
 pub fn is_retryable_error(err: &animus_core::AnimusError) -> bool {
-    let s = err.to_string().to_lowercase();
-    s.contains("429")
-        || s.contains("rate limit")
-        || s.contains("too many requests")
-        || s.contains("503")
-        || s.contains("overloaded")
-        || s.contains("quota")
-        || s.contains("capacity")
+    matches!(
+        err,
+        animus_core::AnimusError::LlmRateLimited(_)
+            | animus_core::AnimusError::LlmServiceUnavailable(_)
+    )
 }

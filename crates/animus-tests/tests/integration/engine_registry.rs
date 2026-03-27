@@ -4,7 +4,7 @@ use animus_cortex::MockEngine;
 
 #[test]
 fn test_engine_registry_fallback() {
-    let registry = EngineRegistry::new(Box::new(MockEngine::new("default")));
+    let registry = EngineRegistry::new(std::sync::Arc::new(MockEngine::new("default")));
 
     // All roles should return the fallback
     assert_eq!(registry.engine_for(CognitiveRole::Perception).model_name(), "mock-engine");
@@ -14,8 +14,8 @@ fn test_engine_registry_fallback() {
 
 #[test]
 fn test_engine_registry_per_role() {
-    let mut registry = EngineRegistry::new(Box::new(MockEngine::new("default")));
-    registry.set_engine(CognitiveRole::Reasoning, Box::new(MockEngine::new("opus")));
+    let mut registry = EngineRegistry::new(std::sync::Arc::new(MockEngine::new("default")));
+    registry.set_engine(CognitiveRole::Reasoning, std::sync::Arc::new(MockEngine::new("opus")));
 
     // Reasoning should use assigned engine, others use fallback
     assert_eq!(registry.engine_for(CognitiveRole::Reasoning).model_name(), "mock-engine");
