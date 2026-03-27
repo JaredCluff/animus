@@ -272,14 +272,26 @@ impl ModelPlan {
 
 Available models: {model_list}
 
+Provider tiers (use this to guide routing decisions):
+- openai_compat: Cerebras cloud inference — free tier, ~3000 tokens/s. Prefer as PRIMARY for all task classes where quality is sufficient.
+- ollama: Local inference — free but uses local hardware, slower, may be unavailable. Use as FALLBACK when Cerebras is offline or unavailable.
+- anthropic: Paid API, highest quality, extended thinking support. Reserve for ComplexReasoning or tasks that truly require frontier quality. Use sparingly.
+
+Routing philosophy:
+- Cerebras (openai_compat) first — it is fast, free, and high quality. Route everything there by default.
+- Ollama local models as offline fallback — when Cerebras is not reachable.
+- Anthropic (Claude) only when the task genuinely requires frontier reasoning quality.
+- Embedding/retrieval tasks should always use local ollama embedding models (not Cerebras).
+
 Your task:
 1. Define 4–6 task classes that cover the types of inputs you handle.
    For each class, provide: a name, a description, and 5–10 characteristic keywords.
 2. Assign each task class a primary model and 1–2 fallback models from the available list.
+   Follow the routing philosophy above — Cerebras primary, Ollama fallback, Anthropic for complex only.
 3. Specify the think budget per model assignment.
    Think budget options: "off", "dynamic", "minimal_N" (e.g. "minimal_4000"), "full_N" (e.g. "full_8000").
    Use "dynamic" for models with thinking capability (Qwen3-style or Claude extended thinking).
-   Use "off" for fast/small models or tool execution tasks.
+   Use "off" for fast/small models, embedding tasks, or tool execution tasks.
 
 Respond with JSON only (no markdown, no explanation):
 {{
@@ -288,7 +300,7 @@ Respond with JSON only (no markdown, no explanation):
   ],
   "routes": {{
     "ClassName": {{
-      "primary": {{"provider": "ollama|anthropic|openai", "model": "model-name", "think": "dynamic"}},
+      "primary": {{"provider": "openai_compat|ollama|anthropic", "model": "model-name", "think": "dynamic"}},
       "fallbacks": [
         {{"provider": "ollama", "model": "smaller-model", "think": "off"}}
       ]

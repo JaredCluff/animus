@@ -67,6 +67,11 @@ impl EngineRegistry {
     pub fn add_named(&mut self, provider: &str, model: &str, engine: Arc<dyn ReasoningEngine>) {
         self.register_named(provider, model, engine);
     }
+
+    /// Returns all registered named engine keys in "provider:model" format.
+    pub fn named_model_ids(&self) -> Vec<String> {
+        self.by_name.keys().cloned().collect()
+    }
 }
 
 /// LLM provider type.

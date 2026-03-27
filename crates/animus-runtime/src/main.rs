@@ -546,6 +546,13 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             available_models.push(configured);
         }
 
+        // Include any per-role named engines (e.g. Cerebras via ANIMUS_PERCEPTION_*)
+        for id in engine_registry.named_model_ids() {
+            if !available_models.iter().any(|m| m == &id) {
+                available_models.push(id);
+            }
+        }
+
         let config_hash = ModelPlan::config_hash_for(&available_models);
 
         // Try to load existing plan
