@@ -24,8 +24,11 @@
 use crate::model_plan::{HeuristicClassifier, ModelPlan, ModelSpec, RouteStats};
 use animus_core::identity::ThreadId;
 use animus_core::threading::{Signal, SignalPriority};
+use animus_core::{BudgetPressure, ContentSensitivity, CostTier, ProviderTrustProfile};
+use animus_core::provider_catalog::provider_trust_map;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use parking_lot::Mutex;
@@ -35,6 +38,13 @@ const HEURISTIC_CONFIDENCE_THRESHOLD: f32 = 0.5;
 
 /// Consecutive failures before marking a route as degraded.
 const DEGRADATION_THRESHOLD: u32 = 3;
+
+/// Registry of known provider trust profiles, keyed by provider_id.
+pub type ProviderTrustRegistry = std::collections::HashMap<String, ProviderTrustProfile>;
+
+/// Provider IDs that are unconditionally prohibited (e.g. PRC/Russia jurisdiction).
+/// Checked independently of trust_floor arithmetic so they cannot be bypassed.
+type ProhibitedSet = HashSet<String>;
 
 // ---------------------------------------------------------------------------
 // RouteHealth — Layer 1 state, no LLM
@@ -79,6 +89,10 @@ pub struct SmartRouter {
     source_id: ThreadId,
     /// Per-model rate limit state handles — populated by register_rate_limit_state().
     rate_limit_states: Arc<Mutex<HashMap<String, Arc<parking_lot::RwLock<animus_core::RateLimitState>>>>>,
+    /// Provider trust profiles — populated from provider_catalog at startup.
+    trust_registry: Arc<parking_lot::Mutex<ProviderTrustRegistry>>,
+    /// Providers that are always blocked regardless of content or budget pressure.
+    prohibited_providers: Arc<parking_lot::Mutex<ProhibitedSet>>,
 }
 
 impl SmartRouter {
@@ -101,6 +115,19 @@ impl SmartRouter {
             signal_tx,
             source_id: ThreadId::new(),
             rate_limit_states: Arc::new(Mutex::new(HashMap::new())),
+            trust_registry: {
+                let map = provider_trust_map();
+                Arc::new(parking_lot::Mutex::new(map))
+            },
+            prohibited_providers: {
+                use animus_core::provider_meta::OwnershipRisk;
+                let map = provider_trust_map();
+                let prohibited: ProhibitedSet = map.values()
+                    .filter(|p| p.ownership_risk == OwnershipRisk::Prohibited)
+                    .map(|p| p.provider_id.clone())
+                    .collect();
+                Arc::new(parking_lot::Mutex::new(prohibited))
+            },
         }
     }
 
@@ -374,6 +401,97 @@ impl SmartRouter {
     pub fn classifier(&self) -> Arc<RwLock<HeuristicClassifier>> {
         self.classifier.clone()
     }
+
+    /// Check if a provider is prohibited (PRC/Russia jurisdiction etc.).
+    fn is_prohibited(&self, provider: &str) -> bool {
+        self.prohibited_providers.lock().contains(provider)
+    }
+
+    /// Check if a ModelSpec passes the budget filter.
+    fn passes_budget(spec: &crate::model_plan::ModelSpec, pressure: BudgetPressure) -> bool {
+        let cost = spec.cost.unwrap_or(CostTier::Moderate);
+        match pressure {
+            BudgetPressure::Normal => true,
+            BudgetPressure::Careful => cost <= CostTier::Moderate,
+            BudgetPressure::Emergency | BudgetPressure::Exceeded => cost == CostTier::Free,
+        }
+    }
+
+    /// Check if a ModelSpec passes the trust filter for the given content sensitivity.
+    fn passes_trust(&self, spec: &crate::model_plan::ModelSpec, required_floor: u8) -> bool {
+        if self.is_prohibited(&spec.provider) {
+            return false;
+        }
+        let registry = self.trust_registry.lock();
+        let effective = registry.get(&spec.provider)
+            .map(|p| p.effective_trust)
+            .unwrap_or(0); // unknown provider → assume untrusted
+        effective >= required_floor
+    }
+
+    /// Check if Critical content has a local engine available.
+    /// Critical content must only go to local (Ollama) providers.
+    fn is_local_provider(provider: &str) -> bool {
+        provider == "ollama"
+    }
+
+    /// Route with budget + trust + sensitivity constraints applied.
+    ///
+    /// Falls back through the route's fallback chain, skipping any model that
+    /// violates the constraints. If no model passes, returns an error.
+    pub async fn route_with_constraints(
+        &self,
+        input: &str,
+        pressure: BudgetPressure,
+        sensitivity: ContentSensitivity,
+    ) -> Result<RouteDecision, String> {
+        let (class_name, _confidence) = self.classify_heuristic(input).await;
+        let required_floor = sensitivity.required_trust_floor();
+
+        let plan = self.plan.read().await;
+        let route = plan.routes.get(&class_name)
+            .or_else(|| plan.routes.values().next())
+            .ok_or_else(|| "no routes in plan".to_string())?;
+
+        // Build candidate list: primary first, then fallbacks
+        let candidates: Vec<(usize, &crate::model_plan::ModelSpec)> =
+            std::iter::once((0, &route.primary))
+            .chain(route.fallbacks.iter().enumerate().map(|(i, f)| (i + 1, f)))
+            .collect();
+
+        for (fallback_index, spec) in candidates {
+            // Hard prohibition check
+            if self.is_prohibited(&spec.provider) {
+                tracing::debug!("Skipping {} — prohibited provider", spec.provider);
+                continue;
+            }
+            // Critical content → local only
+            if sensitivity == ContentSensitivity::Critical && !Self::is_local_provider(&spec.provider) {
+                tracing::debug!("Skipping {} — Critical content requires local provider", spec.provider);
+                continue;
+            }
+            // Trust floor check
+            if !self.passes_trust(spec, required_floor) {
+                tracing::debug!("Skipping {}:{} — trust floor not met (required {})", spec.provider, spec.model, required_floor);
+                continue;
+            }
+            // Budget check
+            if !Self::passes_budget(spec, pressure) {
+                tracing::debug!("Skipping {}:{} — budget pressure {:?}", spec.provider, spec.model, pressure);
+                continue;
+            }
+            return Ok(RouteDecision {
+                class_name,
+                model_spec: spec.clone(),
+                fallback_index,
+            });
+        }
+
+        Err(format!(
+            "No engine passes constraints for class '{}' (sensitivity={:?}, pressure={:?})",
+            class_name, sensitivity, pressure
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -527,5 +645,36 @@ mod tests {
         let s = &stats["Technical"];
         assert_eq!(s.turn_count, 2);
         assert_eq!(s.avg_latency_ms(), Some(500));
+    }
+
+    #[tokio::test]
+    async fn prohibited_provider_never_selected() {
+        let (router, _rx) = make_router();
+        assert!(router.is_prohibited("qwen-api"), "qwen-api must be prohibited");
+        assert!(router.is_prohibited("deepseek-api"), "deepseek-api must be prohibited");
+        assert!(!router.is_prohibited("anthropic"), "anthropic must not be prohibited");
+        assert!(!router.is_prohibited("cerebras"), "cerebras must not be prohibited");
+    }
+
+    #[test]
+    fn budget_filter_free_only_on_emergency() {
+        use crate::model_plan::{ModelSpec, ThinkLevel};
+        let spec_free = ModelSpec {
+            provider: "cerebras".to_string(),
+            model: "llama3.1-8b".to_string(),
+            think: ThinkLevel::Off,
+            cost: Some(CostTier::Free),
+            speed: None, quality: None, trust_floor: 0,
+        };
+        let spec_expensive = ModelSpec {
+            provider: "anthropic".to_string(),
+            model: "claude-opus-4-6".to_string(),
+            think: ThinkLevel::Dynamic,
+            cost: Some(CostTier::Expensive),
+            speed: None, quality: None, trust_floor: 0,
+        };
+        assert!(SmartRouter::passes_budget(&spec_free, BudgetPressure::Emergency));
+        assert!(!SmartRouter::passes_budget(&spec_expensive, BudgetPressure::Emergency));
+        assert!(SmartRouter::passes_budget(&spec_expensive, BudgetPressure::Normal));
     }
 }
