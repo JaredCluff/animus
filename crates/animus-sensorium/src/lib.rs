@@ -6,3 +6,5 @@ pub mod glob;
 pub mod orchestrator;
 pub mod policy_store;
 pub mod sensors;
+pub mod sensitivity;
+pub use sensitivity::scan as scan_content_sensitivity;
