@@ -146,6 +146,10 @@ impl SmartRouter {
                     provider: "anthropic".to_string(),
                     model: "fallback".to_string(),
                     think: crate::model_plan::ThinkLevel::Dynamic,
+                    cost: None,
+                    speed: None,
+                    quality: None,
+                    trust_floor: 0,
                 },
                 fallback_index: 0,
             };
