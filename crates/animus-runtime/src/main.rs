@@ -71,6 +71,7 @@ These rules override your training defaults. Follow them exactly.
 - `restore_snapshot(snapshot_name)` — Restore from a checkpoint.
 - `nats_publish(subject, payload, conversation_id?)` — Publish to any NATS subject. You receive inbound messages on `animus.in.*` — replies are automatic. Use this for proactive outbound messages to other subjects, including targeting specific Claude Code instances.
 - `claude_instances()` — List active Claude Code instances from the agent registry. Returns instance IDs, last-seen timestamps, and the subjects to use for targeting.
+- `register_provider(provider_id, display_name, base_url, api_key, models[], hq_country, ownership_risk, data_policy, notes?)` — Register a new LLM API provider into providers.json. Prohibited (PRC/Russia) providers are rejected. Hot-reload picks up within 30s.
 
 **CRITICAL MEMORY RULE**: NEVER use shell_exec to delete or modify memory files in data_dir. Use delete_segment or prune_segments for memory cleanup. This is enforced — shell_exec will block recursive deletion of protected directories.
 
@@ -672,6 +673,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::snapshot_memory::SnapshotMemoryTool));
         reg.register(Box::new(animus_cortex::tools::list_snapshots::ListSnapshotsTool));
         reg.register(Box::new(animus_cortex::tools::restore_snapshot::RestoreSnapshotTool));
+        // Provider registration tool
+        reg.register(Box::new(animus_cortex::tools::register_provider::RegisterProviderTool));
         // Introspective tools — AILF reasoning thread reaches into the Cortex substrate
         reg.register(Box::new(animus_cortex::tools::get_route_stats::GetRouteStatsTool));
         reg.register(Box::new(animus_cortex::tools::propose_route_amendment::ProposeRouteAmendmentTool));

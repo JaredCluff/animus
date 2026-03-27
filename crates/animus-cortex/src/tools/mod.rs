@@ -22,6 +22,8 @@ pub mod restore_snapshot;
 pub mod nats_publish;
 pub mod claude_instances;
 pub mod federate_segment;
+// Provider registration tool — registers new LLM API providers into providers.json
+pub mod register_provider;
 // Introspective tools — AILF reasoning thread reaches into the Cortex substrate
 pub mod get_route_stats;
 pub mod propose_route_amendment;
