@@ -389,20 +389,30 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
         let mut registry = EngineRegistry::new(fallback);
 
-        // Per-role overrides — each can specify a different provider + model
-        for (role, model_env, provider_env, max_tok) in [
-            (CognitiveRole::Perception,  "ANIMUS_PERCEPTION_MODEL",  "ANIMUS_PERCEPTION_PROVIDER",  1024usize),
-            (CognitiveRole::Reflection,  "ANIMUS_REFLECTION_MODEL",  "ANIMUS_REFLECTION_PROVIDER",  4096),
-            (CognitiveRole::Reasoning,   "ANIMUS_REASONING_MODEL",   "ANIMUS_REASONING_PROVIDER",   4096),
+        // Per-role overrides — each can specify a different provider + model + URL + API key
+        for (role, model_env, provider_env, url_env, key_env, max_tok) in [
+            (CognitiveRole::Perception, "ANIMUS_PERCEPTION_MODEL",  "ANIMUS_PERCEPTION_PROVIDER",  "ANIMUS_PERCEPTION_BASE_URL",  "ANIMUS_PERCEPTION_API_KEY",  1024usize),
+            (CognitiveRole::Reflection, "ANIMUS_REFLECTION_MODEL",  "ANIMUS_REFLECTION_PROVIDER",  "ANIMUS_REFLECTION_BASE_URL",  "ANIMUS_REFLECTION_API_KEY",  4096),
+            (CognitiveRole::Reasoning,  "ANIMUS_REASONING_MODEL",   "ANIMUS_REASONING_PROVIDER",   "ANIMUS_REASONING_BASE_URL",   "ANIMUS_REASONING_API_KEY",   4096),
         ] {
             let role_model = std::env::var(model_env).ok()
                 .or_else(|| if role == CognitiveRole::Reasoning { Some(model_id.clone()) } else { None });
             let role_provider = std::env::var(provider_env).ok()
                 .unwrap_or_else(|| provider_str.clone());
+            let role_url = std::env::var(url_env).ok()
+                .unwrap_or_else(|| base_url.clone());
+            let role_key = std::env::var(key_env).ok()
+                .unwrap_or_else(|| api_key.clone());
 
-            if let Some(model) = role_model {
-                if let Some(engine) = build_engine(&role_provider, &model, max_tok, &base_url, &api_key) {
-                    tracing::info!("{role:?} role: {role_provider}/{model}");
+            if let Some(ref model) = role_model {
+                if let Some(engine) = build_engine(&role_provider, model, max_tok, &role_url, &role_key) {
+                    tracing::info!("{role:?} role: {role_provider}/{model} @ {role_url}");
+                    // Register by name so SmartRouter can dispatch by ModelSpec
+                    let arc_engine: Arc<dyn animus_cortex::ReasoningEngine> = Arc::from(
+                        build_engine(&role_provider, model, max_tok, &role_url, &role_key)
+                            .expect("engine built successfully above")
+                    );
+                    registry.register_named(&role_provider, model, arc_engine);
                     registry.set_engine(role, engine);
                 }
             }
