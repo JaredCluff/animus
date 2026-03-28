@@ -154,7 +154,7 @@ fn format_reflection_prompt(segments: &[Segment], goals_summary: &str) -> String
 
 /// Background reflection loop — periodically synthesizes recent knowledge.
 pub struct ReflectionLoop<S: VectorStore> {
-    engine: Box<dyn ReasoningEngine>,
+    engine: Arc<dyn ReasoningEngine>,
     store: Arc<S>,
     embedder: Arc<dyn EmbeddingService>,
     goals: Arc<parking_lot::Mutex<GoalManager>>,
@@ -171,7 +171,7 @@ pub struct ReflectionLoop<S: VectorStore> {
 
 impl<S: VectorStore> ReflectionLoop<S> {
     pub fn new(
-        engine: Box<dyn ReasoningEngine>,
+        engine: Arc<dyn ReasoningEngine>,
         store: Arc<S>,
         embedder: Arc<dyn EmbeddingService>,
         goals: Arc<parking_lot::Mutex<GoalManager>>,
@@ -467,7 +467,7 @@ mod tests {
         let goals = Arc::new(parking_lot::Mutex::new(GoalManager::new()));
         let (signal_tx, _) = mpsc::channel(100);
 
-        let mock_engine = Box::new(crate::MockEngine::new("test"));
+        let mock_engine = Arc::new(crate::MockEngine::new("test"));
         let loop_ = ReflectionLoop::new(mock_engine, store, embedder, goals, signal_tx);
 
         // No new segments, should not cycle
@@ -486,7 +486,7 @@ mod tests {
         let goals = Arc::new(parking_lot::Mutex::new(GoalManager::new()));
         let (signal_tx, _) = mpsc::channel(100);
 
-        let mock_engine = Box::new(crate::MockEngine::new("test"));
+        let mock_engine = Arc::new(crate::MockEngine::new("test"));
         let mut loop_ = ReflectionLoop::new(mock_engine, store.clone(), embedder, goals, signal_tx)
             .with_min_new_segments(2);
 
@@ -552,7 +552,7 @@ mod tests {
             "goal_updates": [],
             "signals": []
         });
-        let mock_engine = Box::new(crate::MockEngine::new(&response.to_string()));
+        let mock_engine = Arc::new(crate::MockEngine::new(&response.to_string()));
         let mut loop_ = ReflectionLoop::new(mock_engine, store.clone(), embedder, goals, signal_tx);
         loop_.last_cycle = Utc::now() - chrono::Duration::hours(1);
         loop_.last_segment_count = 0;
@@ -596,7 +596,7 @@ mod tests {
             "goal_updates": [],
             "signals": []
         });
-        let mock_engine = Box::new(crate::MockEngine::new(&response.to_string()));
+        let mock_engine = Arc::new(crate::MockEngine::new(&response.to_string()));
         let mut loop_ = ReflectionLoop::new(mock_engine, store, embedder, goals, signal_tx);
         loop_.last_cycle = Utc::now() - chrono::Duration::hours(1);
         loop_.last_segment_count = 0;
@@ -648,7 +648,7 @@ mod tests {
                 "relevant_segments": []
             }]
         });
-        let mock_engine = Box::new(crate::MockEngine::new(&response.to_string()));
+        let mock_engine = Arc::new(crate::MockEngine::new(&response.to_string()));
         let mut loop_ = ReflectionLoop::new(mock_engine, store, embedder, goals, signal_tx);
         loop_.last_cycle = Utc::now() - chrono::Duration::hours(1);
         loop_.last_segment_count = 0;

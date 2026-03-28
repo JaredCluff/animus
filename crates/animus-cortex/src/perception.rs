@@ -291,7 +291,7 @@ fn format_burst_summary(events: &[SensorEvent]) -> String {
 
 /// Background perception loop — batches sensor events and classifies them via LLM.
 pub struct PerceptionLoop<S: VectorStore> {
-    engine: Box<dyn ReasoningEngine>,
+    engine: Arc<dyn ReasoningEngine>,
     store: Arc<S>,
     embedder: Arc<dyn EmbeddingService>,
     signal_tx: mpsc::Sender<Signal>,
@@ -311,7 +311,7 @@ pub struct PerceptionLoop<S: VectorStore> {
 
 impl<S: VectorStore> PerceptionLoop<S> {
     pub fn new(
-        engine: Box<dyn ReasoningEngine>,
+        engine: Arc<dyn ReasoningEngine>,
         store: Arc<S>,
         embedder: Arc<dyn EmbeddingService>,
         signal_tx: mpsc::Sender<Signal>,
@@ -764,7 +764,7 @@ mod tests {
             Arc::new(animus_embed::SyntheticEmbedding::new(4));
         let (signal_tx, _signal_rx) = mpsc::channel(100);
 
-        let mock_engine = Box::new(crate::MockEngine::new("test"));
+        let mock_engine = Arc::new(crate::MockEngine::new("test"));
         let loop_ = PerceptionLoop::new(mock_engine, store, embedder, signal_tx)
             .with_batch_window(Duration::from_millis(500))
             .with_max_batch_size(5);
@@ -808,7 +808,7 @@ mod tests {
                 }
             ]
         });
-        let mock_engine = Box::new(crate::MockEngine::new(&response.to_string()));
+        let mock_engine = Arc::new(crate::MockEngine::new(&response.to_string()));
         let perception = PerceptionLoop::new(mock_engine, store.clone(), embedder, signal_tx);
 
         let events = vec![
@@ -861,7 +861,7 @@ mod tests {
                 "signal": {"priority": "Urgent", "reason": "Suspicious network activity"}
             }]
         });
-        let mock_engine = Box::new(crate::MockEngine::new(&response.to_string()));
+        let mock_engine = Arc::new(crate::MockEngine::new(&response.to_string()));
         let perception = PerceptionLoop::new(mock_engine, store, embedder, signal_tx);
 
         let events = vec![SensorEvent {
@@ -894,7 +894,7 @@ mod tests {
         let (signal_tx, _signal_rx) = mpsc::channel(100);
 
         // MockEngine returns unparseable text — should trigger fallback
-        let mock_engine = Box::new(crate::MockEngine::new("I don't understand the events"));
+        let mock_engine = Arc::new(crate::MockEngine::new("I don't understand the events"));
         let perception = PerceptionLoop::new(mock_engine, store.clone(), embedder, signal_tx);
 
         let events = vec![SensorEvent {

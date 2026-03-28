@@ -519,7 +519,30 @@ pub struct CortexConfig {
     /// Ollama default: "http://127.0.0.1:11434"
     /// OpenAI default: "https://api.openai.com"
     pub openai_base_url: String,
+
+    // ── Safety-net / fallback engine ─────────────────────────────────────
+    // The always-available engine that the system falls back to when the
+    // primary provider (and all cloud alternatives) are down. Can be any
+    // OpenAI-compatible server: local Ollama, LM Studio, vLLM, cloud
+    // Ollama, text-generation-inference, etc.
+
+    /// Base URL of the safety-net endpoint.
+    /// Env: `ANIMUS_FALLBACK_URL`. Falls back to `ANIMUS_OLLAMA_URL`.
+    #[serde(default = "default_fallback_url")]
+    pub fallback_url: String,
+    /// Provider type for the safety-net endpoint ("ollama" | "openai_compat").
+    /// Env: `ANIMUS_FALLBACK_PROVIDER`.
+    #[serde(default = "default_fallback_provider")]
+    pub fallback_provider: String,
+    /// Explicit model override for the safety net. If empty, auto-discovered
+    /// from the endpoint at boot.
+    /// Env: `ANIMUS_FALLBACK_MODEL`.
+    #[serde(default)]
+    pub fallback_model: String,
 }
+
+fn default_fallback_url() -> String { "http://localhost:11434".to_string() }
+fn default_fallback_provider() -> String { "ollama".to_string() }
 
 impl Default for CortexConfig {
     fn default() -> Self {
@@ -530,6 +553,9 @@ impl Default for CortexConfig {
             max_response_tokens: 4096,
             system_prompt: String::new(),
             openai_base_url: "http://127.0.0.1:11434".to_string(),
+            fallback_url: default_fallback_url(),
+            fallback_provider: default_fallback_provider(),
+            fallback_model: String::new(),
         }
     }
 }
@@ -796,6 +822,22 @@ impl AnimusConfig {
         } else if let Ok(url) = std::env::var("ANIMUS_OLLAMA_URL") {
             // ANIMUS_OLLAMA_URL doubles as the base URL for both embeddings and LLM.
             self.cortex.openai_base_url = url;
+        }
+
+        // Safety-net / fallback overrides
+        if let Ok(url) = std::env::var("ANIMUS_FALLBACK_URL") {
+            self.cortex.fallback_url = url;
+        } else if self.cortex.fallback_url == default_fallback_url() {
+            // If no explicit fallback URL, inherit from ANIMUS_OLLAMA_URL for backwards compat
+            if let Ok(url) = std::env::var("ANIMUS_OLLAMA_URL") {
+                self.cortex.fallback_url = url;
+            }
+        }
+        if let Ok(provider) = std::env::var("ANIMUS_FALLBACK_PROVIDER") {
+            self.cortex.fallback_provider = provider;
+        }
+        if let Ok(model) = std::env::var("ANIMUS_FALLBACK_MODEL") {
+            self.cortex.fallback_model = model;
         }
 
         // Health overrides

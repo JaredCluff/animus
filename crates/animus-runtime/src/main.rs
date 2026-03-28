@@ -299,6 +299,35 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
     tracing::info!("Sensorium initialized (use /consent to manage observation policies)");
 
+    // ── Safety-net endpoint discovery ───────────────────────────────────────
+    // The safety-net is the always-available backup engine: local Ollama, LM Studio,
+    // vLLM, cloud Ollama — anything serving an OpenAI-compatible API.
+    // Config-driven: ANIMUS_FALLBACK_URL / ANIMUS_FALLBACK_PROVIDER / ANIMUS_FALLBACK_MODEL.
+    // Results drive: (a) fallback engine cascade, (b) named engine registration,
+    // (c) model plan building, (d) capability registry.
+    let fallback_url = config.cortex.fallback_url.trim_end_matches('/').to_string();
+    let fallback_provider = config.cortex.fallback_provider.clone();
+    let discovered_local_models: Vec<String> = {
+        discover_models_at_endpoint(&fallback_url).await
+    };
+    // Resolve which model the safety net uses: explicit config > first discovered > empty
+    let fallback_model: Option<String> = if !config.cortex.fallback_model.is_empty() {
+        Some(config.cortex.fallback_model.clone())
+    } else {
+        discovered_local_models.first().cloned()
+    };
+    if !discovered_local_models.is_empty() {
+        tracing::info!(
+            "Safety-net discovery: {} model(s) at {} (provider: {}) — {}",
+            discovered_local_models.len(),
+            fallback_url,
+            fallback_provider,
+            discovered_local_models.join(", ")
+        );
+    } else {
+        tracing::debug!("Safety-net endpoint not reachable at {fallback_url}");
+    }
+
     // Build engine registry from config + env vars.
     // Provider dispatch: anthropic (default) | ollama | openai | mock
     // Per-role overrides: ANIMUS_{REASONING,REFLECTION,PERCEPTION}_MODEL and _PROVIDER
@@ -343,15 +372,32 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             }
         };
 
+        // Fallback cascade: configured primary → safety-net endpoint → Mock.
+        // The safety net can be any OpenAI-compatible server (Ollama, LM Studio,
+        // vLLM, cloud Ollama, etc.) configured via ANIMUS_FALLBACK_*.
         let fallback: Arc<dyn animus_cortex::ReasoningEngine> =
             build_engine(&provider_str, &model_id, 4096, &base_url, &api_key)
+            .or_else(|| {
+                // Primary provider failed — cascade to the safety-net endpoint.
+                if let Some(ref model) = fallback_model {
+                    tracing::warn!(
+                        "Primary provider '{}' unavailable — cascading to safety net: {}/{} @ {}",
+                        provider_str, fallback_provider, model, fallback_url
+                    );
+                    build_engine(&fallback_provider, model, 4096, &fallback_url, "")
+                } else {
+                    tracing::warn!(
+                        "Primary provider '{}' unavailable and safety-net endpoint has no models",
+                        provider_str
+                    );
+                    None
+                }
+            })
             .unwrap_or_else(|| {
-                eprintln!("Warning: Could not initialize LLM engine. Running with mock.");
-                eprintln!("For Anthropic: mount ~/.claude/.credentials.json or set ANTHROPIC_API_KEY");
-                eprintln!("For Ollama:    set ANIMUS_LLM_PROVIDER=ollama ANIMUS_OLLAMA_URL=http://host:11434");
-                eprintln!("For OpenAI:    set ANIMUS_LLM_PROVIDER=openai ANIMUS_OPENAI_API_KEY=sk-...");
+                eprintln!("Warning: No LLM provider available (primary + safety net both failed). Running with mock.");
+                eprintln!("Configure a safety-net endpoint: ANIMUS_FALLBACK_URL, ANIMUS_FALLBACK_PROVIDER, ANIMUS_FALLBACK_MODEL");
                 Arc::new(animus_cortex::MockEngine::new(
-                    "I'm running without an LLM connection. Set ANIMUS_LLM_PROVIDER and related vars.",
+                    "No LLM provider available. Set ANIMUS_FALLBACK_URL to a local inference server.",
                 ))
             });
 
@@ -383,7 +429,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             }
         }
 
-        // Register optional named engines from dedicated env vars (OpenRouter, NIM, etc.)
+        // Register optional named engines from dedicated env vars (OpenRouter, NIM, Cerebras, Groq)
         for (name, provider_env, model_env, url_env, key_env, default_model, default_url) in [
             (
                 "openrouter",
@@ -403,8 +449,29 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 "meta/llama-3.3-70b-instruct",
                 "https://integrate.api.nvidia.com",
             ),
+            (
+                "cerebras",
+                "ANIMUS_CEREBRAS_PROVIDER",
+                "ANIMUS_CEREBRAS_MODEL",
+                "ANIMUS_CEREBRAS_BASE_URL",
+                "ANIMUS_CEREBRAS_API_KEY",
+                "llama-3.3-70b",
+                "https://api.cerebras.ai",
+            ),
+            (
+                "groq",
+                "ANIMUS_GROQ_PROVIDER",
+                "ANIMUS_GROQ_MODEL",
+                "ANIMUS_GROQ_BASE_URL",
+                "GROQ_API_KEY",
+                "llama-3.3-70b-versatile",
+                "https://api.groq.com/openai",
+            ),
         ] {
             if let Ok(api_key) = std::env::var(key_env) {
+                if api_key.is_empty() {
+                    continue;
+                }
                 let provider = std::env::var(provider_env).unwrap_or("openai_compat".to_string());
                 let model = std::env::var(model_env).unwrap_or(default_model.to_string());
                 let url = std::env::var(url_env).unwrap_or(default_url.to_string());
@@ -412,6 +479,17 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 if let Some(arc) = build_engine(&provider, &model, 4096, &url, &api_key) {
                     registry.register_named(name, &model, arc);
                     tracing::info!("{name} engine registered: {name}/{model}");
+                }
+            }
+        }
+
+        // Register ALL discovered safety-net models as named engines.
+        // Works with any OpenAI-compatible server (Ollama, LM Studio, vLLM, etc.).
+        for model_name in &discovered_local_models {
+            if registry.engine_by_spec(&fallback_provider, model_name).is_none() {
+                if let Some(arc) = build_engine(&fallback_provider, model_name, 4096, &fallback_url, "") {
+                    registry.register_named(&fallback_provider, model_name, arc);
+                    tracing::info!("Safety-net engine registered: {}:{}", fallback_provider, model_name);
                 }
             }
         }
@@ -500,29 +578,12 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     // and reused until the available model set changes. Cortex substrate tracks
     // RouteStats; AILF reasoning thread can reach in via introspective tools.
 
-    // Discover available models early — needed for CapabilityRegistry build.
-    let mut available_models_pre: Vec<String> = Vec::new();
-    if config.cortex.llm_provider.to_lowercase() == "ollama" || config.cortex.openai_base_url.contains("11434") {
-        let ollama_url_pre = if config.cortex.openai_base_url.is_empty() {
-            "http://localhost:11434"
-        } else {
-            config.cortex.openai_base_url.trim_end_matches('/')
-        };
-        let tags_url_pre = format!("{}/api/tags", ollama_url_pre);
-        if let Ok(resp) = reqwest::Client::new().get(&tags_url_pre).timeout(std::time::Duration::from_secs(5)).send().await {
-            if resp.status().is_success() {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    if let Some(models) = body["models"].as_array() {
-                        for m in models {
-                            if let Some(name) = m["name"].as_str() {
-                                available_models_pre.push(format!("ollama:{}", name));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Build available models list from safety-net discovery + registry.
+    // Reuses `discovered_local_models` (probed once at boot) — no duplicate HTTP calls.
+    let mut available_models_pre: Vec<String> = discovered_local_models
+        .iter()
+        .map(|m| format!("{}:{m}", fallback_provider))
+        .collect();
     let configured_pre = format!("{}:{}", config.cortex.llm_provider, config.cortex.model_id);
     if !available_models_pre.iter().any(|m| m == &configured_pre) {
         available_models_pre.push(configured_pre);
@@ -533,13 +594,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         }
     }
 
-    // Build CapabilityRegistry: static profiles + optional Ollama probe
-    let ollama_base_for_registry = if config.cortex.llm_provider.to_lowercase() == "ollama" || config.cortex.openai_base_url.contains("11434") {
-        Some(if config.cortex.openai_base_url.is_empty() {
-            "http://localhost:11434".to_string()
-        } else {
-            config.cortex.openai_base_url.trim_end_matches('/').to_string()
-        })
+    // Build CapabilityRegistry: static profiles + optional local model probe.
+    // Always pass fallback URL if models were discovered — not gated on llm_provider.
+    let ollama_base_for_registry = if !discovered_local_models.is_empty() {
+        Some(fallback_url.clone())
     } else {
         None
     };
@@ -554,32 +612,11 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let smart_router: Option<SmartRouter> = {
         let plan_path = data_dir.join("model_plan.json");
 
-        // Discover available models for config hash computation
-        let mut available_models: Vec<String> = Vec::new();
-
-        // Ollama: query /api/tags for local model list
-        if config.cortex.llm_provider.to_lowercase() == "ollama" || config.cortex.openai_base_url.contains("11434") {
-            let ollama_url = if config.cortex.openai_base_url.is_empty() {
-                "http://localhost:11434"
-            } else {
-                config.cortex.openai_base_url.trim_end_matches('/')
-            };
-            let tags_url = format!("{}/api/tags", ollama_url);
-            match reqwest::Client::new().get(&tags_url).timeout(std::time::Duration::from_secs(5)).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        if let Some(models) = body["models"].as_array() {
-                            for m in models {
-                                if let Some(name) = m["name"].as_str() {
-                                    available_models.push(format!("ollama:{}", name));
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => tracing::debug!("Could not query Ollama model list — using config model only"),
-            }
-        }
+        // Reuse safety-net discovery + engine registry — no duplicate HTTP probes.
+        let mut available_models: Vec<String> = discovered_local_models
+            .iter()
+            .map(|m| format!("{}:{m}", fallback_provider))
+            .collect();
 
         // Always include the explicitly configured model
         let configured = format!("{}:{}", config.cortex.llm_provider, config.cortex.model_id);
@@ -587,7 +624,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             available_models.push(configured);
         }
 
-        // Include any per-role named engines (e.g. Cerebras via ANIMUS_PERCEPTION_*)
+        // Include all registered named engines (Cerebras, Groq, OpenRouter, NIM, etc.)
         for id in engine_registry.named_model_ids() {
             if !available_models.iter().any(|m| m == &id) {
                 available_models.push(id);
@@ -1101,17 +1138,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let perception_event_rx = event_bus.subscribe();
     let perception_self_filter = self_event_filter.clone();
     let perception_api_tracker = api_tracker.clone();
-    let perception_engine: Box<dyn animus_cortex::ReasoningEngine> = {
-        let pm = std::env::var("ANIMUS_PERCEPTION_MODEL")
-            .unwrap_or_else(|_| model_id.clone());
-        match AnthropicEngine::from_best_available(&pm, 1024) {
-            Ok(e) => Box::new(e),
-            Err(_) => {
-                tracing::info!("No perception model configured, using mechanical event pipeline");
-                Box::new(animus_cortex::MockEngine::new("no perception model"))
-            }
-        }
-    };
+    // Use the engine from the registry — respects per-role overrides and the
+    // fallback cascade (configured provider → Ollama → Mock). Shares rate limit
+    // state with SmartRouter via the same Arc.
+    let perception_engine = engine_registry.engine_for_arc(CognitiveRole::Perception);
     tokio::spawn(async move {
         let perception = animus_cortex::PerceptionLoop::new(
             perception_engine,
@@ -1168,17 +1198,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let reflection_store = store.clone();
     let reflection_embedder = embedder.clone();
     let reflection_goals = goals.clone();
-    let reflection_engine: Box<dyn animus_cortex::ReasoningEngine> = {
-        let rm = std::env::var("ANIMUS_REFLECTION_MODEL")
-            .unwrap_or_else(|_| model_id.clone());
-        match AnthropicEngine::from_best_available(&rm, 4096) {
-            Ok(e) => Box::new(e),
-            Err(_) => {
-                tracing::info!("No reflection model configured, reflection loop disabled");
-                Box::new(animus_cortex::MockEngine::new("no reflection model"))
-            }
-        }
-    };
+    // Use the engine from the registry — respects per-role overrides and the
+    // fallback cascade (configured provider → Ollama → Mock). Shares rate limit
+    // state with SmartRouter via the same Arc.
+    let reflection_engine = engine_registry.engine_for_arc(CognitiveRole::Reflection);
     tokio::spawn(async move {
         let reflection = animus_cortex::ReflectionLoop::new(
             reflection_engine,
@@ -2079,6 +2102,66 @@ async fn run_reasoning_turn(
     }
 
     Ok(output.content)
+}
+
+// ---------------------------------------------------------------------------
+// Safety-net model discovery
+// ---------------------------------------------------------------------------
+
+/// Discover available models at an OpenAI-compatible endpoint.
+///
+/// Tries Ollama `/api/tags` first, then standard `/v1/models`.
+/// Works with Ollama, LM Studio, vLLM, text-generation-inference, or any
+/// OpenAI-compatible server.
+async fn discover_models_at_endpoint(base_url: &str) -> Vec<String> {
+    let client = reqwest::Client::new();
+    let timeout = std::time::Duration::from_secs(5);
+
+    // Try Ollama /api/tags
+    if let Ok(resp) = client
+        .get(format!("{base_url}/api/tags"))
+        .timeout(timeout)
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if let Some(models) = body["models"].as_array() {
+                    let names: Vec<String> = models
+                        .iter()
+                        .filter_map(|m| m["name"].as_str().map(String::from))
+                        .collect();
+                    if !names.is_empty() {
+                        return names;
+                    }
+                }
+            }
+        }
+    }
+
+    // Try OpenAI-compat /v1/models (LM Studio, vLLM, etc.)
+    if let Ok(resp) = client
+        .get(format!("{base_url}/v1/models"))
+        .timeout(timeout)
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if let Some(data) = body["data"].as_array() {
+                    let names: Vec<String> = data
+                        .iter()
+                        .filter_map(|m| m["id"].as_str().map(String::from))
+                        .collect();
+                    if !names.is_empty() {
+                        return names;
+                    }
+                }
+            }
+        }
+    }
+
+    vec![]
 }
 
 // ---------------------------------------------------------------------------

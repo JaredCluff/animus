@@ -29,6 +29,12 @@ services:
       # OpenAI (optional, for ANIMUS_LLM_PROVIDER=openai or ANIMUS_EMBED_PROVIDER=openai)
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
 
+      # ── Cloud LLM providers (all optional — set env var to enable) ────────
+      GROQ_API_KEY: "${GROQ_API_KEY:-}"
+      ANIMUS_CEREBRAS_API_KEY: "${ANIMUS_CEREBRAS_API_KEY:-}"
+      ANIMUS_NIM_API_KEY: "${ANIMUS_NIM_API_KEY:-}"
+      ANIMUS_OPENROUTER_API_KEY: "${ANIMUS_OPENROUTER_API_KEY:-}"
+
       # ── Embedding: Ollama running on the host machine ────────────────────────
       # On macOS + Podman, set ANIMUS_OLLAMA_URL to your Mac's LAN IP:
       #   export ANIMUS_OLLAMA_URL=http://192.168.0.200:11434
@@ -36,6 +42,13 @@ services:
       ANIMUS_EMBED_PROVIDER: "${ANIMUS_EMBED_PROVIDER:-ollama}"
       ANIMUS_OLLAMA_URL: "${ANIMUS_OLLAMA_URL:-http://localhost:11434}"
       ANIMUS_EMBED_MODEL: "${ANIMUS_EMBED_MODEL:-mxbai-embed-large}"
+
+      # ── Safety-net / fallback engine ────────────────────────────────────────
+      # Always-available backup: local Ollama, LM Studio, vLLM, cloud Ollama, etc.
+      # Any OpenAI-compatible endpoint works. Defaults to ANIMUS_OLLAMA_URL.
+      ANIMUS_FALLBACK_URL: "${ANIMUS_FALLBACK_URL:-}"
+      ANIMUS_FALLBACK_PROVIDER: "${ANIMUS_FALLBACK_PROVIDER:-ollama}"
+      ANIMUS_FALLBACK_MODEL: "${ANIMUS_FALLBACK_MODEL:-}"
 
       # ── Telegram bot (set ANIMUS_TELEGRAM_TOKEN to enable) ─────────────────
       # Create a bot via @BotFather, copy the token here or export it:
