@@ -9,7 +9,7 @@ use tempfile::TempDir;
 fn make_thread(name: &str) -> (ReasoningThread<MmapVectorStore>, TempDir) {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(MmapVectorStore::open(&dir.path().join("vfs"), 128).unwrap());
-    let thread = ReasoningThread::new(name.to_string(), store, 8000, 128);
+    let thread = ReasoningThread::new(name.to_string(), store, 8000);
     (thread, dir)
 }
 
@@ -94,7 +94,7 @@ fn drain_signals_clears_inbox() {
 async fn signals_drained_after_processing() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(MmapVectorStore::open(&dir.path().join("vfs"), 128).unwrap());
-    let mut thread = ReasoningThread::new("test".to_string(), store, 8000, 128);
+    let mut thread = ReasoningThread::new("test".to_string(), store, 8000);
 
     // Deliver a signal
     let signal = Signal {
