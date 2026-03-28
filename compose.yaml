@@ -79,7 +79,7 @@ services:
       start_period: 10s
 
   nats:
-    image: nats:latest
+    image: nats:alpine
     container_name: animus-nats
     restart: unless-stopped
     command: ["-p", "14222", "--jetstream", "-m", "8222"]
