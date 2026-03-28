@@ -86,7 +86,7 @@ async fn probe_batch(
                 created: Utc::now(),
             });
         } else if prev_weight <= 0.0 && available {
-            // Was confirmed down (or first probe and down→up), now recovered
+            // Was confirmed down (weight=0.0), now recovered
             let summary = format!("Engine '{key}' is back online — resuming normal routing");
             tracing::info!("{summary}");
             let _ = signal_tx.try_send(Signal {
