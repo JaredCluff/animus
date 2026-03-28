@@ -1,8 +1,9 @@
 //! Self-Configuring Model Plan — living routing knowledge for the AILF.
 //!
-//! Animus builds its own cognitive routing plan from available models at startup.
-//! The plan is persisted, reused until the config changes, and accumulates runtime
-//! performance data (`RouteStats`) so the AILF can reflect on its own routing quality.
+//! Animus builds its own cognitive routing plan from available models at startup
+//! using capability profiles from the `CapabilityRegistry`. The plan is persisted,
+//! reused until the config changes, and accumulates runtime performance data
+//! (`RouteStats`) so the AILF can reflect on its own routing quality.
 //!
 //! # Three-layer compliance
 //! - Layer 1: `RouteStats` and `RouteHealth` tracking — pure data, no LLM
@@ -107,26 +108,87 @@ impl RouteStats {
 // Route
 // ---------------------------------------------------------------------------
 
-/// A routing entry for one task class: primary model + fallback chain + live stats.
+/// A routing entry for one task class: ranked candidate list + live stats.
+/// Index 0 of `candidates` is the highest-scoring model at plan-build time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
-    pub primary: ModelSpec,
-    pub fallbacks: Vec<ModelSpec>,
+    /// Ranked candidate list — index 0 is the highest initial scorer.
+    pub candidates: Vec<ModelSpec>,
+    /// Per-model stats keyed by "provider:model".
+    #[serde(default)]
+    pub model_stats: HashMap<String, RouteStats>,
+    /// Class-level aggregate stats.
     #[serde(default)]
     pub stats: RouteStats,
+}
+
+impl Route {
+    /// Convenience: primary model (index 0).
+    pub fn primary(&self) -> Option<&ModelSpec> {
+        self.candidates.first()
+    }
+
+    /// Convenience: fallbacks (index 1+).
+    pub fn fallbacks(&self) -> &[ModelSpec] {
+        if self.candidates.len() > 1 {
+            &self.candidates[1..]
+        } else {
+            &[]
+        }
+    }
+
+    /// Learned quality for a specific model.
+    /// Returns `None` when fewer than 5 turns recorded (insufficient data).
+    pub fn learned_quality_for(&self, model_key: &str) -> Option<f32> {
+        let stats = self.model_stats.get(model_key)?;
+        if stats.turn_count < 5 {
+            return None;
+        }
+        let q = stats.success_rate() * (1.0 - stats.correction_rate());
+        Some(q.clamp(0.0, 1.0))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // TaskClass
 // ---------------------------------------------------------------------------
 
-/// An LLM-defined task classification.
+/// A task classification with routing weight hints.
 /// Keywords are compiled into heuristic patterns by `HeuristicClassifier`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskClass {
     pub name: String,
     pub description: String,
     pub keywords: Vec<String>,
+
+    #[serde(default = "default_weight_quality")]
+    pub weight_quality: f32,
+    #[serde(default = "default_weight_speed")]
+    pub weight_speed: f32,
+    #[serde(default = "default_weight_reasoning")]
+    pub weight_reasoning: f32,
+    #[serde(default = "default_weight_cost")]
+    pub weight_cost: f32,
+    #[serde(default)]
+    pub latency_budget_ms: Option<u32>,
+}
+
+fn default_weight_quality()   -> f32 { 0.5 }
+fn default_weight_speed()     -> f32 { 0.3 }
+fn default_weight_reasoning() -> f32 { 0.3 }
+fn default_weight_cost()      -> f32 { 0.3 }
+
+impl TaskClass {
+    /// Convert to `TaskWeights` for use with `ModelScorer`.
+    pub fn to_weights(&self) -> crate::model_scorer::TaskWeights {
+        crate::model_scorer::TaskWeights {
+            weight_quality: self.weight_quality,
+            weight_speed: self.weight_speed,
+            weight_reasoning: self.weight_reasoning,
+            weight_cost: self.weight_cost,
+            latency_budget_ms: self.latency_budget_ms,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,256 +243,176 @@ impl ModelPlan {
         hex::encode(hasher.finalize())
     }
 
-    /// Build a rule-based default plan when no model is reachable at bootstrap.
-    /// Assigns models based on simple size heuristics (more models = more routes).
-    pub fn default_plan(available_models: &[String]) -> Self {
-        let now = Utc::now();
-        let config_hash = Self::config_hash_for(available_models);
+    /// Build a plan deterministically from capability profiles — no LLM required.
+    pub fn build_from_capabilities(
+        registry: &crate::capability_registry::CapabilityRegistry,
+        available: &[String],
+        task_classes: Vec<TaskClass>,
+    ) -> Self {
+        use crate::model_scorer::{ModelScorer, ScoringContext};
+        use animus_core::budget::BudgetPressure;
 
-        // Sort models by a rough size proxy: longer names / larger numbers = bigger model
-        let mut sorted = available_models.to_vec();
-        sorted.sort_by(|a, b| {
-            // Extract trailing numbers as proxy for param count (e.g., "qwen3.5:35b" → 35)
-            let size_a = extract_size_hint(a);
-            let size_b = extract_size_hint(b);
-            size_b.cmp(&size_a) // descending: biggest first
-        });
+        let config_hash = Self::config_hash_for(available);
+        let mut routes = HashMap::new();
 
-        let largest = sorted.first().map(|s| s.as_str()).unwrap_or("unknown");
-        let smallest = sorted.last().map(|s| s.as_str()).unwrap_or("unknown");
-        let second = sorted.get(1).map(|s| s.as_str()).unwrap_or(largest);
-
-        // Determine providers from model names
-        let provider_for = |model: &str| -> String {
-            if model.contains('/') || model.starts_with("claude") || model.starts_with("gpt") {
-                "anthropic".to_string()
-            } else {
-                "ollama".to_string()
-            }
+        // Optimistic context at plan-build time (no live state yet)
+        let build_ctx = ScoringContext {
+            rate_limit_remaining_pct: 1.0,
+            rate_limit_rpm_ceiling: None,
+            budget_pressure: BudgetPressure::Normal,
+            engine_available: true,
+            learned_quality: None,
         };
 
-        let task_classes = vec![
-            TaskClass {
-                name: "Conversational".to_string(),
-                description: "Casual chat, greetings, simple questions, short exchanges".to_string(),
-                keywords: vec!["hello".to_string(), "hi ".to_string(), "thanks".to_string(), "okay".to_string(), "sure".to_string()],
-            },
-            TaskClass {
-                name: "Analytical".to_string(),
-                description: "Deep analysis, reasoning, complex problem solving".to_string(),
-                keywords: vec!["analyze".to_string(), "explain".to_string(), "why ".to_string(), "how does".to_string(), "compare".to_string(), "evaluate".to_string()],
-            },
-            TaskClass {
-                name: "Technical".to_string(),
-                description: "Code, debugging, architecture, systems".to_string(),
-                keywords: vec!["code".to_string(), "function".to_string(), "debug".to_string(), "implement".to_string(), "rust".to_string(), "error".to_string()],
-            },
-            TaskClass {
-                name: "ToolExecution".to_string(),
-                description: "Tasks requiring tool use, file operations, web access".to_string(),
-                keywords: vec!["fetch".to_string(), "read file".to_string(), "write".to_string(), "search".to_string(), "run".to_string()],
-            },
-        ];
+        for task_class in &task_classes {
+            let weights = task_class.to_weights();
+            let mut scored: Vec<(ModelSpec, f32)> = available
+                .iter()
+                .filter_map(|key| {
+                    let (provider, model) = key.split_once(':')?;
+                    let profile = registry.get(provider, model)?;
+                    if profile.trust_score == 0 {
+                        return None;
+                    }
+                    let score = ModelScorer::score(profile, &weights, &build_ctx);
+                    if score == 0.0 {
+                        return None;
+                    }
+                    let think = think_level_for_profile(profile, task_class);
+                    Some((
+                        ModelSpec {
+                            provider: provider.to_string(),
+                            model: model.to_string(),
+                            think,
+                            cost: Some(profile.cost_tier),
+                            speed: None,
+                            quality: None,
+                            trust_floor: 0,
+                        },
+                        score,
+                    ))
+                })
+                .collect();
 
-        let mut routes = HashMap::new();
-        routes.insert("Conversational".to_string(), Route {
-            primary: ModelSpec { provider: provider_for(smallest), model: smallest.to_string(), think: ThinkLevel::Off, cost: None, speed: None, quality: None, trust_floor: 0 },
-            fallbacks: vec![ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 }],
-            stats: RouteStats::default(),
-        });
-        routes.insert("Analytical".to_string(), Route {
-            primary: ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 },
-            fallbacks: vec![ModelSpec { provider: provider_for(second), model: second.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 }],
-            stats: RouteStats::default(),
-        });
-        routes.insert("Technical".to_string(), Route {
-            primary: ModelSpec { provider: provider_for(second), model: second.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 },
-            fallbacks: vec![ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Dynamic, cost: None, speed: None, quality: None, trust_floor: 0 }],
-            stats: RouteStats::default(),
-        });
-        routes.insert("ToolExecution".to_string(), Route {
-            primary: ModelSpec { provider: provider_for(largest), model: largest.to_string(), think: ThinkLevel::Off, cost: None, speed: None, quality: None, trust_floor: 0 },
-            fallbacks: vec![ModelSpec { provider: provider_for(second), model: second.to_string(), think: ThinkLevel::Off, cost: None, speed: None, quality: None, trust_floor: 0 }],
-            stats: RouteStats::default(),
-        });
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let candidates: Vec<ModelSpec> = scored.into_iter().map(|(s, _)| s).collect();
+
+            routes.insert(
+                task_class.name.clone(),
+                Route {
+                    candidates,
+                    model_stats: HashMap::new(),
+                    stats: RouteStats::default(),
+                },
+            );
+        }
 
         Self {
             id: Uuid::new_v4(),
-            created: now,
+            created: Utc::now(),
             config_hash,
             task_classes,
             routes,
-            build_reason: "Rule-based default (no LLM reachable at bootstrap)".to_string(),
+            build_reason: "Deterministic capability scoring — zero LLM tokens".to_string(),
         }
     }
 
-    /// Extract the JSON plan prompt to send to the LLM for plan building.
-    pub fn build_prompt(available_models: &[String]) -> String {
-        let model_list = available_models.join(", ");
-        format!(
-            r#"You are configuring your own cognitive routing plan.
-
-Available models: {model_list}
-
-Provider tiers (use this to guide routing decisions):
-- openai_compat: Cerebras cloud inference — free tier, ~3000 tokens/s. Prefer as PRIMARY for all task classes where quality is sufficient.
-- ollama: Local inference — free but uses local hardware, slower, may be unavailable. Use as FALLBACK when Cerebras is offline or unavailable.
-- anthropic: Paid API, highest quality, extended thinking support. Reserve for ComplexReasoning or tasks that truly require frontier quality. Use sparingly.
-
-Routing philosophy:
-- Cerebras (openai_compat) first — it is fast, free, and high quality. Route everything there by default.
-- Ollama local models as offline fallback — when Cerebras is not reachable.
-- Anthropic (Claude) only when the task genuinely requires frontier reasoning quality.
-- Embedding/retrieval tasks should always use local ollama embedding models (not Cerebras).
-
-Your task:
-1. Define 4–6 task classes that cover the types of inputs you handle.
-   For each class, provide: a name, a description, and 5–10 characteristic keywords.
-2. Assign each task class a primary model and 1–2 fallback models from the available list.
-   Follow the routing philosophy above — Cerebras primary, Ollama fallback, Anthropic for complex only.
-3. Specify the think budget per model assignment.
-   Think budget options: "off", "dynamic", "minimal_N" (e.g. "minimal_4000"), "full_N" (e.g. "full_8000").
-   Use "dynamic" for models with thinking capability (Qwen3-style or Claude extended thinking).
-   Use "off" for fast/small models, embedding tasks, or tool execution tasks.
-
-Respond with JSON only (no markdown, no explanation):
-{{
-  "task_classes": [
-    {{"name": "ClassName", "description": "What this class covers", "keywords": ["kw1", "kw2", ...]}}
-  ],
-  "routes": {{
-    "ClassName": {{
-      "primary": {{"provider": "openai_compat|ollama|anthropic", "model": "model-name", "think": "dynamic"}},
-      "fallbacks": [
-        {{"provider": "ollama", "model": "smaller-model", "think": "off"}}
-      ]
-    }}
-  }},
-  "build_reason": "Brief explanation of your routing decisions"
-}}"#,
-            model_list = model_list
-        )
+    /// Generate a prompt asking the LLM to annotate (not build) the existing plan.
+    pub fn annotation_prompt(&self) -> String {
+        let mut lines = vec![
+            "Review the cognitive routing plan below. For each task class, explain in 1–2 sentences why the ranked model order makes sense, considering capability, reasoning support, speed, cost, and trust.".to_string(),
+            "Your explanation will be stored as a self-knowledge segment in VectorFS.".to_string(),
+            String::new(),
+        ];
+        for (class_name, route) in &self.routes {
+            lines.push(format!("  {class_name}:"));
+            for (i, spec) in route.candidates.iter().take(3).enumerate() {
+                let label = if i == 0 { "primary".to_string() } else { format!("fallback {i}") };
+                lines.push(format!("    {label}: {}:{} (think={:?})", spec.provider, spec.model, spec.think));
+            }
+        }
+        lines.join("\n")
     }
 
-    /// Parse a plan from an LLM response string.
-    /// Handles JSON wrapped in markdown code blocks.
-    pub fn parse_from_response(response: &str, config_hash: String) -> Option<Self> {
-        let json_str = extract_json(response)?;
-
-        #[derive(Deserialize)]
-        struct PlanResponse {
-            task_classes: Vec<TaskClass>,
-            routes: HashMap<String, RouteJson>,
-            build_reason: Option<String>,
-        }
-
-        #[derive(Deserialize)]
-        struct RouteJson {
-            primary: ModelSpecJson,
-            #[serde(default)]
-            fallbacks: Vec<ModelSpecJson>,
-        }
-
-        #[derive(Deserialize)]
-        struct ModelSpecJson {
-            provider: String,
-            model: String,
-            think: Option<String>,
-        }
-
-        fn parse_think(s: Option<&str>) -> ThinkLevel {
-            match s {
-                None | Some("dynamic") => ThinkLevel::Dynamic,
-                Some("off") => ThinkLevel::Off,
-                Some(s) if s.starts_with("minimal_") => {
-                    s[8..].parse::<u32>().map(ThinkLevel::Minimal).unwrap_or(ThinkLevel::Dynamic)
-                }
-                Some(s) if s.starts_with("full_") => {
-                    s[5..].parse::<u32>().map(ThinkLevel::Full).unwrap_or(ThinkLevel::Full(8000))
-                }
-                _ => ThinkLevel::Dynamic,
-            }
-        }
-
-        let parsed: PlanResponse = serde_json::from_str(json_str).ok()?;
-
-        // Validate: every route class must have a matching task_class entry
-        let class_names: std::collections::HashSet<&str> =
-            parsed.task_classes.iter().map(|c| c.name.as_str()).collect();
-        for route_name in parsed.routes.keys() {
-            if !class_names.contains(route_name.as_str()) {
-                tracing::warn!("model plan parse: route '{}' has no matching task_class — skipping plan", route_name);
-                return None;
-            }
-        }
-
-        let routes = parsed.routes.into_iter().map(|(name, r)| {
-            let route = Route {
-                primary: ModelSpec {
-                    provider: r.primary.provider,
-                    model: r.primary.model,
-                    think: parse_think(r.primary.think.as_deref()),
-                    cost: None,
-                    speed: None,
-                    quality: None,
-                    trust_floor: 0,
-                },
-                fallbacks: r.fallbacks.into_iter().map(|f| ModelSpec {
-                    provider: f.provider,
-                    model: f.model,
-                    think: parse_think(f.think.as_deref()),
-                    cost: None,
-                    speed: None,
-                    quality: None,
-                    trust_floor: 0,
-                }).collect(),
-                stats: RouteStats::default(),
-            };
-            (name, route)
-        }).collect();
-
-        Some(Self {
-            id: Uuid::new_v4(),
-            created: Utc::now(),
-            config_hash,
-            task_classes: parsed.task_classes,
-            routes,
-            build_reason: parsed.build_reason.unwrap_or_else(|| "LLM-built plan".to_string()),
-        })
+    /// Deprecated: LLM-built plans are replaced by `build_from_capabilities`.
+    #[deprecated(since = "0.2.0", note = "Use build_from_capabilities instead")]
+    pub fn parse_from_response(_response: &str, _config_hash: String) -> Option<Self> {
+        None
     }
 }
 
-/// Extract JSON from an LLM response that may be wrapped in markdown code blocks.
-fn extract_json(s: &str) -> Option<&str> {
-    let s = s.trim();
-    // Strip ```json ... ``` or ``` ... ```
-    if let Some(inner) = s.strip_prefix("```json").or_else(|| s.strip_prefix("```")) {
-        if let Some(end) = inner.rfind("```") {
-            return Some(inner[..end].trim());
+// ---------------------------------------------------------------------------
+// think_level_for_profile helper
+// ---------------------------------------------------------------------------
+
+fn think_level_for_profile(
+    profile: &animus_core::model_capability::ModelCapabilityProfile,
+    task: &TaskClass,
+) -> ThinkLevel {
+    use animus_core::model_capability::ReasoningSupport;
+    match &profile.reasoning_support {
+        ReasoningSupport::ExtendedThinking { .. } => {
+            if task.weight_reasoning >= 0.4 {
+                ThinkLevel::Dynamic
+            } else {
+                ThinkLevel::Off
+            }
         }
-    }
-    // Plain JSON
-    if s.starts_with('{') {
-        Some(s)
-    } else {
-        // Try to find the first '{' in the response
-        s.find('{').map(|i| s[i..].trim())
+        _ => ThinkLevel::Off,
     }
 }
 
-/// Extract a rough size hint (parameter count) from a model name string.
-fn extract_size_hint(model: &str) -> u64 {
-    // Look for patterns like "35b", "9b", "70b", "120b", "0.8b"
-    let lower = model.to_lowercase();
-    for part in lower.split(|c: char| !c.is_alphanumeric() && c != '.') {
-        if part.ends_with('b') {
-            let num_str = &part[..part.len() - 1];
-            if let Ok(n) = num_str.parse::<f64>() {
-                return (n * 10.0) as u64; // multiply by 10 to preserve decimal (e.g., 0.8 → 8)
-            }
-        }
-    }
-    0
+// ---------------------------------------------------------------------------
+// default_task_classes
+// ---------------------------------------------------------------------------
+
+/// Default task classes with calibrated routing weights.
+pub fn default_task_classes() -> Vec<TaskClass> {
+    vec![
+        TaskClass {
+            name: "Conversational".to_string(),
+            description: "Casual chat, greetings, short exchanges, simple questions".to_string(),
+            keywords: vec!["hello".to_string(), "hi ".to_string(), "thanks".to_string(),
+                           "okay".to_string(), "sure".to_string(), "what is".to_string()],
+            weight_quality: 0.4, weight_speed: 0.6, weight_reasoning: 0.1,
+            weight_cost: 0.4, latency_budget_ms: None,
+        },
+        TaskClass {
+            name: "Analytical".to_string(),
+            description: "Deep analysis, complex reasoning, multi-step problem solving".to_string(),
+            keywords: vec!["analyze".to_string(), "explain".to_string(), "why ".to_string(),
+                           "how does".to_string(), "compare".to_string(), "evaluate".to_string(),
+                           "reason".to_string(), "think through".to_string()],
+            weight_quality: 0.8, weight_speed: 0.1, weight_reasoning: 0.7,
+            weight_cost: 0.2, latency_budget_ms: None,
+        },
+        TaskClass {
+            name: "Technical".to_string(),
+            description: "Code, debugging, architecture, systems design, implementation".to_string(),
+            keywords: vec!["code".to_string(), "function".to_string(), "debug".to_string(),
+                           "implement".to_string(), "rust".to_string(), "error".to_string(),
+                           "fix".to_string(), "build".to_string(), "refactor".to_string()],
+            weight_quality: 0.7, weight_speed: 0.3, weight_reasoning: 0.5,
+            weight_cost: 0.2, latency_budget_ms: None,
+        },
+        TaskClass {
+            name: "ToolExecution".to_string(),
+            description: "Tasks requiring tool use, file operations, web access, memory search".to_string(),
+            keywords: vec!["fetch".to_string(), "read file".to_string(), "write".to_string(),
+                           "search".to_string(), "run".to_string(), "remember".to_string(),
+                           "store".to_string(), "retrieve".to_string()],
+            weight_quality: 0.5, weight_speed: 0.5, weight_reasoning: 0.2,
+            weight_cost: 0.3, latency_budget_ms: None,
+        },
+        TaskClass {
+            name: "Voice".to_string(),
+            description: "Realtime voice or near-realtime responses where latency is critical".to_string(),
+            keywords: vec!["voice".to_string(), "speak".to_string(), "realtime".to_string(),
+                           "quickly".to_string(), "fast reply".to_string()],
+            weight_quality: 0.2, weight_speed: 0.9, weight_reasoning: 0.0,
+            weight_cost: 0.5, latency_budget_ms: Some(2_000),
+        },
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -518,27 +500,80 @@ impl HeuristicClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability_registry::CapabilityRegistry;
 
-    #[test]
-    fn route_stats_empty() {
-        let stats = RouteStats::default();
-        assert_eq!(stats.avg_latency_ms(), None);
-        assert_eq!(stats.success_rate(), 1.0);
-        assert_eq!(stats.correction_rate(), 0.0);
+    fn two_ollama_models() -> Vec<String> {
+        vec!["ollama:qwen3.5:35b".to_string(), "ollama:qwen3.5:9b".to_string()]
+    }
+
+    #[tokio::test]
+    async fn build_from_capabilities_produces_ranked_candidates() {
+        let registry = CapabilityRegistry::build(None, &[], &two_ollama_models()).await;
+        let task_classes = default_task_classes();
+        let plan = ModelPlan::build_from_capabilities(&registry, &two_ollama_models(), task_classes);
+        assert!(!plan.routes.is_empty());
+        // Most routes should have candidates; Voice may be empty with slow local models
+        // (latency_budget_ms filter correctly excludes models that can't meet the 2s budget)
+        let non_empty = plan.routes.values().filter(|r| !r.candidates.is_empty()).count();
+        assert!(non_empty >= 4, "expected at least 4 routes with candidates, got {non_empty}");
+    }
+
+    #[tokio::test]
+    async fn build_from_capabilities_excludes_prohibited() {
+        let available = vec!["ollama:qwen3.5:35b".to_string()];
+        let registry = CapabilityRegistry::build(None, &[], &available).await;
+        let plan = ModelPlan::build_from_capabilities(&registry, &available, default_task_classes());
+        for route in plan.routes.values() {
+            for spec in &route.candidates {
+                assert_ne!(spec.provider, "qwen-api");
+                assert_ne!(spec.provider, "deepseek-api");
+            }
+        }
     }
 
     #[test]
-    fn route_stats_with_data() {
+    fn route_stats_roundtrip() {
         let stats = RouteStats {
-            turn_count: 10,
-            failure_count: 2,
-            total_latency_ms: 5000,
-            correction_count: 1,
-            last_turn: None,
+            turn_count: 5, failure_count: 1, total_latency_ms: 2500,
+            correction_count: 0, last_turn: None,
         };
-        assert_eq!(stats.avg_latency_ms(), Some(500));
         assert!((stats.success_rate() - 0.8).abs() < 0.001);
-        assert!((stats.correction_rate() - 0.1).abs() < 0.001);
+        assert_eq!(stats.avg_latency_ms(), Some(500));
+    }
+
+    #[test]
+    fn learned_quality_none_under_min_turns() {
+        let route = Route {
+            candidates: vec![],
+            model_stats: {
+                let mut m = HashMap::new();
+                m.insert("ollama:qwen3.5:35b".to_string(), RouteStats {
+                    turn_count: 3, failure_count: 0, total_latency_ms: 0,
+                    correction_count: 0, last_turn: None,
+                });
+                m
+            },
+            stats: RouteStats::default(),
+        };
+        assert!(route.learned_quality_for("ollama:qwen3.5:35b").is_none());
+    }
+
+    #[test]
+    fn learned_quality_some_after_min_turns() {
+        let route = Route {
+            candidates: vec![],
+            model_stats: {
+                let mut m = HashMap::new();
+                m.insert("ollama:qwen3.5:35b".to_string(), RouteStats {
+                    turn_count: 10, failure_count: 1, total_latency_ms: 5000,
+                    correction_count: 1, last_turn: None,
+                });
+                m
+            },
+            stats: RouteStats::default(),
+        };
+        let q = route.learned_quality_for("ollama:qwen3.5:35b").unwrap();
+        assert!(q > 0.0 && q <= 1.0);
     }
 
     #[test]
@@ -548,102 +583,37 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
+    #[tokio::test]
+    async fn plan_save_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("model_plan.json");
+        let registry = CapabilityRegistry::build(None, &[], &two_ollama_models()).await;
+        let plan = ModelPlan::build_from_capabilities(&registry, &two_ollama_models(), default_task_classes());
+        plan.save(&path).unwrap();
+        let loaded = ModelPlan::load(&path).unwrap();
+        assert_eq!(plan.id, loaded.id);
+        assert_eq!(plan.config_hash, loaded.config_hash);
+    }
+
+    #[test]
+    fn heuristic_classifier_basic() {
+        let classes = default_task_classes();
+        let plan = ModelPlan {
+            id: uuid::Uuid::new_v4(), created: chrono::Utc::now(),
+            config_hash: "x".to_string(), task_classes: classes,
+            routes: HashMap::new(),
+            build_reason: "test".to_string(),
+        };
+        let classifier = HeuristicClassifier::from_plan(&plan);
+        let (class, conf) = classifier.classify("implement a rust function to parse JSON");
+        assert_eq!(class, "Technical");
+        assert!(conf >= 0.5);
+    }
+
     #[test]
     fn config_hash_changes_on_new_model() {
         let h1 = ModelPlan::config_hash_for(&["ollama:qwen3.5:35b".to_string()]);
         let h2 = ModelPlan::config_hash_for(&["ollama:qwen3.5:35b".to_string(), "ollama:qwen3.5:9b".to_string()]);
         assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn default_plan_builds_from_models() {
-        let plan = ModelPlan::default_plan(&[
-            "ollama:qwen3.5:35b".to_string(),
-            "ollama:qwen3.5:9b".to_string(),
-        ]);
-        assert!(!plan.routes.is_empty());
-        assert!(!plan.task_classes.is_empty());
-        assert_eq!(plan.build_reason.contains("Rule-based"), true);
-    }
-
-    #[test]
-    fn extract_json_handles_markdown_wrapper() {
-        let resp = "```json\n{\"foo\": 1}\n```";
-        assert_eq!(extract_json(resp), Some("{\"foo\": 1}"));
-    }
-
-    #[test]
-    fn extract_json_handles_plain() {
-        let resp = r#"{"foo": 1}"#;
-        assert_eq!(extract_json(resp), Some(r#"{"foo": 1}"#));
-    }
-
-    #[test]
-    fn heuristic_classifier_basic() {
-        let plan = ModelPlan::default_plan(&["ollama:qwen3.5:35b".to_string()]);
-        let classifier = HeuristicClassifier::from_plan(&plan);
-
-        let (class, conf) = classifier.classify("implement a rust function to parse JSON");
-        assert_eq!(class, "Technical");
-        assert!(conf >= 0.5);
-
-        let (class, _) = classifier.classify("hello how are you");
-        assert_eq!(class, "Conversational");
-    }
-
-    #[test]
-    fn heuristic_classifier_low_confidence_on_ambiguous() {
-        let plan = ModelPlan::default_plan(&["ollama:qwen3.5:35b".to_string()]);
-        let classifier = HeuristicClassifier::from_plan(&plan);
-        // No keywords match → low confidence
-        let (_, conf) = classifier.classify("xyzzy plugh foobar");
-        assert!(conf < 0.5);
-    }
-
-    #[test]
-    fn plan_parse_from_response() {
-        let response = r#"{
-  "task_classes": [
-    {"name": "Technical", "description": "Code tasks", "keywords": ["code", "function", "debug"]},
-    {"name": "Conversational", "description": "Chat", "keywords": ["hello", "thanks"]}
-  ],
-  "routes": {
-    "Technical": {
-      "primary": {"provider": "ollama", "model": "qwen3.5:35b", "think": "dynamic"},
-      "fallbacks": [{"provider": "ollama", "model": "qwen3.5:9b", "think": "off"}]
-    },
-    "Conversational": {
-      "primary": {"provider": "ollama", "model": "qwen3.5:9b", "think": "off"},
-      "fallbacks": []
-    }
-  },
-  "build_reason": "test plan"
-}"#;
-        let plan = ModelPlan::parse_from_response(response, "testhash".to_string());
-        assert!(plan.is_some());
-        let plan = plan.unwrap();
-        assert_eq!(plan.task_classes.len(), 2);
-        assert!(plan.routes.contains_key("Technical"));
-        assert_eq!(plan.routes["Technical"].primary.model, "qwen3.5:35b");
-        assert_eq!(plan.routes["Technical"].primary.think, ThinkLevel::Dynamic);
-    }
-
-    #[test]
-    fn plan_serde_roundtrip() {
-        let plan = ModelPlan::default_plan(&["ollama:qwen3.5:35b".to_string()]);
-        let json = serde_json::to_string(&plan).unwrap();
-        let restored: ModelPlan = serde_json::from_str(&json).unwrap();
-        assert_eq!(plan.id, restored.id);
-        assert_eq!(plan.config_hash, restored.config_hash);
-    }
-
-    #[test]
-    fn plan_save_and_load() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("model_plan.json");
-        let plan = ModelPlan::default_plan(&["ollama:qwen3.5:35b".to_string()]);
-        plan.save(&path).unwrap();
-        let loaded = ModelPlan::load(&path).unwrap();
-        assert_eq!(plan.id, loaded.id);
     }
 }

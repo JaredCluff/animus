@@ -91,9 +91,11 @@ impl Tool for ProposeRouteAmendmentTool {
             }
 
             if let Some(route) = plan.routes.get_mut(class_name) {
-                // Preserve fallbacks; update primary
-                let old_primary = route.primary.model.clone();
-                route.primary = ModelSpec {
+                // Promote new primary to front of candidates; keep remainder as fallbacks
+                let old_primary = route.candidates.first()
+                    .map(|s| s.model.clone())
+                    .unwrap_or_default();
+                let new_primary = ModelSpec {
                     provider: provider.to_string(),
                     model: model.to_string(),
                     think,
@@ -102,7 +104,10 @@ impl Tool for ProposeRouteAmendmentTool {
                     quality: None,
                     trust_floor: 0,
                 };
-                // Reset stats for this route (fresh start with new model)
+                // Remove any existing entry for this model, then prepend as new primary
+                route.candidates.retain(|s| !(s.provider == provider && s.model == model));
+                route.candidates.insert(0, new_primary);
+                // Reset aggregate stats for this route (fresh start with new primary)
                 route.stats = crate::model_plan::RouteStats::default();
 
                 tracing::info!(
