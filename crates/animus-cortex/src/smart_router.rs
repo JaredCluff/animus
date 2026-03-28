@@ -905,8 +905,8 @@ mod tests {
         router.set_engine_health(key_a, 1.0);
         router.set_engine_health(key_b, 0.5);
         // Both should be selectable (weight > 0.0)
-        assert!(router.engine_health_weight(key_a) == 1.0);
-        assert!(router.engine_health_weight(key_b) == 0.5);
+        assert_eq!(router.engine_health_weight(key_a), 1.0);
+        assert_eq!(router.engine_health_weight(key_b), 0.5);
         // The test verifies that health_w is applied — actual routing integration
         // is covered by the integration test in Task 5; here we just verify the
         // weight is stored and returned correctly for select_for_class to use.
