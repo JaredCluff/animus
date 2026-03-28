@@ -372,36 +372,37 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             }
         };
 
-        // Fallback cascade: configured primary → safety-net endpoint → Mock.
-        // The safety net can be any OpenAI-compatible server (Ollama, LM Studio,
-        // vLLM, cloud Ollama, etc.) configured via ANIMUS_FALLBACK_*.
-        let fallback: Arc<dyn animus_cortex::ReasoningEngine> =
-            build_engine(&provider_str, &model_id, 4096, &base_url, &api_key)
-            .or_else(|| {
-                // Primary provider failed — cascade to the safety-net endpoint.
-                if let Some(ref model) = fallback_model {
-                    tracing::warn!(
-                        "Primary provider '{}' unavailable — cascading to safety net: {}/{} @ {}",
-                        provider_str, fallback_provider, model, fallback_url
-                    );
-                    build_engine(&fallback_provider, model, 4096, &fallback_url, "")
-                } else {
-                    tracing::warn!(
-                        "Primary provider '{}' unavailable and safety-net endpoint has no models",
-                        provider_str
-                    );
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                eprintln!("Warning: No LLM provider available (primary + safety net both failed). Running with mock.");
-                eprintln!("Configure a safety-net endpoint: ANIMUS_FALLBACK_URL, ANIMUS_FALLBACK_PROVIDER, ANIMUS_FALLBACK_MODEL");
-                Arc::new(animus_cortex::MockEngine::new(
-                    "No LLM provider available. Set ANIMUS_FALLBACK_URL to a local inference server.",
-                ))
-            });
+        // The registry fallback is the SAFETY NET — not the primary provider.
+        // This ensures that Perception, Reflection, and reconstitution (which don't
+        // have per-role overrides by default) use the always-available safety-net
+        // engine, not the primary provider that might have depleted credits.
+        // The primary provider is registered under CognitiveRole::Reasoning below.
+        let safety_net_engine: Arc<dyn animus_cortex::ReasoningEngine> =
+            if let Some(ref model) = fallback_model {
+                build_engine(&fallback_provider, model, 4096, &fallback_url, "")
+                    .unwrap_or_else(|| {
+                        tracing::warn!("Safety-net engine construction failed for {fallback_provider}/{model}");
+                        Arc::new(animus_cortex::MockEngine::new(
+                            "Safety-net engine failed to construct. Check ANIMUS_FALLBACK_URL.",
+                        ))
+                    })
+            } else {
+                // No safety-net models discovered — try primary provider as fallback
+                build_engine(&provider_str, &model_id, 4096, &base_url, &api_key)
+                    .unwrap_or_else(|| {
+                        eprintln!("Warning: No LLM provider available. Running with mock.");
+                        eprintln!("Configure a safety-net endpoint: ANIMUS_FALLBACK_URL, ANIMUS_FALLBACK_PROVIDER, ANIMUS_FALLBACK_MODEL");
+                        Arc::new(animus_cortex::MockEngine::new(
+                            "No LLM provider available. Set ANIMUS_FALLBACK_URL to a local inference server.",
+                        ))
+                    })
+            };
+        tracing::info!(
+            "Registry fallback (safety net): {}",
+            safety_net_engine.model_name()
+        );
 
-        let mut registry = EngineRegistry::new(fallback);
+        let mut registry = EngineRegistry::new(safety_net_engine);
 
         // Per-role overrides — each can specify a different provider + model + URL + API key
         for (role, model_env, provider_env, url_env, key_env, max_tok) in [

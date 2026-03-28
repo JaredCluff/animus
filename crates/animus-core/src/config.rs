@@ -824,20 +824,29 @@ impl AnimusConfig {
             self.cortex.openai_base_url = url;
         }
 
-        // Safety-net / fallback overrides
+        // Safety-net / fallback overrides (empty strings treated as "not set")
         if let Ok(url) = std::env::var("ANIMUS_FALLBACK_URL") {
-            self.cortex.fallback_url = url;
-        } else if self.cortex.fallback_url == default_fallback_url() {
-            // If no explicit fallback URL, inherit from ANIMUS_OLLAMA_URL for backwards compat
-            if let Ok(url) = std::env::var("ANIMUS_OLLAMA_URL") {
+            if !url.is_empty() {
                 self.cortex.fallback_url = url;
             }
         }
+        // If no explicit fallback URL, inherit from ANIMUS_OLLAMA_URL for backwards compat
+        if self.cortex.fallback_url == default_fallback_url() {
+            if let Ok(url) = std::env::var("ANIMUS_OLLAMA_URL") {
+                if !url.is_empty() {
+                    self.cortex.fallback_url = url;
+                }
+            }
+        }
         if let Ok(provider) = std::env::var("ANIMUS_FALLBACK_PROVIDER") {
-            self.cortex.fallback_provider = provider;
+            if !provider.is_empty() {
+                self.cortex.fallback_provider = provider;
+            }
         }
         if let Ok(model) = std::env::var("ANIMUS_FALLBACK_MODEL") {
-            self.cortex.fallback_model = model;
+            if !model.is_empty() {
+                self.cortex.fallback_model = model;
+            }
         }
 
         // Health overrides
