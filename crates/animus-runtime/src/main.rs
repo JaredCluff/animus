@@ -690,24 +690,30 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         Arc::new(parking_lot::Mutex::new(initial))
     };
 
+    // Retain a sender for the probe trigger channel so the hot-add path can fire immediate
+    // probes for engines registered after the watcher is spawned.
+    let mut hot_add_probe_tx: Option<tokio::sync::mpsc::Sender<Vec<String>>> = None;
+
     if let Some(ref router) = smart_router {
-        if !health_endpoints.lock().is_empty() {
-            let watcher_router = router.clone();
-            let watcher_signal_tx = signal_tx.clone();
-            let watcher_source = animus_core::identity::ThreadId::new();
-            let watcher_endpoints = health_endpoints.clone();
-            let n = watcher_endpoints.lock().len();
-            tokio::spawn(async move {
-                animus_cortex::watchers::run_model_health_watcher(
-                    watcher_endpoints,
-                    watcher_router,
-                    watcher_signal_tx,
-                    watcher_source,
-                    MODEL_HEALTH_PROBE_INTERVAL_SECS,
-                ).await;
-            });
-            tracing::info!("ModelHealthWatcher spawned ({n} endpoint(s))");
-        }
+        let (probe_trigger_tx, probe_trigger_rx) = tokio::sync::mpsc::channel::<Vec<String>>(32);
+        hot_add_probe_tx = Some(probe_trigger_tx.clone()); // retain for hot-add probes
+        router.set_probe_trigger_tx(probe_trigger_tx);
+        let watcher_router = router.clone();
+        let watcher_signal_tx = signal_tx.clone();
+        let watcher_source = animus_core::identity::ThreadId::new();
+        let watcher_endpoints = health_endpoints.clone();
+        let n = watcher_endpoints.lock().len();
+        tokio::spawn(async move {
+            animus_cortex::watchers::run_model_health_watcher(
+                watcher_endpoints,
+                watcher_router,
+                watcher_signal_tx,
+                watcher_source,
+                MODEL_HEALTH_PROBE_INTERVAL_SECS,
+                probe_trigger_rx,
+            ).await;
+        });
+        tracing::info!("ModelHealthWatcher spawned ({n} endpoint(s), T=0 probe active)");
     }
 
     // Log initial capability tier (conservative default until first probe cycle)
@@ -1340,10 +1346,16 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                                     // extends to hot-loaded engines without restarting the watcher.
                                     // All hot-loaded engines are OpenAI-compat; probe URL = base_url.
                                     if !entry.base_url.is_empty() {
+                                        let new_engine_key = format!("{}:{}", entry.provider_id, model.model_id);
                                         health_endpoints.lock().push((
-                                            format!("{}:{}", entry.provider_id, model.model_id),
+                                            new_engine_key.clone(),
                                             entry.base_url.clone(),
                                         ));
+                                        // Trigger an immediate probe so the new engine's health weight
+                                        // is populated without waiting for the next scheduled cycle.
+                                        if let Some(ref tx) = hot_add_probe_tx {
+                                            let _ = tx.try_send(vec![new_engine_key]);
+                                        }
                                     }
                                     engine_registry.add_named(
                                         &entry.provider_id,
@@ -1886,15 +1898,17 @@ async fn run_reasoning_turn(
     // Build ordered engine candidate list from smart router, then append the Reasoning engine
     // as a last-resort fallback. process_turn_with_engines tries each in order, automatically
     // skipping to the next on rate-limit (429) or transient (503/overloaded) errors.
-    let candidate_arcs: Vec<Arc<dyn animus_cortex::ReasoningEngine>> =
+    let route_decisions: Vec<animus_cortex::smart_router::RouteDecision> =
         if let Some(ref router) = tool_ctx.smart_router {
             router.route_all_candidates(input, pressure, sensitivity_scan.level).await
-                .into_iter()
-                .filter_map(|d| engine_registry.engine_by_spec(&d.model_spec.provider, &d.model_spec.model))
-                .collect()
         } else {
             vec![]
         };
+    let primary_model_key: Option<String> = route_decisions.first()
+        .map(|d| format!("{}:{}", d.model_spec.provider, d.model_spec.model));
+    let candidate_arcs: Vec<Arc<dyn animus_cortex::ReasoningEngine>> = route_decisions.iter()
+        .filter_map(|d| engine_registry.engine_by_spec(&d.model_spec.provider, &d.model_spec.model))
+        .collect();
     // Collect &dyn refs; candidate_arcs and engine_registry both live for this scope
     let mut engine_refs: Vec<&dyn animus_cortex::ReasoningEngine> =
         candidate_arcs.iter().map(|a| a.as_ref()).collect();
@@ -1944,6 +1958,11 @@ async fn run_reasoning_turn(
                 segment_refs: vec![],
                 created: chrono::Utc::now(),
             });
+        }
+        // Mark engine unhealthy immediately (sets weight to 0.0) and trigger re-probe so health
+        // state reflects the failure without waiting for the next scheduled probe cycle.
+        if let (Some(ref key), Some(ref router)) = (&primary_model_key, &tool_ctx.smart_router) {
+            router.mark_engine_unhealthy(key);
         }
     }
 

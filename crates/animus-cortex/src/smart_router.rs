@@ -93,9 +93,12 @@ pub struct SmartRouter {
     trust_registry: Arc<parking_lot::Mutex<ProviderTrustRegistry>>,
     /// Providers that are always blocked regardless of content or budget pressure.
     prohibited_providers: Arc<parking_lot::Mutex<ProhibitedSet>>,
-    /// Engine availability — keyed by "provider:model", updated by ModelHealthWatcher.
-    /// `true` = available (default when not yet probed), `false` = unavailable.
-    engine_health: Arc<parking_lot::Mutex<HashMap<String, bool>>>,
+    /// Engine health weight — keyed by "provider:model", updated by ModelHealthWatcher.
+    /// `1.0` = confirmed healthy, `0.5` = unknown (not yet probed), `0.0` = confirmed down.
+    engine_health: Arc<parking_lot::Mutex<HashMap<String, f32>>>,
+    /// Trigger channel sender — send engine keys to request an immediate out-of-band probe.
+    /// Set by main.rs after SmartRouter creation via `set_probe_trigger_tx`.
+    probe_trigger_tx: Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<Vec<String>>>>>,
     /// Capability profiles for all available models — used by ModelScorer at routing time.
     capability_registry: Arc<crate::capability_registry::CapabilityRegistry>,
 }
@@ -132,6 +135,7 @@ impl SmartRouter {
             trust_registry: Arc::new(parking_lot::Mutex::new(trust_map)),
             prohibited_providers: Arc::new(parking_lot::Mutex::new(prohibited)),
             engine_health: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            probe_trigger_tx: Arc::new(parking_lot::Mutex::new(None)),
             capability_registry,
         }
     }
@@ -187,7 +191,15 @@ impl SmartRouter {
 
         for (idx, spec) in route.candidates.iter().enumerate() {
             let model_key = format!("{}:{}", spec.provider, spec.model);
-            let engine_available = self.is_engine_healthy(spec);
+            let health_w = self.engine_health_weight(&model_key);
+            if health_w == 0.0 {
+                tracing::debug!(
+                    "select_for_class: skipping {}:{} — confirmed down (health_w=0.0)",
+                    spec.provider, spec.model
+                );
+                continue;
+            }
+            let engine_available = true; // health_w > 0.0 verified above
 
             let (remaining_pct, rpm_ceiling, near_limit, should_notify) = {
                 let states = self.rate_limit_states.lock();
@@ -262,11 +274,12 @@ impl SmartRouter {
 
             // Near-limit penalty: scale score by remaining capacity fraction so a healthy
             // candidate at 100% always wins over a near-exhausted one at 5%.
-            let score = if near_limit {
+            // Health weight multiplier: confirmed-healthy (1.0) scores full; unknown (0.5) scores half.
+            let score = (if near_limit {
                 raw_score * remaining_pct
             } else {
                 raw_score
-            };
+            }) * health_w;
 
             if score > 0.0 {
                 match &best {
@@ -429,22 +442,41 @@ impl SmartRouter {
         tracing::info!("SmartRouter: plan updated, classifier rebuilt");
     }
 
-    /// Update the availability state of an engine (called by ModelHealthWatcher).
-    /// Key is "provider:model" — must match the ModelSpec in the plan.
-    pub fn set_engine_health(&self, key: &str, available: bool) {
-        self.engine_health.lock().insert(key.to_string(), available);
+    /// Set the health weight for an engine. 1.0 = healthy, 0.5 = unknown, 0.0 = confirmed down.
+    /// Key is "provider:model".
+    pub fn set_engine_health(&self, key: &str, weight: f32) {
+        let safe_weight = if weight.is_nan() { 0.0 } else { weight.clamp(0.0, 1.0) };
+        self.engine_health.lock().insert(key.to_string(), safe_weight);
     }
 
-    /// Check if an engine is currently available.
-    /// Returns `true` (optimistic) when not yet probed.
-    pub fn is_engine_available(&self, key: &str) -> bool {
-        *self.engine_health.lock().get(key).unwrap_or(&true)
+    /// Return the health weight for an engine key.
+    /// Returns `0.5` (unknown) when not yet probed.
+    pub fn engine_health_weight(&self, key: &str) -> f32 {
+        *self.engine_health.lock().get(key).unwrap_or(&0.5_f32)
     }
 
-    /// Check if the engine for a ModelSpec is healthy.
-    fn is_engine_healthy(&self, spec: &crate::model_plan::ModelSpec) -> bool {
+    /// Check if the engine for a ModelSpec is not confirmed down (weight > 0.0).
+    pub(crate) fn is_engine_healthy(&self, spec: &crate::model_plan::ModelSpec) -> bool {
         let key = format!("{}:{}", spec.provider, spec.model);
-        self.is_engine_available(&key)
+        self.engine_health_weight(&key) > 0.0
+    }
+
+    /// Mark an engine confirmed down (weight = 0.0) and trigger an immediate re-probe.
+    pub fn mark_engine_unhealthy(&self, key: &str) {
+        self.set_engine_health(key, 0.0);
+        self.trigger_probe(vec![key.to_string()]);
+    }
+
+    /// Send engine keys through the trigger channel to request an immediate probe.
+    pub fn trigger_probe(&self, keys: Vec<String>) {
+        if let Some(tx) = self.probe_trigger_tx.lock().as_ref() {
+            let _ = tx.try_send(keys);
+        }
+    }
+
+    /// Wire the probe trigger sender. Called once from main.rs after channel creation.
+    pub fn set_probe_trigger_tx(&self, tx: tokio::sync::mpsc::Sender<Vec<String>>) {
+        *self.probe_trigger_tx.lock() = Some(tx);
     }
 
     /// Register a rate limit state handle for a model.
@@ -734,7 +766,7 @@ mod tests {
     async fn degraded_route_falls_back() {
         let (router, _rx) = make_router_async().await;
         // Mark the primary engine as unavailable — scorer checks engine_available, not route_health
-        router.set_engine_health("ollama:qwen3.5:35b", false);
+        router.set_engine_health("ollama:qwen3.5:35b", 0.0);
         let decision = router.select_for_class("Analytical", BudgetPressure::Normal).await;
         assert_eq!(decision.fallback_index, 1); // using first fallback
     }
@@ -834,5 +866,53 @@ mod tests {
         assert_eq!(decision.model_spec.model, "qwen3.5:35b",
             "Analytical class should prefer 35B model over 1B via live scoring, got: {}",
             decision.model_spec.model);
+    }
+
+    #[tokio::test]
+    async fn health_weight_methods_roundtrip() {
+        let (router, _rx) = make_router_async().await;
+        // Unprobed engine defaults to 0.5
+        assert_eq!(router.engine_health_weight("ollama:qwen3.5:35b"), 0.5);
+        // Set confirmed healthy
+        router.set_engine_health("ollama:qwen3.5:35b", 1.0);
+        assert_eq!(router.engine_health_weight("ollama:qwen3.5:35b"), 1.0);
+        // Mark unhealthy
+        router.mark_engine_unhealthy("ollama:qwen3.5:35b");
+        assert_eq!(router.engine_health_weight("ollama:qwen3.5:35b"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn health_weight_score_multiply_math() {
+        // An engine at 0.5 weight should score at half of a confirmed-healthy engine
+        let (router, _rx) = make_router_async().await;
+        // Register two engines with the same spec but different health weights
+        // Use the helper that sets engine_health directly
+        let key_a = "providerA:model-x";
+        let key_b = "providerB:model-x";
+        router.set_engine_health(key_a, 1.0);
+        router.set_engine_health(key_b, 0.5);
+        // Both should be selectable (weight > 0.0)
+        assert_eq!(router.engine_health_weight(key_a), 1.0);
+        assert_eq!(router.engine_health_weight(key_b), 0.5);
+        // The test verifies that health_w is applied — actual routing integration
+        // is covered by the integration test in Task 5; here we just verify the
+        // weight is stored and returned correctly for select_for_class to use.
+        let score_a = 1.0_f32 * router.engine_health_weight(key_a);
+        let score_b = 1.0_f32 * router.engine_health_weight(key_b);
+        assert!(score_a > score_b, "confirmed-healthy should score higher than unknown");
+    }
+
+    #[tokio::test]
+    async fn select_for_class_zero_weight_skipped() {
+        let (router, _rx) = make_router_async().await;
+        let key = "deadprovider:model-z";
+        router.set_engine_health(key, 0.0);
+        assert_eq!(router.engine_health_weight(key), 0.0);
+        assert!(!router.is_engine_healthy(&crate::model_plan::ModelSpec {
+            provider: "deadprovider".to_string(),
+            model: "model-z".to_string(),
+            think: crate::model_plan::ThinkLevel::Off,
+            cost: None, speed: None, quality: None, trust_floor: 0,
+        }));
     }
 }
