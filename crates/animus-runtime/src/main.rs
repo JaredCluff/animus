@@ -691,27 +691,24 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     };
 
     if let Some(ref router) = smart_router {
-        if !health_endpoints.lock().is_empty() {
-            let (probe_trigger_tx, probe_trigger_rx) =
-                tokio::sync::mpsc::channel::<Vec<String>>(16);
-            router.set_probe_trigger_tx(probe_trigger_tx);
-            let watcher_router = router.clone();
-            let watcher_signal_tx = signal_tx.clone();
-            let watcher_source = animus_core::identity::ThreadId::new();
-            let watcher_endpoints = health_endpoints.clone();
-            let n = watcher_endpoints.lock().len();
-            tokio::spawn(async move {
-                animus_cortex::watchers::run_model_health_watcher(
-                    watcher_endpoints,
-                    watcher_router,
-                    watcher_signal_tx,
-                    watcher_source,
-                    MODEL_HEALTH_PROBE_INTERVAL_SECS,
-                    probe_trigger_rx,
-                ).await;
-            });
-            tracing::info!("ModelHealthWatcher spawned ({n} endpoint(s))");
-        }
+        let (probe_trigger_tx, probe_trigger_rx) = tokio::sync::mpsc::channel::<Vec<String>>(32);
+        router.set_probe_trigger_tx(probe_trigger_tx);
+        let watcher_router = router.clone();
+        let watcher_signal_tx = signal_tx.clone();
+        let watcher_source = animus_core::identity::ThreadId::new();
+        let watcher_endpoints = health_endpoints.clone();
+        let n = watcher_endpoints.lock().len();
+        tokio::spawn(async move {
+            animus_cortex::watchers::run_model_health_watcher(
+                watcher_endpoints,
+                watcher_router,
+                watcher_signal_tx,
+                watcher_source,
+                MODEL_HEALTH_PROBE_INTERVAL_SECS,
+                probe_trigger_rx,
+            ).await;
+        });
+        tracing::info!("ModelHealthWatcher spawned ({n} endpoint(s), T=0 probe active)");
     }
 
     // Log initial capability tier (conservative default until first probe cycle)
@@ -1890,15 +1887,17 @@ async fn run_reasoning_turn(
     // Build ordered engine candidate list from smart router, then append the Reasoning engine
     // as a last-resort fallback. process_turn_with_engines tries each in order, automatically
     // skipping to the next on rate-limit (429) or transient (503/overloaded) errors.
-    let candidate_arcs: Vec<Arc<dyn animus_cortex::ReasoningEngine>> =
+    let route_decisions: Vec<animus_cortex::smart_router::RouteDecision> =
         if let Some(ref router) = tool_ctx.smart_router {
             router.route_all_candidates(input, pressure, sensitivity_scan.level).await
-                .into_iter()
-                .filter_map(|d| engine_registry.engine_by_spec(&d.model_spec.provider, &d.model_spec.model))
-                .collect()
         } else {
             vec![]
         };
+    let primary_model_key: Option<String> = route_decisions.first()
+        .map(|d| format!("{}:{}", d.model_spec.provider, d.model_spec.model));
+    let candidate_arcs: Vec<Arc<dyn animus_cortex::ReasoningEngine>> = route_decisions.iter()
+        .filter_map(|d| engine_registry.engine_by_spec(&d.model_spec.provider, &d.model_spec.model))
+        .collect();
     // Collect &dyn refs; candidate_arcs and engine_registry both live for this scope
     let mut engine_refs: Vec<&dyn animus_cortex::ReasoningEngine> =
         candidate_arcs.iter().map(|a| a.as_ref()).collect();
@@ -1948,6 +1947,10 @@ async fn run_reasoning_turn(
                 segment_refs: vec![],
                 created: chrono::Utc::now(),
             });
+        }
+        // Trigger immediate re-probe so health state updates without waiting for next scheduled cycle.
+        if let (Some(ref key), Some(ref router)) = (&primary_model_key, &tool_ctx.smart_router) {
+            router.trigger_probe(vec![key.clone()]);
         }
     }
 
