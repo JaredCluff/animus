@@ -220,15 +220,26 @@ impl AnthropicEngine {
     }
 
     /// Try the best available auth:
-    /// `CLAUDE_CODE_OAUTH_TOKEN` → credentials file (with refresh) → `ANTHROPIC_OAUTH_TOKEN` → `ANTHROPIC_API_KEY`.
+    /// `ANTHROPIC_API_KEY` → `CLAUDE_CODE_OAUTH_TOKEN` → credentials file (with refresh) → `ANTHROPIC_OAUTH_TOKEN`.
     ///
-    /// `CLAUDE_CODE_OAUTH_TOKEN` is injected by the Claude Code CLI into child processes and is
-    /// always fresh for the lifetime of the session — the cleanest path for container deployments
-    /// launched from a Claude Code terminal.
+    /// `ANTHROPIC_API_KEY` takes priority when explicitly set — it supports all models including
+    /// Sonnet and Opus. OAuth tokens (from Claude Code CLI or credentials file) only support
+    /// Haiku-class models, so using them with Sonnet/Opus produces a 400.
+    ///
+    /// `CLAUDE_CODE_OAUTH_TOKEN` is the fallback for local dev sessions launched from a Claude Code
+    /// terminal where no API key is configured.
     pub fn from_best_available(model: &str, max_tokens: usize) -> Result<Self> {
+        // Explicit API key always wins — supports all models
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            if !key.is_empty() {
+                tracing::debug!("AnthropicEngine: using ANTHROPIC_API_KEY");
+                return Ok(Self::new(key, model.to_string(), max_tokens));
+            }
+        }
         // Claude Code CLI injects this per-session token automatically
         if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
             if !token.is_empty() {
+                tracing::debug!("AnthropicEngine: using CLAUDE_CODE_OAUTH_TOKEN");
                 return Ok(Self::with_oauth(token, model.to_string(), max_tokens));
             }
         }
@@ -245,7 +256,9 @@ impl AnthropicEngine {
         if let Ok(token) = std::env::var("ANTHROPIC_OAUTH_TOKEN") {
             return Ok(Self::with_oauth(token, model.to_string(), max_tokens));
         }
-        Self::from_env(model, max_tokens)
+        Err(AnimusError::Llm(
+            "no Anthropic credentials found — set ANTHROPIC_API_KEY or configure CLAUDE_CODE_OAUTH_TOKEN".to_string()
+        ))
     }
 
     /// Resolve the current auth to headers-ready values.
