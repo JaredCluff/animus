@@ -109,8 +109,8 @@ pub async fn run_model_health_watcher(
         let results = futures::future::join_all(probe_futures).await;
 
         for (key, available) in results {
-            let was_available = router.is_engine_available(&key);
-            router.set_engine_health(&key, available);
+            let was_available = router.engine_health_weight(&key) > 0.0;
+            router.set_engine_health(&key, if available { 1.0 } else { 0.0 });
 
             if was_available && !available {
                 let summary = format!(
