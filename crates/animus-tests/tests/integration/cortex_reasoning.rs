@@ -18,7 +18,6 @@ async fn test_reasoning_thread_processes_turn() {
         "test".to_string(),
         store.clone(),
         8000,
-        128,
     );
 
     let output = thread
@@ -45,7 +44,6 @@ async fn test_reasoning_thread_stores_conversation_as_segments() {
         "test".to_string(),
         store.clone(),
         8000,
-        128,
     );
 
     let output = thread
@@ -86,7 +84,6 @@ async fn test_multi_turn_stores_all_segments() {
         "multi-turn-test".to_string(),
         store.clone(),
         8000,
-        128,
     );
 
     // First turn — process_turn only stores user segment now
