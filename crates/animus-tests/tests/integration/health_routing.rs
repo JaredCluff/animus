@@ -72,14 +72,13 @@ async fn all_down_returns_emergency_spec() {
     // The class name must be populated.
     assert!(!decision.class_name.is_empty(), "class_name should not be empty");
 
-    // The model_spec must contain a non-empty provider and model.
+    // The emergency spec must be drawn from the known candidate list, not a stub.
+    // SmartRouter falls back to the first candidate in the plan when all are skipped.
+    let selected_key = format!("{}:{}", decision.model_spec.provider, decision.model_spec.model);
     assert!(
-        !decision.model_spec.provider.is_empty(),
-        "emergency spec provider should not be empty"
-    );
-    assert!(
-        !decision.model_spec.model.is_empty(),
-        "emergency spec model should not be empty"
+        selected_key == primary_key || selected_key == fallback_key,
+        "emergency spec should be drawn from known candidates ({}, {}), got: {}",
+        primary_key, fallback_key, selected_key
     );
 }
 
