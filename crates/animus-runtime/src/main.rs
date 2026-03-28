@@ -690,8 +690,13 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         Arc::new(parking_lot::Mutex::new(initial))
     };
 
+    // Retain a sender for the probe trigger channel so the hot-add path can fire immediate
+    // probes for engines registered after the watcher is spawned.
+    let mut hot_add_probe_tx: Option<tokio::sync::mpsc::Sender<Vec<String>>> = None;
+
     if let Some(ref router) = smart_router {
         let (probe_trigger_tx, probe_trigger_rx) = tokio::sync::mpsc::channel::<Vec<String>>(32);
+        hot_add_probe_tx = Some(probe_trigger_tx.clone()); // retain for hot-add probes
         router.set_probe_trigger_tx(probe_trigger_tx);
         let watcher_router = router.clone();
         let watcher_signal_tx = signal_tx.clone();
@@ -1341,10 +1346,16 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                                     // extends to hot-loaded engines without restarting the watcher.
                                     // All hot-loaded engines are OpenAI-compat; probe URL = base_url.
                                     if !entry.base_url.is_empty() {
+                                        let new_engine_key = format!("{}:{}", entry.provider_id, model.model_id);
                                         health_endpoints.lock().push((
-                                            format!("{}:{}", entry.provider_id, model.model_id),
+                                            new_engine_key.clone(),
                                             entry.base_url.clone(),
                                         ));
+                                        // Trigger an immediate probe so the new engine's health weight
+                                        // is populated without waiting for the next scheduled cycle.
+                                        if let Some(ref tx) = hot_add_probe_tx {
+                                            let _ = tx.try_send(vec![new_engine_key]);
+                                        }
                                     }
                                     engine_registry.add_named(
                                         &entry.provider_id,
@@ -1948,9 +1959,10 @@ async fn run_reasoning_turn(
                 created: chrono::Utc::now(),
             });
         }
-        // Trigger immediate re-probe so health state updates without waiting for next scheduled cycle.
+        // Mark engine unhealthy immediately (sets weight to 0.0) and trigger re-probe so health
+        // state reflects the failure without waiting for the next scheduled probe cycle.
         if let (Some(ref key), Some(ref router)) = (&primary_model_key, &tool_ctx.smart_router) {
-            router.trigger_probe(vec![key.clone()]);
+            router.mark_engine_unhealthy(key);
         }
     }
 
