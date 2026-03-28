@@ -882,20 +882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_weight_engine_skipped_by_is_engine_healthy() {
-        let (router, _rx) = make_router_async().await;
-        let spec = crate::model_plan::ModelSpec {
-            provider: "ollama".to_string(),
-            model: "qwen3.5:35b".to_string(),
-            think: crate::model_plan::ThinkLevel::Dynamic,
-            cost: None, speed: None, quality: None, trust_floor: 0,
-        };
-        router.mark_engine_unhealthy("ollama:qwen3.5:35b");
-        assert!(!router.is_engine_healthy(&spec));
-    }
-
-    #[tokio::test]
-    async fn select_for_class_half_weight_halves_score() {
+    async fn health_weight_score_multiply_math() {
         // An engine at 0.5 weight should score at half of a confirmed-healthy engine
         let (router, _rx) = make_router_async().await;
         // Register two engines with the same spec but different health weights

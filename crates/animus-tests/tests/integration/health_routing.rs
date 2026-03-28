@@ -75,10 +75,10 @@ async fn all_down_returns_emergency_spec() {
     // The emergency spec must be drawn from the known candidate list, not a stub.
     // SmartRouter falls back to the first candidate in the plan when all are skipped.
     let selected_key = format!("{}:{}", decision.model_spec.provider, decision.model_spec.model);
-    assert!(
-        selected_key == primary_key || selected_key == fallback_key,
-        "emergency spec should be drawn from known candidates ({}, {}), got: {}",
-        primary_key, fallback_key, selected_key
+    assert_eq!(
+        selected_key, primary_key,
+        "emergency spec should be the first candidate in the plan ({}), got: {}",
+        primary_key, selected_key
     );
 }
 
