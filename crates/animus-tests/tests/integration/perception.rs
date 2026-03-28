@@ -22,7 +22,7 @@ async fn test_perception_pipeline_store_and_filter() {
             {"event_index": 2, "store": true, "summary": "Build completed", "decay_class": "Episodic", "tags": {"category": "build"}, "signal": null}
         ]
     });
-    let engine = Box::new(MockEngine::new(&response.to_string()));
+    let engine = Arc::new(MockEngine::new(&response.to_string()));
     let perception = PerceptionLoop::new(engine, store.clone(), embedder, signal_tx);
 
     let events: Vec<SensorEvent> = (0..3)
@@ -50,7 +50,7 @@ async fn test_perception_fallback_stores_all_on_engine_failure() {
     let (signal_tx, _signal_rx) = tokio::sync::mpsc::channel(100);
 
     // Invalid JSON response triggers fallback (parse failure path)
-    let engine = Box::new(MockEngine::new("not valid json"));
+    let engine = Arc::new(MockEngine::new("not valid json"));
     let perception = PerceptionLoop::new(engine, store.clone(), embedder, signal_tx);
 
     let events: Vec<SensorEvent> = (0..3)

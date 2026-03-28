@@ -41,7 +41,7 @@ async fn test_reflection_cycle_produces_synthesis() {
         "goal_updates": [],
         "signals": []
     });
-    let engine = Box::new(MockEngine::new(&response.to_string()));
+    let engine = Arc::new(MockEngine::new(&response.to_string()));
     let mut reflection = ReflectionLoop::new(engine, store.clone(), embedder, goals, signal_tx)
         .with_min_new_segments(1)
         // Set last_cycle to the past so gather_recent_segments finds our segments
@@ -62,7 +62,7 @@ fn test_reflection_should_cycle_logic() {
     let goals = Arc::new(parking_lot::Mutex::new(GoalManager::new()));
     let (signal_tx, _) = tokio::sync::mpsc::channel(100);
 
-    let engine = Box::new(MockEngine::new("test"));
+    let engine = Arc::new(MockEngine::new("test"));
     let loop_ = ReflectionLoop::new(engine, store.clone(), embedder, goals, signal_tx)
         .with_min_new_segments(2);
 
