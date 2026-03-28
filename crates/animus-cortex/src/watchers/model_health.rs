@@ -38,6 +38,75 @@ async fn probe_endpoint(http: &reqwest::Client, base_url: &str) -> bool {
     }
 }
 
+/// Probe a batch of `(registry_key, base_url)` pairs concurrently and update router health.
+/// Fires signals on confirmed state transitions (up→down or down→up only).
+async fn probe_batch(
+    snapshot: &[(String, String)],
+    router: &SmartRouter,
+    signal_tx: &mpsc::Sender<Signal>,
+    source_id: ThreadId,
+    http: &reqwest::Client,
+) {
+    if snapshot.is_empty() {
+        return;
+    }
+
+    tracing::debug!("ModelHealthWatcher: probing {} engine(s)", snapshot.len());
+
+    let probe_futures: Vec<_> = snapshot.iter()
+        .map(|(key, base_url)| {
+            let http = http.clone();
+            let key = key.clone();
+            let base_url = base_url.clone();
+            async move {
+                let available = probe_endpoint(&http, &base_url).await;
+                (key, available)
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(probe_futures).await;
+
+    for (key, available) in results {
+        let prev_weight = router.engine_health_weight(&key);
+        router.set_engine_health(&key, if available { 1.0 } else { 0.0 });
+
+        if prev_weight >= 1.0 && !available {
+            // Was confirmed healthy, now confirmed down
+            let summary = format!(
+                "Adapting: engine '{key}' probe failed — routing around it until it recovers"
+            );
+            tracing::warn!("{summary}");
+            let _ = signal_tx.try_send(Signal {
+                source_thread: source_id,
+                target_thread: ThreadId::default(),
+                priority: SignalPriority::Normal,
+                summary,
+                segment_refs: vec![],
+                created: Utc::now(),
+            });
+        } else if prev_weight <= 0.0 && available {
+            // Was confirmed down (or first probe and down→up), now recovered
+            let summary = format!("Engine '{key}' is back online — resuming normal routing");
+            tracing::info!("{summary}");
+            let _ = signal_tx.try_send(Signal {
+                source_thread: source_id,
+                target_thread: ThreadId::default(),
+                priority: SignalPriority::Normal,
+                summary,
+                segment_refs: vec![],
+                created: Utc::now(),
+            });
+        } else {
+            tracing::debug!(
+                "ModelHealthWatcher: '{}' = {}",
+                key,
+                if available { "up" } else { "down" }
+            );
+        }
+    }
+}
+
 /// Launch the model health watcher as a background task.
 ///
 /// `endpoints` — shared, mutable list of `(registry_key, base_url)` pairs where
@@ -49,17 +118,17 @@ async fn probe_endpoint(http: &reqwest::Client, base_url: &str) -> bool {
 /// restarting the watcher (CRITICAL-4).
 ///
 /// `interval_secs` — how often to probe all endpoints.
+///
+/// `probe_trigger_rx` — channel for targeted on-demand probes (e.g. after a routing
+/// failure). Fires with backoff to avoid hammering a known-down engine.
 pub async fn run_model_health_watcher(
     endpoints: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
     router: SmartRouter,
     signal_tx: mpsc::Sender<Signal>,
     source_id: ThreadId,
     interval_secs: u64,
+    mut probe_trigger_rx: tokio::sync::mpsc::Receiver<Vec<String>>,
 ) {
-    if endpoints.lock().is_empty() {
-        return;
-    }
-
     let http = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -72,76 +141,74 @@ pub async fn run_model_health_watcher(
     };
 
     tracing::info!(
-        "ModelHealthWatcher started — probing engine(s) every {}s",
+        "ModelHealthWatcher started — probing engine(s) every {}s (T=0 probe firing now)",
         interval_secs,
     );
 
+    // T=0: probe all known endpoints immediately — don't wait for the first interval tick.
+    {
+        let snapshot: Vec<(String, String)> = endpoints.lock().clone();
+        probe_batch(&snapshot, &router, &signal_tx, source_id, &http).await;
+    }
+
+    // Track consecutive triggered-probe failures per engine for backoff.
+    let mut consecutive_failures: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut last_triggered_probe: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-    interval.tick().await; // skip immediate first tick — let startup settle
+    interval.tick().await; // consume the immediate first tick so loop starts at T+interval_secs
 
     loop {
-        interval.tick().await;
-
-        // CRITICAL-4: snapshot under lock so hot-added engines are picked up each cycle.
-        let snapshot: Vec<(String, String)> = endpoints.lock().clone();
-
-        if snapshot.is_empty() {
-            continue;
-        }
-
-        tracing::debug!("ModelHealthWatcher: probing {} engine(s)", snapshot.len());
-
-        // CRITICAL-3: probe all endpoints concurrently — one stalled endpoint no longer
-        // blocks the rest of the fleet from being evaluated.
-        // reqwest::Client is cheap to clone (shares the underlying connection pool).
-        let probe_futures: Vec<_> = snapshot.iter()
-            .map(|(key, base_url)| {
-                let http = http.clone();
-                let key = key.clone();
-                let base_url = base_url.clone();
-                async move {
-                    let available = probe_endpoint(&http, &base_url).await;
-                    (key, available)
+        tokio::select! {
+            _ = interval.tick() => {
+                let snapshot: Vec<(String, String)> = endpoints.lock().clone();
+                probe_batch(&snapshot, &router, &signal_tx, source_id, &http).await;
+                // Reset backoff counters for engines that recovered.
+                for (key, _) in &snapshot {
+                    if router.engine_health_weight(key) > 0.0 {
+                        consecutive_failures.remove(key);
+                        last_triggered_probe.remove(key);
+                    }
                 }
-            })
-            .collect();
+            }
+            Some(keys) = probe_trigger_rx.recv() => {
+                let now = std::time::Instant::now();
+                let all_endpoints = endpoints.lock().clone();
+                let targeted: Vec<(String, String)> = all_endpoints.into_iter()
+                    .filter(|(key, _)| {
+                        if !keys.contains(key) {
+                            return false;
+                        }
+                        // Exponential backoff: 30s base, doubles per consecutive failure, cap 300s
+                        let failures = consecutive_failures.get(key).copied().unwrap_or(0);
+                        let backoff_secs = (30u64 * 2u64.pow(failures.min(4))).min(300);
+                        let backoff = std::time::Duration::from_secs(backoff_secs);
+                        match last_triggered_probe.get(key) {
+                            Some(last) if now.duration_since(*last) < backoff => {
+                                tracing::debug!(
+                                    "ModelHealthWatcher: skipping triggered probe for '{}' — backoff {}s",
+                                    key, backoff_secs
+                                );
+                                false
+                            }
+                            _ => true,
+                        }
+                    })
+                    .collect();
 
-        let results = futures::future::join_all(probe_futures).await;
-
-        for (key, available) in results {
-            let was_available = router.engine_health_weight(&key) > 0.0;
-            router.set_engine_health(&key, if available { 1.0 } else { 0.0 });
-
-            if was_available && !available {
-                let summary = format!(
-                    "Adapting: engine '{key}' probe failed — routing around it until it recovers"
-                );
-                tracing::warn!("{summary}");
-                let _ = signal_tx.try_send(Signal {
-                    source_thread: source_id,
-                    target_thread: ThreadId::default(),
-                    priority: SignalPriority::Normal,
-                    summary,
-                    segment_refs: vec![],
-                    created: Utc::now(),
-                });
-            } else if !was_available && available {
-                let summary = format!("Engine '{key}' is back online — resuming normal routing");
-                tracing::info!("{summary}");
-                let _ = signal_tx.try_send(Signal {
-                    source_thread: source_id,
-                    target_thread: ThreadId::default(),
-                    priority: SignalPriority::Normal,
-                    summary,
-                    segment_refs: vec![],
-                    created: Utc::now(),
-                });
-            } else {
-                tracing::debug!(
-                    "ModelHealthWatcher: '{}' = {}",
-                    key,
-                    if available { "up" } else { "down" }
-                );
+                if !targeted.is_empty() {
+                    probe_batch(&targeted, &router, &signal_tx, source_id, &http).await;
+                    for (key, _) in &targeted {
+                        last_triggered_probe.insert(key.clone(), now);
+                        if router.engine_health_weight(key) == 0.0 {
+                            *consecutive_failures.entry(key.clone()).or_insert(0) += 1;
+                        } else {
+                            consecutive_failures.remove(key);
+                        }
+                    }
+                }
             }
         }
     }

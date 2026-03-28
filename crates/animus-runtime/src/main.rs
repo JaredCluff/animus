@@ -692,6 +692,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
     if let Some(ref router) = smart_router {
         if !health_endpoints.lock().is_empty() {
+            let (probe_trigger_tx, probe_trigger_rx) =
+                tokio::sync::mpsc::channel::<Vec<String>>(16);
+            router.set_probe_trigger_tx(probe_trigger_tx);
             let watcher_router = router.clone();
             let watcher_signal_tx = signal_tx.clone();
             let watcher_source = animus_core::identity::ThreadId::new();
@@ -704,6 +707,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     watcher_signal_tx,
                     watcher_source,
                     MODEL_HEALTH_PROBE_INTERVAL_SECS,
+                    probe_trigger_rx,
                 ).await;
             });
             tracing::info!("ModelHealthWatcher spawned ({n} endpoint(s))");
