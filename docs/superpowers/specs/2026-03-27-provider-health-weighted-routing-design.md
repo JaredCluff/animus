@@ -84,7 +84,7 @@ Behavioral consequences:
 
 **T=0 startup:** The watcher's run loop currently sleeps before its first probe. Change: probe first, then enter the sleep→probe cycle. No external trigger needed.
 
-**On-failure re-probe:** Main loop catches engine error → calls `router.mark_engine_unhealthy(key)` (sets weight to `0.0`) → sends key through trigger channel. Watcher re-probes on next available cycle.
+**On-failure re-probe:** Main loop catches engine error → calls `router.mark_engine_unhealthy(key)` (sets weight to `0.0`) → sends key through trigger channel. The watcher drains the trigger channel before each sleep, so a trigger received mid-sleep wakes it immediately via the mpsc channel's readiness signal. Re-probe runs as soon as any in-progress scheduled probe completes.
 
 **Config change:** After plan rebuild triggered by config_hash mismatch, main loop sends all plan engine keys through trigger channel and resets their weights to `0.5`.
 
@@ -95,13 +95,13 @@ The trigger `Sender` is stored in `Arc` and shared between the main loop and `Sm
 ## Error Handling
 
 **All providers confirmed down (all weights = 0.0):**
-`select_for_class()` returns no candidates. The router returns `RouteDecision::NoHealthyProviders`. The main loop surfaces this as a structured error with a message like "No providers currently available." The watcher's 30s scheduled cycle resolves this automatically when a provider recovers.
+`select_for_class()` returns no candidates. The router returns `RouteDecision::NoHealthyProviders` — a new variant added to the existing `RouteDecision` enum. The main loop surfaces this as a structured error with a message like "No providers currently available." The watcher's 30s scheduled cycle resolves this automatically when a provider recovers.
 
 **All providers unknown, T=0 probe in flight:**
 During the ~3s startup window before probes resolve, routing proceeds at half scores. A request that arrives before probes complete routes to whichever candidate wins on capability score alone. If that provider is down, the failure path marks it `0.0` and triggers re-probe; the retry uses the next candidate.
 
 **Probe backoff on repeated failure:**
-If a provider fails its re-probe after being marked down, exponential backoff applies: 30s → 60s → cap at 300s. This prevents hammering a dead endpoint. The watcher tracks `consecutive_failures: u32` per engine key.
+If a provider fails its re-probe after being marked down, exponential backoff applies: 30s → 60s → cap at 300s. This prevents hammering a dead endpoint. The watcher tracks `consecutive_failures: u32` per engine key. A successful probe resets `consecutive_failures` to 0 and resumes the normal 30s scheduled cycle.
 
 **Single-provider setup:**
 With one engine registered, `health_weight=0.5` lets it route during the startup window. The 0.5 multiplier has no practical effect on selection when there's only one candidate — it just affects the absolute score.
