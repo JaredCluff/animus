@@ -1,0 +1,132 @@
+name: CI / Container / Release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/animus
+
+jobs:
+  # ── Tests ──────────────────────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      nats:
+        image: nats:latest
+        ports:
+          - 4222:4222
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust build cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev \
+            pkg-config \
+            libasound2-dev
+
+      - name: Run tests
+        run: cargo test --workspace
+        env:
+          ANIMUS_NATS_URL: nats://localhost:4222
+
+  # ── Container image ────────────────────────────────────────────────────────
+  # Builds and pushes to GHCR on every push to main and on version tags.
+  # Skipped on pull requests (build verification only, no push).
+  container:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── GitHub Release ─────────────────────────────────────────────────────────
+  # Creates a GitHub Release entry on version tags.
+  # The primary release artifact is the versioned container image on GHCR.
+  release:
+    needs: container
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Container Image
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository_owner }}/animus:${{ github.ref_name }}
+            ```
+
+            ## Deploy
+
+            Update your `compose.yaml` image tag to `${{ github.ref_name }}` and restart:
+
+            ```bash
+            docker compose pull && docker compose up -d
+            ```
+
+            ## What's Changed
+
+            See the [full commit history](https://github.com/${{ github.repository }}/compare/${{ github.ref_name }}...main) for details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
