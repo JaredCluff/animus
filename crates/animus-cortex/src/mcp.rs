@@ -15,11 +15,10 @@ use tracing::{info, warn};
 
 /// A discovered tool from an MCP server.
 #[derive(Debug, Clone)]
-pub struct McpDiscoveredTool {
+pub(crate) struct McpDiscoveredTool {
     pub(crate) prefixed_name: String,  // "servername__toolname"
     pub(crate) description: String,
     pub(crate) input_schema: serde_json::Value,
-    pub(crate) server_name: String,
     pub(crate) original_name: String,
 }
 
@@ -103,7 +102,6 @@ impl McpManager {
                 description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
                 input_schema: serde_json::to_value(&tool.input_schema)
                     .unwrap_or_else(|_| serde_json::json!({"type": "object"})),
-                server_name: config.name.clone(),
                 original_name: tool.name.to_string(),
             });
         }

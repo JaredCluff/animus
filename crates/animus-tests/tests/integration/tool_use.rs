@@ -30,6 +30,7 @@ fn test_ctx(dir: &std::path::Path) -> ToolContext {
         role_mesh: None,
         budget_state: None,
         budget_config: None,
+        debug_mirror_tx: None,
     }
 }
 

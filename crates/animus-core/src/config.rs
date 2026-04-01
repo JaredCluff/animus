@@ -750,6 +750,7 @@ pub struct McpServerConfig {
     /// Unique name for this server (used as tool prefix: `name__toolname`).
     pub name: String,
     /// Whether this server is enabled.
+    #[serde(default)]
     pub enabled: bool,
     /// Command to launch the server process.
     pub command: String,
