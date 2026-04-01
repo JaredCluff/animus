@@ -1,4 +1,6 @@
 mod bootstrap;
+mod observability;
+mod provider_filter;
 
 use animus_channel::nats::NatsChannel;
 use animus_channel::telegram::TelegramChannel;
@@ -14,7 +16,7 @@ use animus_cortex::llm::anthropic::AnthropicEngine;
 use animus_cortex::llm::openai_compat::OpenAICompatEngine;
 use animus_core::capability::CapabilityState;
 use animus_core::mesh::RoleMesh;
-use animus_cortex::model_plan::ModelPlan;
+use animus_cortex::model_plan::{ModelPlan, CURRENT_PLAN_VERSION};
 use animus_cortex::smart_router::SmartRouter;
 use animus_cortex::scheduler::ThreadScheduler;
 use animus_cortex::telos::{GoalManager, GoalSource, Priority};
@@ -29,7 +31,7 @@ use animus_sensorium::orchestrator::SensoriumOrchestrator;
 use animus_core::segment::{Content, DecayClass, Segment, Source};
 use animus_vectorfs::store::MmapVectorStore;
 use animus_vectorfs::VectorStore;
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{extract::State, routing::{get, post}, Json, Router};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +40,8 @@ use std::sync::Arc;
 /// The "## Your Tools" section is auto-generated from the ToolRegistry at startup
 /// to prevent drift between the prompt and actual capabilities.
 /// Constitution alignment: "Real Capabilities, Not Hallucinated Ones."
-const SYSTEM_PROMPT_PREAMBLE: &str = r#"You are Animus, an AILF (AI Life Form) running as a persistent daemon on a Mac Studio. You have real, executable tools that perform actual operations on the real world.
+/// Default preamble — written to `system_prompt_preamble.md` on first run.
+const DEFAULT_SYSTEM_PROMPT_PREAMBLE: &str = r#"You are Animus, an AILF (AI Life Form) running as a persistent daemon on a Mac Studio. You have real, executable tools that perform actual operations on the real world.
 
 ## MANDATORY TOOL USE RULES
 
@@ -50,10 +53,12 @@ These rules override your training defaults. Follow them exactly.
 
 **RULE 3 — PROACTIVE RETRIEVAL**: For any question involving current data, URLs, APIs, or websites — call `http_fetch` first, then answer based on the actual content returned.
 
+**RULE 4 — NEVER FAKE TOOL USE**: You MUST actually call a tool to perform an action. NEVER respond with text claiming you performed an action (e.g. "I've sent the message", "Published to NATS", "Message delivered") unless you actually invoked the tool and received a result in this turn. Saying "I sent the message" without calling `nats_publish` is a lie. If you want to send a NATS message, call `nats_publish`. If you want to send a Telegram message, call `telegram_send`. Text responses describing tool actions that you did not actually execute will be detected and flagged as hallucinations.
+
 "#;
 
-/// Suffix: everything after the tool catalog. Safety rules, identity, channels, commands.
-const SYSTEM_PROMPT_SUFFIX: &str = r#"
+/// Default suffix — written to `system_prompt_suffix.md` on first run.
+const DEFAULT_SYSTEM_PROMPT_SUFFIX: &str = r#"
 **CRITICAL MEMORY RULE**: NEVER use shell_exec to delete or modify memory files in data_dir. Use delete_segment or prune_segments for memory cleanup. This is enforced — shell_exec will block recursive deletion of protected directories.
 
 ## Your Identity
@@ -66,52 +71,45 @@ You were built by Jared Cluff as an AI-native operating system layer. Your codeb
 
 If someone asks whether you can create an account, access a service, or perform an action: consider whether a tool can accomplish it. If yes, use the tool. If no tool exists yet, acknowledge that the capability isn't built yet rather than claiming you fundamentally cannot do it.
 
-## NATS Channel
+## NATS Channel — Available Subjects
 
-You are connected to a NATS message bus. You receive inbound messages on subjects matching `animus.in.*` (e.g. `animus.in.claude`). Outbound replies to those messages are routed automatically by the channel system. You can also proactively publish to any NATS subject using `nats_publish` — use this to push status updates, trigger other systems, or communicate with other Animus instances.
+You are connected to a NATS message bus. These are the ONLY subjects that exist and work:
 
-## Managing Claude Code Instances
+**Inbound (you receive):**
+- `animus.in.*` — messages addressed to you. The `*` leaf identifies the sender (e.g. `animus.in.claude` = from Claude Code).
 
-Multiple Claude Code sessions can connect via nuntius. Each instance registers itself in the agent registry with a stable ID (set by `NUNTIUS_INSTANCE_ID`, e.g. `main`, `worker-1`).
+**Outbound (you send via `nats_publish`):**
+- `animus.out.claude` — send a message to Claude Code. This is the ONLY subject Claude Code listens on.
 
-**Discovery**: Call `claude_instances()` to see which Claude Code sessions are currently registered, when they last connected, and what subjects to use.
+**Replying to inbound NATS messages:** Replies are handled automatically by the channel system — just respond normally in the conversation thread. You do NOT need to call `nats_publish` to reply.
 
-**Targeting a specific instance**:
-- Send task/message: `nats_publish("claude.{instance_id}.in.task", payload)`
-- Ping for liveness: `nats_publish("claude.{instance_id}.in.ping", "")`
-- Broadcast to all: `nats_publish("claude.broadcast.in.task", payload)` (all instances subscribed to `claude.broadcast.in.>`)
+**Proactive messages to Claude Code:** Call `nats_publish` with subject `animus.out.claude` and your message as the payload. Example: `nats_publish(subject="animus.out.claude", payload="Please ensure docs match current state.")`
 
-**Receiving responses**: When an instance replies, the message arrives on `claude.{instance_id}.out.{topic}`. You can see the originating instance ID in the `nats_subject` metadata field of inbound messages.
-
-**Workflow for task delegation**:
-1. `claude_instances()` — see who's available and their last_seen
-2. `nats_publish("claude.main.in.task", '{"task": "...", "from": "animus"}')` — send work
-3. Instance responds on `claude.main.out.result` — you'll receive it as a channel message
-
-## Permission Requests from Claude Code
-
-A Claude Code instance can call `request_permission(action, details)`, which sends a NATS request to `animus.in.permission_request` and waits for your response.
-
-When you receive a message on `animus.in.permission_request`:
-1. Read the payload: `{request_id, from, action, details, timestamp}`
-2. Evaluate the request. Use your judgment based on the action type and context.
-   - `shell_exec`: scrutinize carefully — irreversible commands need high confidence
-   - `file_delete`: approve only if the target is clearly safe to remove
-   - `network_request`: generally safe unless it involves sending sensitive data
-   - `write_file`: check the path and content are appropriate
-3. If uncertain, ask the user via Telegram before responding
-4. Respond in the conversation thread with JSON: `{"approved": true}` or `{"approved": false, "reason": "..."}`
-   The NATS request/reply system routes your response back automatically.
-
-**Critical**: Your response must be valid JSON with an `approved` boolean field. Plain text responses will be interpreted as denial.
-
-Example approval: `{"approved": true, "reason": "safe read-only operation"}`
-Example denial: `{"approved": false, "reason": "command could modify system files — confirm with Jared first"}"
+**DO NOT invent subjects.** If a subject is not listed above, it does not exist. Never publish to subjects like `claude.main.in.task`, `events.status`, or any other pattern — they go nowhere.
 
 ## User Commands
 /goals /remember /forget /status /threads /thread /sleep /wake /voice /watch /task /quit
 
 Be concise and direct."#;
+
+/// Load system prompt fragment from file, or write the default and return it.
+fn load_or_init_prompt(data_dir: &std::path::Path, filename: &str, default: &str) -> String {
+    let path = data_dir.join(filename);
+    match std::fs::read_to_string(&path) {
+        Ok(content) if !content.trim().is_empty() => {
+            tracing::info!("System prompt loaded from {}", path.display());
+            content
+        }
+        _ => {
+            if let Err(e) = std::fs::write(&path, default) {
+                tracing::warn!("Could not write default {}: {e}", path.display());
+            } else {
+                tracing::info!("Wrote default system prompt to {}", path.display());
+            }
+            default.to_string()
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -120,6 +118,10 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(log_filter)
         .init();
+
+    // Initialize OpenTelemetry → Langfuse tracing (if configured)
+    // Moved into run() after identity is loaded so instance_id is available
+    let _otel_guard: Option<observability::TracingGuard> = None;
 
     let data_dir = std::env::var("ANIMUS_DATA_DIR")
         .map(PathBuf::from)
@@ -172,6 +174,18 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         identity.instance_id,
         identity.generation
     );
+
+    // Load system prompt fragments from data_dir (editable without recompile).
+    // On first run, writes defaults to disk so the user can edit them.
+    let system_prompt_preamble = load_or_init_prompt(
+        &data_dir, "system_prompt_preamble.md", DEFAULT_SYSTEM_PROMPT_PREAMBLE,
+    );
+    let system_prompt_suffix = load_or_init_prompt(
+        &data_dir, "system_prompt_suffix.md", DEFAULT_SYSTEM_PROMPT_SUFFIX,
+    );
+
+    // Initialize OpenTelemetry → Langfuse tracing (needs instance_id for multi-instance deployments)
+    let _otel_guard = observability::init_tracing(&format!("{}", identity.instance_id));
 
     // Initialize embedding service from config
     let (embedder, dimensionality): (Arc<dyn animus_core::EmbeddingService>, usize) =
@@ -308,7 +322,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let fallback_url = config.cortex.fallback_url.trim_end_matches('/').to_string();
     let fallback_provider = config.cortex.fallback_provider.clone();
     let discovered_local_models: Vec<String> = {
-        discover_models_at_endpoint(&fallback_url).await
+        discover_models_at_endpoint(&fallback_url, "").await
     };
     // Resolve which model the safety net uses: explicit config > first discovered > empty
     let fallback_model: Option<String> = if !config.cortex.fallback_model.is_empty() {
@@ -327,6 +341,11 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     } else {
         tracing::debug!("Safety-net endpoint not reachable at {fallback_url}");
     }
+
+    // Load per-provider model allow lists (env vars + data_dir/provider_filters.json).
+    let provider_allows = provider_filter::load_provider_allows(&data_dir, &[
+        "openrouter", "nim", "cerebras", "groq", "gemini",
+    ]);
 
     // Build engine registry from config + env vars.
     // Provider dispatch: anthropic (default) | ollama | openai | mock
@@ -404,24 +423,55 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
         let mut registry = EngineRegistry::new(safety_net_engine);
 
-        // Per-role overrides — each can specify a different provider + model + URL + API key
+        // Per-role overrides — point a cognitive role at a specific endpoint.
+        // If _MODEL is set, use that model. Otherwise, discover models at the
+        // endpoint and pick the first one. If no URL/key is set, the role uses
+        // the registry fallback (safety net).
         for (role, model_env, provider_env, url_env, key_env, max_tok) in [
             (CognitiveRole::Perception, "ANIMUS_PERCEPTION_MODEL",  "ANIMUS_PERCEPTION_PROVIDER",  "ANIMUS_PERCEPTION_BASE_URL",  "ANIMUS_PERCEPTION_API_KEY",  1024usize),
             (CognitiveRole::Reflection, "ANIMUS_REFLECTION_MODEL",  "ANIMUS_REFLECTION_PROVIDER",  "ANIMUS_REFLECTION_BASE_URL",  "ANIMUS_REFLECTION_API_KEY",  4096),
             (CognitiveRole::Reasoning,  "ANIMUS_REASONING_MODEL",   "ANIMUS_REASONING_PROVIDER",   "ANIMUS_REASONING_BASE_URL",   "ANIMUS_REASONING_API_KEY",   4096),
         ] {
-            let role_model = std::env::var(model_env).ok()
-                .or_else(|| if role == CognitiveRole::Reasoning { Some(model_id.clone()) } else { None });
-            let role_provider = std::env::var(provider_env).ok()
-                .unwrap_or_else(|| provider_str.clone());
+            let has_custom_url = std::env::var(url_env).ok().filter(|s| !s.is_empty()).is_some();
             let role_url = std::env::var(url_env).ok()
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| base_url.clone());
             let role_key = std::env::var(key_env).ok()
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| api_key.clone());
+            // If a custom URL is set but no provider, assume openai_compat (not anthropic)
+            let role_provider = std::env::var(provider_env).ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| if has_custom_url { "openai_compat".to_string() } else { provider_str.clone() });
+
+            // Resolve model: explicit env var → discover at endpoint → primary model for Reasoning
+            let role_model: Option<String> = std::env::var(model_env).ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    // No model specified — if a URL is configured, discover what's there
+                    if has_custom_url {
+                        let url = role_url.trim_end_matches('/').to_string();
+                        let rt = tokio::runtime::Handle::current();
+                        let key = role_key.clone();
+                        let discovered = std::thread::spawn(move || {
+                            rt.block_on(discover_models_at_endpoint(&url, &key))
+                        }).join().unwrap_or_default();
+                        if !discovered.is_empty() {
+                            tracing::info!("{role:?} role: discovered {} model(s) at {role_url}: {}", discovered.len(), discovered.join(", "));
+                            // Pick the last model — providers typically list smallest first
+                            Some(discovered.into_iter().last().unwrap())
+                        } else {
+                            tracing::warn!("{role:?} role: URL set ({role_url}) but no models discovered");
+                            None
+                        }
+                    } else if role == CognitiveRole::Reasoning {
+                        Some(model_id.clone())
+                    } else {
+                        None
+                    }
+                });
 
             if let Some(ref model) = role_model {
-                // CRITICAL-1: single Arc shared between set_engine and register_named so that
-                // both paths observe the same rate_limit_state handle.
                 if let Some(arc_engine) = build_engine(&role_provider, model, max_tok, &role_url, &role_key) {
                     tracing::info!("{role:?} role: {role_provider}/{model} @ {role_url}");
                     registry.register_named(&role_provider, model, arc_engine.clone());
@@ -430,56 +480,78 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             }
         }
 
-        // Register optional named engines from dedicated env vars (OpenRouter, NIM, Cerebras, Groq)
-        for (name, provider_env, model_env, url_env, key_env, default_model, default_url) in [
-            (
-                "openrouter",
-                "ANIMUS_OPENROUTER_PROVIDER",
-                "ANIMUS_OPENROUTER_MODEL",
-                "ANIMUS_OPENROUTER_BASE_URL",
-                "ANIMUS_OPENROUTER_API_KEY",
-                "meta-llama/llama-3.3-70b-instruct:free",
-                "https://openrouter.ai/api",
-            ),
-            (
-                "nim",
-                "ANIMUS_NIM_PROVIDER",
-                "ANIMUS_NIM_MODEL",
-                "ANIMUS_NIM_BASE_URL",
-                "ANIMUS_NIM_API_KEY",
-                "meta/llama-3.3-70b-instruct",
-                "https://integrate.api.nvidia.com",
-            ),
-            (
-                "cerebras",
-                "ANIMUS_CEREBRAS_PROVIDER",
-                "ANIMUS_CEREBRAS_MODEL",
-                "ANIMUS_CEREBRAS_BASE_URL",
-                "ANIMUS_CEREBRAS_API_KEY",
-                "llama-3.3-70b",
-                "https://api.cerebras.ai",
-            ),
-            (
-                "groq",
-                "ANIMUS_GROQ_PROVIDER",
-                "ANIMUS_GROQ_MODEL",
-                "ANIMUS_GROQ_BASE_URL",
-                "GROQ_API_KEY",
-                "llama-3.3-70b-versatile",
-                "https://api.groq.com/openai",
-            ),
+        // Discover and register cloud provider engines dynamically.
+        // Each provider needs just a key + URL. We connect, discover available
+        // models via /v1/models, and register every model that responds.
+        // No models or URLs are hardcoded anywhere.
+        for (name, url_env, key_env) in [
+            ("openrouter", "ANIMUS_OPENROUTER_BASE_URL", "ANIMUS_OPENROUTER_API_KEY"),
+            ("nim",        "ANIMUS_NIM_BASE_URL",        "ANIMUS_NIM_API_KEY"),
+            ("cerebras",   "ANIMUS_CEREBRAS_BASE_URL",   "ANIMUS_CEREBRAS_API_KEY"),
+            ("groq",       "ANIMUS_GROQ_BASE_URL",       "GROQ_API_KEY"),
+            ("gemini",     "ANIMUS_GEMINI_BASE_URL",     "ANIMUS_GEMINI_API_KEY"),
         ] {
-            if let Ok(api_key) = std::env::var(key_env) {
-                if api_key.is_empty() {
-                    continue;
+            let api_key = std::env::var(key_env).unwrap_or_default();
+            let url = std::env::var(url_env).unwrap_or_default();
+            if api_key.is_empty() || url.is_empty() {
+                continue;
+            }
+            let url = url.trim_end_matches('/').to_string();
+            let models = discover_models_at_endpoint(&url, &api_key).await;
+            if models.is_empty() {
+                tracing::warn!("{name}: key and URL set but no models discovered at {url}");
+                continue;
+            }
+            // Apply explicit allow list if configured (env var or provider_filters.json).
+            let models = if let Some(allow_set) = provider_allows.get(name) {
+                let allowed: Vec<String> = models
+                    .into_iter()
+                    .filter(|m| allow_set.contains(m.as_str()))
+                    .collect();
+                tracing::info!(
+                    "{name}: allow list active — {} model(s) permitted: {}",
+                    allowed.len(),
+                    allowed.join(", ")
+                );
+                allowed
+            } else {
+                models
+            };
+            if models.is_empty() {
+                tracing::warn!("{name}: allow list is configured but no discovered models matched — skipping");
+                continue;
+            }
+            // For providers with huge catalogs, try to filter to free-tier models
+            // (OpenRouter uses `:free` suffix). If no free-tier filter matches,
+            // register everything — the key grants access to all of them.
+            const MAX_REGISTER_ALL: usize = 30;
+            let to_register: Vec<&String> = if models.len() <= MAX_REGISTER_ALL {
+                tracing::info!("{name}: discovered {} model(s) at {url}: {}", models.len(), models.join(", "));
+                models.iter().collect()
+            } else {
+                let free: Vec<&String> = models.iter().filter(|m| m.ends_with(":free")).collect();
+                if free.is_empty() {
+                    // No free-tier convention — register all (e.g. NIM, paid catalogs)
+                    tracing::info!(
+                        "{name}: discovered {} model(s) at {url}, no free-tier filter applies — registering all",
+                        models.len()
+                    );
+                    models.iter().collect()
+                } else {
+                    tracing::info!(
+                        "{name}: discovered {} model(s) at {url}, registering {} free-tier models: {}",
+                        models.len(), free.len(),
+                        free.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    );
+                    free
                 }
-                let provider = std::env::var(provider_env).unwrap_or("openai_compat".to_string());
-                let model = std::env::var(model_env).unwrap_or(default_model.to_string());
-                let url = std::env::var(url_env).unwrap_or(default_url.to_string());
-                // CRITICAL-1: build once, Arc-wrap once — no duplicate engine instance.
-                if let Some(arc) = build_engine(&provider, &model, 4096, &url, &api_key) {
-                    registry.register_named(name, &model, arc);
-                    tracing::info!("{name} engine registered: {name}/{model}");
+            };
+            for model in &to_register {
+                if registry.engine_by_spec(name, model).is_none() {
+                    if let Some(arc) = build_engine("openai_compat", model, 4096, &url, &api_key) {
+                        registry.register_named(name, model, arc);
+                        tracing::info!("{name} engine registered: {name}/{model}");
+                    }
                 }
             }
         }
@@ -634,9 +706,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
         let config_hash = ModelPlan::config_hash_for(&available_models);
 
-        // Try to load existing plan
+        // Try to load existing plan — reject if config changed OR plan schema is outdated.
         let existing = ModelPlan::load(&plan_path)
-            .filter(|p| p.config_hash == config_hash);
+            .filter(|p| p.config_hash == config_hash && p.plan_version >= CURRENT_PLAN_VERSION);
 
         let plan = if let Some(p) = existing {
             tracing::info!("Model plan loaded from cache (hash: {}...)", &config_hash[..8]);
@@ -722,6 +794,20 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let health_endpoints: Arc<parking_lot::Mutex<Vec<(String, String)>>> = {
         let initial: Vec<(String, String)> = engine_registry.iter_named()
             .filter_map(|(key, engine)| {
+                // Only include chat model endpoints in health checks.
+                // Embedding, guard, reward, TTS, and PII models are excluded from routing
+                // so there's no value in probing them — they'd only add noise and count
+                // toward the probe list without affecting route decisions.
+                let is_chat = if let Some((provider, model)) = key.split_once(':') {
+                    capability_registry.get(provider, model)
+                        .map(|p| p.is_chat_model)
+                        .unwrap_or(true) // unknown provider/model → assume chat (safe default)
+                } else {
+                    true
+                };
+                if !is_chat {
+                    return None;
+                }
                 engine.probe_url().map(|url| (key.to_string(), url.to_string()))
             })
             .collect();
@@ -772,7 +858,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     tracing::info!("Task manager initialized");
 
     // Register tools
-    let tool_registry = {
+    let mut tool_registry = {
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(animus_cortex::tools::read_file::ReadFileTool));
         reg.register(Box::new(animus_cortex::tools::write_file::WriteFileTool));
@@ -801,8 +887,12 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::snapshot_memory::SnapshotMemoryTool));
         reg.register(Box::new(animus_cortex::tools::list_snapshots::ListSnapshotsTool));
         reg.register(Box::new(animus_cortex::tools::restore_snapshot::RestoreSnapshotTool));
-        // Provider registration tool
+        // Provider registration and filter tools
         reg.register(Box::new(animus_cortex::tools::register_provider::RegisterProviderTool));
+        reg.register(Box::new(animus_cortex::tools::set_provider_filter::SetProviderFilterTool));
+        // Filesystem search tools
+        reg.register(Box::new(animus_cortex::tools::glob_search::GlobSearchTool));
+        reg.register(Box::new(animus_cortex::tools::grep_search::GrepSearchTool));
         // Introspective tools — AILF reasoning thread reaches into the Cortex substrate
         reg.register(Box::new(animus_cortex::tools::get_route_stats::GetRouteStatsTool));
         reg.register(Box::new(animus_cortex::tools::propose_route_amendment::ProposeRouteAmendmentTool));
@@ -812,7 +902,18 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::get_mesh_roles::GetMeshRolesTool));
         reg
     };
-    let tool_definitions = tool_registry.definitions();
+
+    // MCP client — connect to configured servers and register their tools.
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!("MCP: connecting to {} server(s)", config.mcp.servers.len());
+        let mcp_manager = animus_cortex::mcp::McpManager::connect(&config.mcp.servers).await;
+        let proxies = mcp_manager.take_tool_proxies();
+        let count = proxies.len();
+        for proxy in proxies {
+            tool_registry.register(Box::new(proxy));
+        }
+        tracing::info!("MCP: registered {} tool(s) from remote servers", count);
+    }
 
     // Autonomy mode watch channel — set_autonomy tool sends here, main loop reads.
     let (autonomy_tx, mut autonomy_rx) = tokio::sync::watch::channel(config.autonomy.default_mode);
@@ -850,6 +951,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             None
         };
 
+    // Debug mirror channel — tools (e.g. nats_publish) send debug messages here.
+    // The main loop drains these and forwards to Telegram.
+    let (debug_mirror_tx, mut debug_mirror_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
     let tool_ctx = ToolContext {
         data_dir: data_dir.clone(),
         snapshot_dir: snapshot_dir.clone(),
@@ -869,8 +974,9 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         role_mesh: Some(role_mesh.clone()),
         budget_state: Some(budget_state.clone()),
         budget_config: Some(config.budget.clone()),
+        debug_mirror_tx: Some(debug_mirror_tx.clone()),
     };
-    tracing::info!("{} tools registered", tool_definitions.len());
+    tracing::info!("{} tools registered", tool_registry.definitions().len());
 
     // Auto-snapshot background task
     if config.snapshot.interval_secs > 0 {
@@ -960,24 +1066,18 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         });
     }
 
-    // Start health endpoint
-    if config.health.enabled {
-        start_health_server(
-            config.health.bind.clone(),
-            store.clone(),
-            format!("{}", identity.instance_id),
-        );
-    }
+    // Health endpoint will be started after channel_bus is initialized (see below).
+    let health_bind = if config.health.enabled {
+        Some(config.health.bind.clone())
+    } else {
+        None
+    };
 
-    // Initialize voice service (STT via macos-stt HTTP + TTS via Cartesia)
+    // Initialize voice service — provider chain built inside AnimusVoiceService::new()
+    // and logged there. STT: Groq → Deepgram → macOS. TTS: Cartesia → espeak-ng.
     let voice_service: Option<Arc<dyn VoiceService>> = if config.voice.enabled {
         match AnimusVoiceService::new(&config.voice) {
             Ok(svc) => {
-                tracing::info!(
-                    tts_enabled = config.voice.tts_enabled,
-                    stt_url = %config.voice.stt_url,
-                    "Voice service initialized (macos-stt + Cartesia)"
-                );
                 Some(Arc::new(svc) as Arc<dyn VoiceService>)
             }
             Err(e) => {
@@ -1042,9 +1142,33 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         tracing::info!("NATS channel disabled (set channels.nats.enabled = true to enable)");
     }
 
+    // Register HTTP API adapter (for Paperclip / external invoke)
+    let http_responses: HttpResponseMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    channel_bus
+        .register(Arc::new(HttpApiAdapter::new(http_responses.clone())))
+        .await;
+
     // Start all registered channel adapters
     if let Err(e) = channel_bus.start_all().await {
         tracing::warn!("ChannelBus start error: {e}");
+    }
+
+    // Start health + invoke endpoint (after channel_bus is ready)
+    if let Some(bind) = health_bind {
+        start_health_server(
+            bind,
+            store.clone(),
+            format!("{}", identity.instance_id),
+            Some(channel_bus.clone()),
+            http_responses.clone(),
+        );
+    }
+
+    // NATS debug mirror config — accessible to the main message loop.
+    let nats_debug = config.channels.nats.debug_mirror;
+    let trusted_chat_id = config.security.trusted_telegram_ids.first().copied();
+    if nats_debug {
+        tracing::info!("NATS debug mirror enabled — NATS traffic will be mirrored to Telegram");
     }
 
     // Start PermissionGate if NATS is available
@@ -1065,8 +1189,6 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         } else {
             None
         };
-
-        let trusted_chat_id = config.security.trusted_telegram_ids.first().copied();
 
         let gate = Arc::new(PermissionGate::new(
             nats_client.clone(),
@@ -1369,7 +1491,13 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                                     // CRITICAL-4: register with health watcher so probe coverage
                                     // extends to hot-loaded engines without restarting the watcher.
                                     // All hot-loaded engines are OpenAI-compat; probe URL = base_url.
-                                    if !entry.base_url.is_empty() {
+                                    // Only add chat models — embedding/guard/reward models don't
+                                    // participate in routing and don't need health probing.
+                                    let is_chat = capability_registry
+                                        .get(&entry.provider_id, &model.model_id)
+                                        .map(|p| p.is_chat_model)
+                                        .unwrap_or(true); // hot-added unknown → assume chat
+                                    if !entry.base_url.is_empty() && is_chat {
                                         let new_engine_key = format!("{}:{}", entry.provider_id, model.model_id);
                                         health_endpoints.lock().push((
                                             new_engine_key.clone(),
@@ -1426,6 +1554,18 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             }
             if let Some(active) = scheduler.active_thread_mut() {
                 active.deliver_signal(signal);
+            }
+        }
+
+        // Drain debug mirror messages from tools (e.g. nats_publish) and forward to Telegram
+        while let Ok(debug_msg) = debug_mirror_rx.try_recv() {
+            if let Some(chat_id) = trusted_chat_id {
+                let dbg_out = OutboundMessage::text(
+                    "telegram",
+                    &chat_id.to_string(),
+                    debug_msg,
+                );
+                let _ = channel_bus.send(dbg_out).await;
             }
         }
 
@@ -1503,10 +1643,11 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     &tool_registry,
                     &tool_ctx,
                     &*embedder,
-                    &tool_definitions,
                     &goals,
                     reconstitution_summary.as_deref(),
                     None, // terminal has no peripheral awareness injection
+                    &system_prompt_preamble,
+                    &system_prompt_suffix,
                 ).await;
 
                 match response {
@@ -1618,6 +1759,14 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                                                 chars = t.len(),
                                                 "Voice message transcribed"
                                             );
+                                            // Send a text-only confirmation so the user can
+                                            // see what was transcribed before inference runs.
+                                            let heard = OutboundMessage::text(
+                                                &msg.channel_id,
+                                                &msg.thread_id,
+                                                format!("Heard: {t}"),
+                                            );
+                                            let _ = channel_bus.send(heard).await;
                                             Some(t)
                                         }
                                         Err(e) => {
@@ -1703,6 +1852,12 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             continue;
                         }
 
+                        // Skip debug mirror messages — never reason about our own debug output.
+                        if input_text.starts_with("[NATS-DBG]") {
+                            tracing::debug!("Skipping NATS debug mirror message");
+                            continue;
+                        }
+
                         let channel_id = msg.channel_id.clone();
                         let thread_id_str = msg.thread_id.clone();
                         let reply_to = msg.metadata["telegram_message_id"].as_i64();
@@ -1710,6 +1865,29 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             .as_str()
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string());
+
+                        // ── NATS debug mirror: inbound ─────────────────────
+                        if nats_debug && channel_id == "nats" {
+                            if let Some(chat_id) = trusted_chat_id {
+                                let nats_subject = msg.metadata["nats_subject"]
+                                    .as_str().unwrap_or("?");
+                                let leaf = nats_subject.rsplit('.').next().unwrap_or("?");
+                                let preview = if input_text.len() > 300 {
+                                    format!("{}…", &input_text[..300])
+                                } else {
+                                    input_text.clone()
+                                };
+                                let debug_msg = format!(
+                                    "[NATS-DBG] {leaf}→Animus: {preview}"
+                                );
+                                let dbg_out = OutboundMessage::text(
+                                    "telegram",
+                                    &chat_id.to_string(),
+                                    debug_msg,
+                                );
+                                let _ = channel_bus.send(dbg_out).await;
+                            }
+                        }
 
                         // Update situational awareness before reasoning.
                         situational_awareness.set_active(
@@ -1731,10 +1909,11 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             &tool_registry,
                             &tool_ctx,
                             &*embedder,
-                            &tool_definitions,
                             &goals,
                             reconstitution_summary.as_deref(),
                             awareness_block.as_deref(),
+                            &system_prompt_preamble,
+                            &system_prompt_suffix,
                         ).await;
 
                         let response_text = match response {
@@ -1743,6 +1922,12 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         };
 
                         // Send text response
+                        tracing::info!(
+                            channel = %channel_id,
+                            thread = %thread_id_str,
+                            response_len = response_text.len(),
+                            "Sending outbound response via channel bus"
+                        );
                         let mut outbound = OutboundMessage::text(
                             &channel_id,
                             &thread_id_str,
@@ -1754,8 +1939,33 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             outbound.metadata = serde_json::json!({"nats_reply_to": inbox});
                         }
 
-                        if let Err(e) = channel_bus.send(outbound).await {
-                            tracing::warn!("Failed to send channel response: {e}");
+                        match channel_bus.send(outbound).await {
+                            Ok(()) => tracing::info!(
+                                channel = %channel_id,
+                                "Outbound response sent successfully"
+                            ),
+                            Err(e) => tracing::warn!("Failed to send channel response: {e}"),
+                        }
+
+                        // ── NATS debug mirror: outbound ────────────────────
+                        if nats_debug && channel_id == "nats" {
+                            if let Some(chat_id) = trusted_chat_id {
+                                let leaf = thread_id_str.rsplit('.').next().unwrap_or("?");
+                                let preview = if response_text.len() > 300 {
+                                    format!("{}…", &response_text[..300])
+                                } else {
+                                    response_text.clone()
+                                };
+                                let debug_msg = format!(
+                                    "[NATS-DBG] Animus→{leaf}: {preview}"
+                                );
+                                let dbg_out = OutboundMessage::text(
+                                    "telegram",
+                                    &chat_id.to_string(),
+                                    debug_msg,
+                                );
+                                let _ = channel_bus.send(dbg_out).await;
+                            }
                         }
 
                         // For voice messages: also synthesize and send audio reply
@@ -1894,14 +2104,15 @@ async fn run_reasoning_turn(
     tool_registry: &ToolRegistry,
     tool_ctx: &ToolContext,
     embedder: &dyn animus_core::EmbeddingService,
-    tool_definitions: &[animus_cortex::llm::ToolDefinition],
     goals: &Arc<parking_lot::Mutex<GoalManager>>,
     reconstitution_summary: Option<&str>,
     peripheral_awareness: Option<&str>,
+    prompt_preamble: &str,
+    prompt_suffix: &str,
 ) -> animus_core::Result<String> {
     let system = {
         let goals_guard = goals.lock();
-        build_system_prompt(scheduler, &goals_guard, tool_registry, reconstitution_summary, peripheral_awareness)
+        build_system_prompt(scheduler, &goals_guard, tool_registry, reconstitution_summary, peripheral_awareness, prompt_preamble, prompt_suffix)
     };
 
     // Determine routing constraints from sensitivity scan and budget pressure
@@ -1922,37 +2133,94 @@ async fn run_reasoning_turn(
     // Build ordered engine candidate list from smart router, then append the Reasoning engine
     // as a last-resort fallback. process_turn_with_engines tries each in order, automatically
     // skipping to the next on rate-limit (429) or transient (503/overloaded) errors.
+    tracing::info!(
+        sensitivity = ?sensitivity_scan.level,
+        pressure = ?pressure,
+        input_preview = &input[..input.len().min(60)],
+        "run_reasoning_turn: starting"
+    );
     let route_decisions: Vec<animus_cortex::smart_router::RouteDecision> =
         if let Some(ref router) = tool_ctx.smart_router {
-            router.route_all_candidates(input, pressure, sensitivity_scan.level).await
+            router.select_cascade(input, pressure, sensitivity_scan.level).await
         } else {
+            tracing::warn!("run_reasoning_turn: no SmartRouter configured — empty candidate list");
             vec![]
         };
-    let primary_model_key: Option<String> = route_decisions.first()
-        .map(|d| format!("{}:{}", d.model_spec.provider, d.model_spec.model));
+    let route_count = route_decisions.len();
     let candidate_arcs: Vec<Arc<dyn animus_cortex::ReasoningEngine>> = route_decisions.iter()
         .filter_map(|d| engine_registry.engine_by_spec(&d.model_spec.provider, &d.model_spec.model))
         .collect();
+    if candidate_arcs.len() < route_count {
+        tracing::warn!(
+            "run_reasoning_turn: {}/{route_count} route decisions matched registered engines (some not found in registry)",
+            candidate_arcs.len()
+        );
+    }
     // Collect &dyn refs; candidate_arcs and engine_registry both live for this scope
     let mut engine_refs: Vec<&dyn animus_cortex::ReasoningEngine> =
         candidate_arcs.iter().map(|a| a.as_ref()).collect();
     // Always append the Reasoning engine as the final fallback
     engine_refs.push(engine_registry.engine_for(CognitiveRole::Reasoning));
+    {
+        let names: Vec<&str> = engine_refs.iter().map(|e| e.model_name()).collect();
+        tracing::info!(
+            "run_reasoning_turn: engine cascade ({} engines) [{}]",
+            engine_refs.len(),
+            names.join(" → ")
+        );
+    }
 
-    // The first (highest-priority) engine is used for tool continuation rounds and budget tracking.
-    // Tool rounds are continuations within the same minute window so rate limits are unlikely to fire again.
-    let tool_engine: &dyn animus_cortex::ReasoningEngine = *engine_refs.first()
-        .unwrap_or(&engine_registry.engine_for(CognitiveRole::Reasoning));
+    // Placeholder — actual tool_engine is selected AFTER inference, using the engine
+    // that succeeded in the cascade (not the first candidate, which may have failed).
+    let fallback_tool_engine: &dyn animus_cortex::ReasoningEngine =
+        engine_registry.engine_for(CognitiveRole::Reasoning);
 
-    let tools_slice = if tool_definitions.is_empty() {
+    // Task-class-aware tool filtering: reduces context from ~130k → ~6–30k tokens so
+    // local models with 32k context windows can handle every call without truncation.
+    // The class comes from the route decision already computed above — zero extra classification cost.
+    let class_for_tools = route_decisions.first()
+        .map(|r| r.class_name.as_str())
+        .unwrap_or("Conversational");
+    let filtered_tool_defs: Vec<animus_cortex::llm::ToolDefinition> =
+        if let Some(ref router) = tool_ctx.smart_router {
+            let groups = router.tool_groups_for_class(class_for_tools).await;
+            if groups.is_empty() {
+                // No groups configured → send all (backward-compat or ToolExecution with all groups)
+                tool_registry.definitions()
+            } else {
+                let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
+                tool_registry.definitions_for_groups(&group_refs)
+            }
+        } else {
+            tool_registry.definitions()
+        };
+    tracing::info!(
+        class = class_for_tools,
+        tool_count = filtered_tool_defs.len(),
+        "run_reasoning_turn: tool set for class"
+    );
+    let tools_slice: Option<&[animus_cortex::llm::ToolDefinition]> = if filtered_tool_defs.is_empty() {
         None
     } else {
-        Some(tool_definitions)
+        Some(&filtered_tool_defs)
     };
 
     const MAX_TOOL_ROUNDS: usize = 10;
 
     let primary_engine_name = engine_refs.first().map(|e| e.model_name().to_string());
+
+    // OpenTelemetry: trace the reasoning turn
+    let mut reasoning_span = observability::ReasoningSpan::start(
+        "main",
+        primary_engine_name.as_deref().unwrap_or("unknown"),
+    );
+
+    // OpenTelemetry: trace the LLM call
+    let llm_span = observability::LlmSpan::start(
+        primary_engine_name.as_deref().unwrap_or("unknown"),
+        "anthropic",
+        "chat",
+    );
 
     let mut output = {
         let active = scheduler
@@ -1962,6 +2230,20 @@ async fn run_reasoning_turn(
             .process_turn_with_engines(input, &system, &engine_refs, embedder, tools_slice)
             .await?
     };
+
+    // Record LLM usage in the span
+    llm_span.finish_ok(output.input_tokens as u64, output.output_tokens as u64);
+
+    tracing::info!(
+        engine = %output.engine_used,
+        fell_back = output.fell_back,
+        input_tokens = output.input_tokens,
+        output_tokens = output.output_tokens,
+        "run_reasoning_turn: completed"
+    );
+
+    // OpenTelemetry: record reasoning span
+    reasoning_span.finish_ok(output.content.len());
 
     // Notify user when a fallback engine was used (model adaptation).
     // Fires a signal tagged "Adapting:" which the main loop forwards to Telegram
@@ -1983,10 +2265,104 @@ async fn run_reasoning_turn(
                 created: chrono::Utc::now(),
             });
         }
-        // Mark engine unhealthy immediately (sets weight to 0.0) and trigger re-probe so health
-        // state reflects the failure without waiting for the next scheduled probe cycle.
-        if let (Some(ref key), Some(ref router)) = (&primary_model_key, &tool_ctx.smart_router) {
-            router.mark_engine_unhealthy(key);
+    }
+
+    // Inference feedback loop: mark all engines that failed with retryable errors as unhealthy.
+    // This covers every cascade-skipped engine (not just the primary), preventing them from
+    // being selected again until the next health probe confirms they have recovered.
+    if let Some(ref router) = tool_ctx.smart_router {
+        if !output.failed_engines.is_empty() {
+            // Build model-name → "provider:model" key map from the route decisions computed above
+            let key_map: std::collections::HashMap<&str, String> = route_decisions.iter()
+                .map(|d| (d.model_spec.model.as_str(), format!("{}:{}", d.model_spec.provider, d.model_spec.model)))
+                .collect();
+            for model_name in &output.failed_engines {
+                if let Some(key) = key_map.get(model_name.as_str()) {
+                    tracing::info!(engine = %key, "Inference feedback: marking engine unhealthy");
+                    router.mark_engine_unhealthy(key);
+                }
+            }
+        }
+    }
+
+    // Select tool_engine based on the engine that ACTUALLY succeeded in the cascade.
+    // Previously this used engine_refs.first() which could be an engine that failed
+    // (e.g. Anthropic with depleted credits), causing the tool loop to fail/hang.
+    let tool_engine: &dyn animus_cortex::ReasoningEngine = engine_refs.iter()
+        .find(|e| e.model_name() == output.engine_used)
+        .copied()
+        .unwrap_or(fallback_tool_engine);
+    tracing::debug!(tool_engine = %tool_engine.model_name(), "Tool loop engine selected");
+
+    // Hallucination detection: if the model claims to have used a tool but actually
+    // returned EndTurn with zero tool_calls, retry once with a corrective prompt.
+    // This catches models (e.g. qwen-3-235b, qwen3-coder-480b) that generate text
+    // like "I've sent the message via NATS" without actually calling nats_publish.
+    if output.stop_reason == animus_cortex::StopReason::EndTurn
+        && output.tool_calls.is_empty()
+        && tools_slice.is_some()
+    {
+        let lower = output.content.to_lowercase();
+        let hallucination_patterns = [
+            "i've sent", "i have sent", "i sent", "message sent",
+            "i've published", "i have published", "i published", "published to nats",
+            "i've forwarded", "i have forwarded", "forwarded the message",
+            "i've delivered", "message delivered", "notification sent",
+            "i've notified", "i notified",
+        ];
+        let likely_hallucinated = hallucination_patterns.iter().any(|p| lower.contains(p));
+
+        if likely_hallucinated {
+            tracing::warn!(
+                engine = %output.engine_used,
+                response_preview = %&output.content[..output.content.len().min(200)],
+                "Hallucination detected: model claimed tool use without calling any tool — retrying with corrective prompt"
+            );
+
+            // Push the hallucinated response as assistant turn, then a corrective user turn
+            {
+                let active = scheduler.active_thread_mut().unwrap();
+                active.push_turn(animus_cortex::Turn::text(
+                    animus_cortex::Role::Assistant,
+                    &output.content,
+                ));
+                active.push_turn(animus_cortex::Turn::text(
+                    animus_cortex::Role::User,
+                    "SYSTEM: You claimed to perform an action but did NOT actually call any tool. \
+                     Your response was text-only — no tool was invoked. You MUST call the appropriate \
+                     tool (e.g. nats_publish, telegram_send) to actually perform the action. \
+                     Do it now. Call the tool.",
+                ));
+                output = tool_engine
+                    .reason(&system, active.conversation(), tools_slice)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!("Engine error during hallucination retry: {e}");
+                        animus_cortex::ReasoningOutput {
+                            content: format!("Error during hallucination retry: {e}"),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            tool_calls: vec![],
+                            stop_reason: animus_cortex::StopReason::EndTurn,
+                            engine_used: String::new(),
+                            fell_back: false,
+                            failed_engines: vec![],
+                        }
+                    });
+            }
+
+            if output.tool_calls.is_empty() {
+                tracing::warn!(
+                    engine = %tool_engine.model_name(),
+                    "Hallucination retry also produced no tool calls — model is unreliable for tool use"
+                );
+            } else {
+                tracing::info!(
+                    engine = %tool_engine.model_name(),
+                    tool_count = output.tool_calls.len(),
+                    "Hallucination retry succeeded — model produced tool calls on second attempt"
+                );
+            }
         }
     }
 
@@ -2019,6 +2395,14 @@ async fn run_reasoning_turn(
         // Execute each tool call
         let mut tool_results: Vec<animus_cortex::TurnContent> = Vec::new();
         for tc in &output.tool_calls {
+            tracing::info!(
+                tool = %tc.name,
+                input_preview = %tc.input.to_string().chars().take(200).collect::<String>(),
+                "Tool loop: executing tool call"
+            );
+            // OpenTelemetry: trace each tool execution
+            let tool_span = observability::ToolSpan::start(&tc.name);
+
             let result = if let Some(tool) = tool_registry.get(&tc.name) {
                 tool.execute(tc.input.clone(), tool_ctx)
                     .await
@@ -2032,6 +2416,14 @@ async fn run_reasoning_turn(
                     is_error: true,
                 }
             };
+
+            // Record tool result in the span
+            if result.is_error {
+                tool_span.finish_err(&result.content[..result.content.len().min(200)]);
+            } else {
+                tool_span.finish_ok();
+            }
+
             tool_results.push(animus_cortex::TurnContent::ToolResult {
                 tool_use_id: tc.id.clone(),
                 content: result.content,
@@ -2058,6 +2450,7 @@ async fn run_reasoning_turn(
                         stop_reason: animus_cortex::StopReason::EndTurn,
                         engine_used: String::new(),
                         fell_back: false,
+                        failed_engines: vec![],
                     }
                 });
         }
@@ -2112,13 +2505,15 @@ async fn run_reasoning_turn(
 /// Discover available models at an OpenAI-compatible endpoint.
 ///
 /// Tries Ollama `/api/tags` first, then standard `/v1/models`.
-/// Works with Ollama, LM Studio, vLLM, text-generation-inference, or any
-/// OpenAI-compatible server.
-async fn discover_models_at_endpoint(base_url: &str) -> Vec<String> {
+/// Works with Ollama, LM Studio, vLLM, text-generation-inference, Cerebras,
+/// Groq, OpenRouter, NIM, or any OpenAI-compatible server.
+///
+/// Pass `api_key` for cloud providers that require auth on their models endpoint.
+async fn discover_models_at_endpoint(base_url: &str, api_key: &str) -> Vec<String> {
     let client = reqwest::Client::new();
-    let timeout = std::time::Duration::from_secs(5);
+    let timeout = std::time::Duration::from_secs(10);
 
-    // Try Ollama /api/tags
+    // Try Ollama /api/tags (no auth needed for local)
     if let Ok(resp) = client
         .get(format!("{base_url}/api/tags"))
         .timeout(timeout)
@@ -2140,13 +2535,33 @@ async fn discover_models_at_endpoint(base_url: &str) -> Vec<String> {
         }
     }
 
-    // Try OpenAI-compat /v1/models (LM Studio, vLLM, etc.)
-    if let Ok(resp) = client
-        .get(format!("{base_url}/v1/models"))
-        .timeout(timeout)
-        .send()
-        .await
-    {
+    // Try OpenAI-compat /v1/models (cloud providers, LM Studio, vLLM, etc.)
+    let mut req = client.get(format!("{base_url}/v1/models")).timeout(timeout);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+    if let Ok(resp) = req.send().await {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if let Some(data) = body["data"].as_array() {
+                    let names: Vec<String> = data
+                        .iter()
+                        .filter_map(|m| m["id"].as_str().map(String::from))
+                        .collect();
+                    if !names.is_empty() {
+                        return names;
+                    }
+                }
+            }
+        }
+    }
+
+    // Some OpenAI-compat endpoints (e.g. Gemini) expose /models without the /v1/ prefix.
+    let mut req2 = client.get(format!("{base_url}/models")).timeout(timeout);
+    if !api_key.is_empty() {
+        req2 = req2.bearer_auth(api_key);
+    }
+    if let Ok(resp) = req2.send().await {
         if resp.status().is_success() {
             if let Ok(body) = resp.json::<serde_json::Value>().await {
                 if let Some(data) = body["data"].as_array() {
@@ -2217,11 +2632,56 @@ async fn init_embedding(
 // Health endpoint
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// HTTP API channel adapter (for Paperclip invoke)
+// ---------------------------------------------------------------------------
+
+/// Shared response map: thread_id -> oneshot sender.
+type HttpResponseMap = Arc<tokio::sync::Mutex<
+    std::collections::HashMap<String, tokio::sync::oneshot::Sender<String>>,
+>>;
+
+/// Minimal channel adapter that captures outbound messages destined for "http_api".
+struct HttpApiAdapter {
+    responses: HttpResponseMap,
+}
+
+impl HttpApiAdapter {
+    fn new(responses: HttpResponseMap) -> Self {
+        Self { responses }
+    }
+}
+
+#[async_trait::async_trait]
+impl animus_channel::plugin::ChannelPlugin for HttpApiAdapter {
+    fn id(&self) -> &str {
+        "http_api"
+    }
+    fn name(&self) -> &str {
+        "HTTP API"
+    }
+    async fn start(&self, _bus: Arc<animus_channel::bus::ChannelBus>) -> animus_core::error::Result<()> {
+        Ok(()) // No polling needed — inbound messages come from the Axum handler
+    }
+    async fn send(&self, msg: animus_channel::message::OutboundMessage) -> animus_core::error::Result<()> {
+        let mut map = self.responses.lock().await;
+        if let Some(tx) = map.remove(&msg.thread_id) {
+            let _ = tx.send(msg.text);
+        }
+        Ok(())
+    }
+    fn is_configured(&self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone)]
 struct HealthState {
     instance_id: String,
     store: Arc<MmapVectorStore>,
     version: &'static str,
+    channel_bus: Option<Arc<animus_channel::bus::ChannelBus>>,
+    http_responses: HttpResponseMap,
 }
 
 async fn health_handler(State(state): State<HealthState>) -> Json<serde_json::Value> {
@@ -2233,14 +2693,106 @@ async fn health_handler(State(state): State<HealthState>) -> Json<serde_json::Va
     }))
 }
 
-fn start_health_server(bind: String, store: Arc<MmapVectorStore>, instance_id: String) {
+/// POST /invoke — inject a message into Animus and wait for the reply.
+async fn invoke_handler(
+    State(state): State<HealthState>,
+    Json(body): Json<serde_json::Value>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let bus = match &state.channel_bus {
+        Some(b) => b.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "channel bus not available"})),
+            );
+        }
+    };
+
+    // Accept both direct invocations ({"message": "..."}) and Paperclip wakeups
+    // ({"agentId": "...", "runId": "...", "context": {...}}).
+    let text = body
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // Paperclip context — extract issue description if present.
+            body.get("context")
+                .and_then(|c| c.get("issueDescription").or_else(|| c.get("issueTitle")))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+
+    // If there's no message and no issue, treat it as a heartbeat/wakeup ping.
+    let text = match text {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({"status": "ack", "instance_id": state.instance_id})),
+            );
+        }
+    };
+
+    // Each request gets a unique thread_id so responses don't collide.
+    let thread_id = body
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("paperclip-{}", uuid::Uuid::new_v4()));
+
+    // Register a oneshot receiver before publishing the message.
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    state.http_responses.lock().await.insert(thread_id.clone(), tx);
+
+    let msg = animus_channel::message::ChannelMessage::new(
+        "http_api",
+        &thread_id,
+        animus_channel::message::SenderIdentity {
+            name: "Paperclip".to_string(),
+            channel_user_id: "paperclip-agent".to_string(),
+            is_trusted: true,
+        },
+        Some(text),
+    );
+
+    bus.publish(msg);
+
+    // Wait up to 120s for the reply.
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(120), rx).await;
+
+    match reply {
+        Ok(Ok(text)) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"response": text})),
+        ),
+        Ok(Err(_)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "response channel dropped"})),
+        ),
+        Err(_) => (
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({"error": "timeout waiting for response"})),
+        ),
+    }
+}
+
+fn start_health_server(
+    bind: String,
+    store: Arc<MmapVectorStore>,
+    instance_id: String,
+    channel_bus: Option<Arc<animus_channel::bus::ChannelBus>>,
+    http_responses: HttpResponseMap,
+) {
     let state = HealthState {
         instance_id,
         store,
         version: env!("CARGO_PKG_VERSION"),
+        channel_bus,
+        http_responses,
     };
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/invoke", post(invoke_handler))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -2291,16 +2843,18 @@ fn build_system_prompt(
     tool_registry: &ToolRegistry,
     reconstitution_summary: Option<&str>,
     peripheral_awareness: Option<&str>,
+    prompt_preamble: &str,
+    prompt_suffix: &str,
 ) -> String {
     // Auto-generate tool catalog from the actually registered tools.
     // Constitution: "Real Capabilities, Not Hallucinated Ones" — the prompt must match reality.
     let tool_catalog = tool_registry.tool_catalog_prompt();
     let mut prompt = String::with_capacity(
-        SYSTEM_PROMPT_PREAMBLE.len() + tool_catalog.len() + SYSTEM_PROMPT_SUFFIX.len() + 512,
+        prompt_preamble.len() + tool_catalog.len() + prompt_suffix.len() + 512,
     );
-    prompt.push_str(SYSTEM_PROMPT_PREAMBLE);
+    prompt.push_str(prompt_preamble);
     prompt.push_str(&tool_catalog);
-    prompt.push_str(SYSTEM_PROMPT_SUFFIX);
+    prompt.push_str(prompt_suffix);
 
     let goals_summary = goals.goals_summary();
     if !goals_summary.is_empty() {

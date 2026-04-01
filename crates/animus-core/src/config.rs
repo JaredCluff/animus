@@ -63,6 +63,10 @@ pub struct AnimusConfig {
     /// Autonomous provider registration identity and timeouts.
     #[serde(default)]
     pub registration: RegistrationConfig,
+
+    /// MCP client configuration — external tool servers Animus connects to at startup.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +128,10 @@ pub struct NatsChannelConfig {
     /// For proper security, configure NATS server auth; this is an additional layer.
     #[serde(default = "NatsChannelConfig::default_trusted_prefixes")]
     pub trusted_subject_prefixes: Vec<String>,
+    /// Mirror inbound/outbound NATS messages to Telegram for debugging.
+    /// Override: ANIMUS_NATS_DEBUG=1
+    #[serde(default)]
+    pub debug_mirror: bool,
 }
 
 impl NatsChannelConfig {
@@ -140,6 +148,7 @@ impl Default for NatsChannelConfig {
             subjects: vec!["animus.in.>".to_string()],
             reply_prefix: "animus.out".to_string(),
             trusted_subject_prefixes: Self::default_trusted_prefixes(),
+            debug_mirror: false,
         }
     }
 }
@@ -653,16 +662,24 @@ pub struct VoiceConfig {
     /// Enable voice replies (text-to-speech via Cartesia).
     pub tts_enabled: bool,
 
-    // ── STT (macos-stt service) ──────────────────────────────────────────────
+    // ── STT providers ────────────────────────────────────────────────────────
 
-    /// Base URL of the macos-stt service (e.g. "http://127.0.0.1:7600").
+    /// Groq API key for Whisper STT (reuses GROQ_API_KEY). Never serialized.
+    #[serde(skip)]
+    pub groq_api_key: String,
+
+    /// Deepgram API key. Set via `ANIMUS_DEEPGRAM_KEY`; never serialized.
+    #[serde(skip)]
+    pub deepgram_api_key: String,
+
+    /// Base URL of the macOS STT service (e.g. "http://127.0.0.1:7600").
     pub stt_url: String,
 
-    /// Bearer key for the macos-stt service. Set via `ANIMUS_STT_KEY`; never serialized.
+    /// Bearer key for the macOS STT service. Set via `ANIMUS_STT_KEY`; never serialized.
     #[serde(skip)]
     pub stt_key: String,
 
-    // ── TTS (Cartesia) ───────────────────────────────────────────────────────
+    // ── TTS (Cartesia → espeak-ng fallback) ──────────────────────────────────
 
     /// Cartesia voice UUID.
     pub cartesia_voice_id: String,
@@ -680,6 +697,8 @@ impl Default for VoiceConfig {
         Self {
             enabled: false,
             tts_enabled: false,
+            groq_api_key: String::new(),
+            deepgram_api_key: String::new(),
             stt_url: "http://127.0.0.1:7600".to_string(),
             stt_key: String::new(),
             cartesia_voice_id: String::new(),
@@ -722,6 +741,46 @@ impl Default for FederationConfig {
 }
 
 // ---------------------------------------------------------------------------
+// MCP client configuration
+// ---------------------------------------------------------------------------
+
+/// Configuration for a single MCP server connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Unique name for this server (used as tool prefix: `name__toolname`).
+    pub name: String,
+    /// Whether this server is enabled.
+    pub enabled: bool,
+    /// Command to launch the server process.
+    pub command: String,
+    /// Arguments to pass to the server.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables to set for the server process.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// MCP client configuration — controls which MCP servers Animus connects to at startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// Enable MCP client integration.
+    pub enabled: bool,
+    /// List of MCP servers to connect to.
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            servers: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AnimusConfig impl
 // ---------------------------------------------------------------------------
 
@@ -745,6 +804,7 @@ impl Default for AnimusConfig {
             voice: VoiceConfig::default(),
             budget: BudgetConfig::default(),
             registration: RegistrationConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -884,6 +944,9 @@ impl AnimusConfig {
         if std::env::var("ANIMUS_NATS_DISABLED").is_ok() {
             self.channels.nats.enabled = false;
         }
+        if std::env::var("ANIMUS_NATS_DEBUG").map_or(false, |v| v == "1" || v == "true") {
+            self.channels.nats.debug_mirror = true;
+        }
         // Append extra subjects (comma-separated) without replacing defaults.
         // e.g. ANIMUS_NATS_EXTRA_SUBJECTS=claude.*.out.>
         if let Ok(extra) = std::env::var("ANIMUS_NATS_EXTRA_SUBJECTS") {
@@ -949,7 +1012,17 @@ impl AnimusConfig {
         if std::env::var("ANIMUS_VOICE_TTS_ENABLED").as_deref() == Ok("1") {
             self.voice.tts_enabled = true;
         }
-        // STT service connection
+        // STT providers
+        if let Ok(key) = std::env::var("GROQ_API_KEY") {
+            if !key.is_empty() {
+                self.voice.groq_api_key = key;
+            }
+        }
+        if let Ok(key) = std::env::var("ANIMUS_DEEPGRAM_KEY") {
+            if !key.is_empty() {
+                self.voice.deepgram_api_key = key;
+            }
+        }
         if let Ok(url) = std::env::var("ANIMUS_STT_URL") {
             if !url.is_empty() {
                 self.voice.stt_url = url;
