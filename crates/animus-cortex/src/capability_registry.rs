@@ -121,6 +121,7 @@ async fn probe_ollama_model(
         .as_deref()
         .and_then(parse_param_size_str);
 
+    let chat = is_chat_model_from_name(model);
     Some(ModelCapabilityProfile {
         provider: "ollama".to_string(),
         model_id: model.to_string(),
@@ -137,6 +138,8 @@ async fn probe_ollama_model(
         cost_per_mtok_output: Some(0.0),
         trust_score: 3,
         data_policy: DataPolicy::NoRetention,
+        is_chat_model: chat,
+        supports_tool_use: chat,
         profile_source: ProfileSource::OllamaProbed,
     })
 }
@@ -175,6 +178,7 @@ pub(crate) fn infer_profile(provider: &str, model: &str) -> ModelCapabilityProfi
         _            => (2,    DataPolicy::Unknown),
     };
 
+    let chat = is_chat_model_from_name(model);
     ModelCapabilityProfile {
         provider: provider.to_string(),
         model_id: model.to_string(),
@@ -191,6 +195,8 @@ pub(crate) fn infer_profile(provider: &str, model: &str) -> ModelCapabilityProfi
         cost_per_mtok_output: None,
         trust_score,
         data_policy,
+        is_chat_model: chat,
+        supports_tool_use: chat,
         profile_source: ProfileSource::Inferred,
     }
 }
@@ -210,6 +216,35 @@ pub(crate) fn extract_param_count_from_name(model: &str) -> Option<f32> {
         }
     }
     None
+}
+
+/// Detect whether a model is a chat/instruction-following model from its name.
+///
+/// Returns `false` for embedding, guard, reward, TTS, transcription, PII, and retriever models.
+/// These non-chat models fail with 422/400 when tools or chat messages are sent to them.
+pub(crate) fn is_chat_model_from_name(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    // Non-chat model name patterns — any match → not a chat model
+    if lower.contains("embed")
+        || lower.contains("bge-")
+        || lower.contains("whisper")
+        || lower.contains("orpheus")
+        || lower.contains("guard")
+        || lower.contains("safeguard")
+        || lower.contains("safety")
+        || lower.contains("-reward")
+        || lower.contains("reward-")
+        || lower.contains("pii")
+        || lower.contains("gliner")
+        || lower.contains("retriev")
+        || lower.contains("nemoretriever")
+        || lower.contains("tts")
+        || lower.contains("reranker")
+        || lower.contains("crossencoder")
+    {
+        return false;
+    }
+    true
 }
 
 /// Detect extended thinking support from model name.

@@ -9,17 +9,18 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::process::Command;
 use tracing::{info, warn};
 
 /// A discovered tool from an MCP server.
 #[derive(Debug, Clone)]
 pub struct McpDiscoveredTool {
-    pub prefixed_name: String,  // "servername__toolname"
-    pub description: String,
-    pub input_schema: serde_json::Value,
-    pub server_name: String,
-    pub original_name: String,
+    pub(crate) prefixed_name: String,  // "servername__toolname"
+    pub(crate) description: String,
+    pub(crate) input_schema: serde_json::Value,
+    pub(crate) server_name: String,
+    pub(crate) original_name: String,
 }
 
 /// rmcp service handle type alias
@@ -62,21 +63,36 @@ impl McpManager {
     }
 
     async fn connect_server(config: &McpServerConfig) -> Result<McpConnection> {
+        if config.command.is_empty() {
+            anyhow::bail!("MCP server '{}' has an empty command — check config", config.name);
+        }
+
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
         for (k, v) in &config.env {
             cmd.env(k, v);
         }
 
-        let service = ()
-            .serve(TokioChildProcess::new(cmd)
-                .context("Failed to create child process transport")?)
+        let handshake_timeout = std::time::Duration::from_secs(30);
+        let service = tokio::time::timeout(handshake_timeout, async {
+            ().serve(
+                TokioChildProcess::new(cmd)
+                    .context("Failed to create child process transport")?,
+            )
             .await
-            .context("MCP service init failed")?;
+            .context("MCP service init failed")
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!(
+            "MCP server '{}' handshake timed out after 30s", config.name
+        ))??;
 
-        let all_tools = service
-            .list_all_tools()
+        let list_timeout = std::time::Duration::from_secs(15);
+        let all_tools = tokio::time::timeout(list_timeout, service.list_all_tools())
             .await
+            .map_err(|_| anyhow::anyhow!(
+                "MCP server '{}' tool listing timed out after 15s", config.name
+            ))?
             .context("Failed to list tools")?;
 
         let mut discovered = Vec::new();
@@ -99,7 +115,6 @@ impl McpManager {
     pub fn take_tool_proxies(self) -> Vec<McpToolProxy> {
         let mut proxies = Vec::new();
         for (_server_name, conn) in self.connections {
-            use std::sync::Arc;
             let service = Arc::new(conn.service);
             for tool in conn.tools {
                 proxies.push(McpToolProxy {
@@ -114,8 +129,8 @@ impl McpManager {
 
 /// A proxy that implements Tool trait by calling a remote MCP tool.
 pub struct McpToolProxy {
-    pub tool: McpDiscoveredTool,
-    service: std::sync::Arc<McpService>,
+    pub(crate) tool: McpDiscoveredTool,
+    service: Arc<McpService>,
 }
 
 impl std::fmt::Debug for McpToolProxy {
@@ -149,12 +164,38 @@ impl crate::tools::Tool for McpToolProxy {
         let mut output = String::new();
         let is_error = result.is_error.unwrap_or(false);
         for content in &result.content {
-            if let rmcp::model::RawContent::Text(ref text) = content.raw {
-                if !output.is_empty() { output.push('\n'); }
-                output.push_str(&text.text);
-                if output.len() > 100_000 {
-                    output.push_str("\n[truncated at 100KB]");
-                    break;
+            match &content.raw {
+                rmcp::model::RawContent::Text(text) => {
+                    if !output.is_empty() { output.push('\n'); }
+                    output.push_str(&text.text);
+                    if output.len() > 100_000 {
+                        output.push_str("\n[truncated at 100KB]");
+                        break;
+                    }
+                }
+                rmcp::model::RawContent::Image(_) => {
+                    warn!("[MCP] Tool '{}' returned image content — not yet supported, skipping",
+                        self.tool.prefixed_name);
+                    if !output.is_empty() { output.push('\n'); }
+                    output.push_str("[image content not supported]");
+                }
+                rmcp::model::RawContent::Resource(_) => {
+                    warn!("[MCP] Tool '{}' returned embedded resource content — skipping",
+                        self.tool.prefixed_name);
+                    if !output.is_empty() { output.push('\n'); }
+                    output.push_str("[embedded resource content not supported]");
+                }
+                rmcp::model::RawContent::Audio(_) => {
+                    warn!("[MCP] Tool '{}' returned audio content — not yet supported, skipping",
+                        self.tool.prefixed_name);
+                    if !output.is_empty() { output.push('\n'); }
+                    output.push_str("[audio content not supported]");
+                }
+                rmcp::model::RawContent::ResourceLink(_) => {
+                    warn!("[MCP] Tool '{}' returned resource link — skipping",
+                        self.tool.prefixed_name);
+                    if !output.is_empty() { output.push('\n'); }
+                    output.push_str("[resource link content not supported]");
                 }
             }
         }

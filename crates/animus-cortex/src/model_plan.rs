@@ -19,6 +19,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
 
+/// Bump this when the plan schema gains new mandatory features.
+/// Plans with `plan_version < CURRENT_PLAN_VERSION` are rebuilt on startup.
+pub const CURRENT_PLAN_VERSION: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // ThinkLevel
 // ---------------------------------------------------------------------------
@@ -171,6 +175,10 @@ pub struct TaskClass {
     pub weight_cost: f32,
     #[serde(default)]
     pub latency_budget_ms: Option<u32>,
+    /// Tool groups available for this class. Empty = send all tools (legacy / ToolExecution).
+    /// See `tools::mod::tool_group()` for the group → tool mapping.
+    #[serde(default)]
+    pub tool_groups: Vec<String>,
 }
 
 fn default_weight_quality()   -> f32 { 0.5 }
@@ -209,6 +217,10 @@ pub struct ModelPlan {
     /// class_name → Route
     pub routes: HashMap<String, Route>,
     pub build_reason: String,
+    /// Format version — bump `CURRENT_PLAN_VERSION` when the schema gains new mandatory features.
+    /// Plans with an older version are rebuilt on startup so new fields (e.g. tool_groups) activate.
+    #[serde(default)]
+    pub plan_version: u32,
 }
 
 impl ModelPlan {
@@ -266,19 +278,34 @@ impl ModelPlan {
 
         for task_class in &task_classes {
             let weights = task_class.to_weights();
+            tracing::debug!(
+                class = %task_class.name,
+                "ModelPlan: scoring {} models (weights: quality={:.1} speed={:.1} reasoning={:.1} cost={:.1})",
+                available.len(), weights.weight_quality, weights.weight_speed, weights.weight_reasoning, weights.weight_cost
+            );
             let mut scored: Vec<(ModelSpec, f32)> = available
                 .iter()
                 .filter_map(|key| {
                     let (provider, model) = key.split_once(':')?;
                     let profile = registry.get(provider, model)?;
                     if profile.trust_score == 0 {
+                        tracing::debug!("ModelPlan: {key} excluded (trust_score=0)");
+                        return None;
+                    }
+                    if !profile.is_chat_model {
+                        tracing::debug!("ModelPlan: {key} excluded (is_chat_model=false)");
                         return None;
                     }
                     let score = ModelScorer::score(profile, &weights, &build_ctx);
                     if score == 0.0 {
+                        tracing::debug!("ModelPlan: {key} excluded (score=0.0)");
                         return None;
                     }
                     let think = think_level_for_profile(profile, task_class);
+                    tracing::debug!(
+                        "ModelPlan: {key} score={score:.3} think={think:?} cost={:?} params={:?}B",
+                        profile.cost_tier, profile.parameter_count_b
+                    );
                     Some((
                         ModelSpec {
                             provider: provider.to_string(),
@@ -295,6 +322,16 @@ impl ModelPlan {
                 .collect();
 
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            {
+                let ranked: Vec<String> = scored.iter()
+                    .map(|(s, score)| format!("{}:{} ({score:.3})", s.provider, s.model))
+                    .collect();
+                tracing::info!(
+                    class = %task_class.name,
+                    "ModelPlan: ranked [{}]",
+                    ranked.join(", ")
+                );
+            }
             let candidates: Vec<ModelSpec> = scored.into_iter().map(|(s, _)| s).collect();
 
             routes.insert(
@@ -314,6 +351,7 @@ impl ModelPlan {
             task_classes,
             routes,
             build_reason: "Deterministic capability scoring — zero LLM tokens".to_string(),
+            plan_version: CURRENT_PLAN_VERSION,
         }
     }
 
@@ -366,7 +404,11 @@ fn think_level_for_profile(
 // default_task_classes
 // ---------------------------------------------------------------------------
 
-/// Default task classes with calibrated routing weights.
+/// Default task classes with calibrated routing weights and tool group assignments.
+///
+/// `tool_groups` controls which tool subsets are sent to the model for each class.
+/// Smaller sets reduce context size, enabling local models with 32k context windows.
+/// An empty `tool_groups` vec means "send all tools" (ToolExecution only).
 pub fn default_task_classes() -> Vec<TaskClass> {
     vec![
         TaskClass {
@@ -376,6 +418,8 @@ pub fn default_task_classes() -> Vec<TaskClass> {
                            "okay".to_string(), "sure".to_string(), "what is".to_string()],
             weight_quality: 0.4, weight_speed: 0.6, weight_reasoning: 0.1,
             weight_cost: 0.4, latency_budget_ms: None,
+            // comms + web + federation = telegram_send, http_fetch, analyze_image, nats_publish + universals → ~7 tools
+            tool_groups: vec!["comms".to_string(), "web".to_string(), "federation".to_string()],
         },
         TaskClass {
             name: "Analytical".to_string(),
@@ -385,6 +429,9 @@ pub fn default_task_classes() -> Vec<TaskClass> {
                            "reason".to_string(), "think through".to_string()],
             weight_quality: 0.8, weight_speed: 0.1, weight_reasoning: 0.7,
             weight_cost: 0.2, latency_budget_ms: None,
+            // web + routing = http_fetch, analyze_image, get_route_stats, propose_route_amendment,
+            // get_classification_patterns, update_classification_pattern, get_capability_state + universals → ~10 tools
+            tool_groups: vec!["web".to_string(), "routing".to_string()],
         },
         TaskClass {
             name: "Technical".to_string(),
@@ -394,15 +441,27 @@ pub fn default_task_classes() -> Vec<TaskClass> {
                            "fix".to_string(), "build".to_string(), "refactor".to_string()],
             weight_quality: 0.7, weight_speed: 0.3, weight_reasoning: 0.5,
             weight_cost: 0.2, latency_budget_ms: None,
+            // filesystem + web + tasks = read_file, write_file, http_fetch, analyze_image,
+            // spawn_task, task_status, task_output, task_cancel + universals → ~11 tools
+            tool_groups: vec!["filesystem".to_string(), "web".to_string(), "tasks".to_string()],
         },
         TaskClass {
             name: "ToolExecution".to_string(),
             description: "Tasks requiring tool use, file operations, web access, memory search".to_string(),
             keywords: vec!["fetch".to_string(), "read file".to_string(), "write".to_string(),
                            "search".to_string(), "run".to_string(), "remember".to_string(),
-                           "store".to_string(), "retrieve".to_string()],
+                           "store".to_string(), "retrieve".to_string(),
+                           "send".to_string(), "publish".to_string(), "nats".to_string(),
+                           "forward".to_string(), "tell claude".to_string(), "notify".to_string(),
+                           "message to".to_string(), "deliver".to_string()],
             weight_quality: 0.5, weight_speed: 0.5, weight_reasoning: 0.2,
             weight_cost: 0.3, latency_budget_ms: None,
+            // All groups → full 31-tool set; ToolExecution explicitly requests heavy tool use
+            tool_groups: vec![
+                "comms".to_string(), "web".to_string(), "filesystem".to_string(),
+                "memory".to_string(), "tasks".to_string(), "routing".to_string(),
+                "federation".to_string(), "system".to_string(),
+            ],
         },
         TaskClass {
             name: "Voice".to_string(),
@@ -411,6 +470,8 @@ pub fn default_task_classes() -> Vec<TaskClass> {
                            "quickly".to_string(), "fast reply".to_string()],
             weight_quality: 0.2, weight_speed: 0.9, weight_reasoning: 0.0,
             weight_cost: 0.5, latency_budget_ms: Some(2_000),
+            // comms only → telegram_send + universals → ~4 tools; keep context tiny for latency
+            tool_groups: vec!["comms".to_string()],
         },
     ]
 }
@@ -603,6 +664,7 @@ mod tests {
             config_hash: "x".to_string(), task_classes: classes,
             routes: HashMap::new(),
             build_reason: "test".to_string(),
+            plan_version: 0,
         };
         let classifier = HeuristicClassifier::from_plan(&plan);
         let (class, conf) = classifier.classify("implement a rust function to parse JSON");

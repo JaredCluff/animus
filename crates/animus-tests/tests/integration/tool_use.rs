@@ -132,6 +132,7 @@ fn test_reasoning_output_with_tool_calls() {
         stop_reason: StopReason::ToolUse,
         engine_used: String::new(),
         fell_back: false,
+        failed_engines: vec![],
     };
     assert_eq!(output.stop_reason, StopReason::ToolUse);
     assert_eq!(output.tool_calls.len(), 1);

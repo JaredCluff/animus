@@ -61,15 +61,32 @@ impl Tool for NatsPublishTool {
             payload.to_string()
         };
 
-        match client.publish(subject.to_string(), wire_payload.as_bytes().to_vec().into()).await {
-            Ok(()) => Ok(ToolResult {
-                content: format!("Published to '{subject}': {}", &payload[..payload.len().min(200)]),
-                is_error: false,
-            }),
-            Err(e) => Ok(ToolResult {
+        if let Err(e) = client.publish(subject.to_string(), wire_payload.as_bytes().to_vec().into()).await {
+            return Ok(ToolResult {
                 content: format!("NATS publish to '{subject}' failed: {e}"),
                 is_error: true,
-            }),
+            });
         }
+        // Flush to ensure the message is actually sent (async_nats buffers writes)
+        if let Err(e) = client.flush().await {
+            return Ok(ToolResult {
+                content: format!("NATS flush after publish to '{subject}' failed: {e}"),
+                is_error: true,
+            });
+        }
+
+        tracing::info!(subject = %subject, payload_len = payload.len(), "nats_publish: published and flushed");
+
+        // Send debug mirror message so the main loop can forward to Telegram
+        if let Some(ref tx) = ctx.debug_mirror_tx {
+            let leaf = subject.rsplit('.').next().unwrap_or("?");
+            let preview = if payload.len() > 300 { &payload[..300] } else { payload };
+            let _ = tx.send(format!("[NATS-DBG] Animus→{leaf}: {preview}"));
+        }
+
+        Ok(ToolResult {
+            content: format!("Published to '{subject}': {}", &payload[..payload.len().min(200)]),
+            is_error: false,
+        })
     }
 }

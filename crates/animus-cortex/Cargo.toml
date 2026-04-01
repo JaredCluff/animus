@@ -24,6 +24,11 @@ async-nats = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+regex = { workspace = true }
+glob = { workspace = true }
+walkdir = { workspace = true }
+anyhow = { workspace = true }
+rmcp = { workspace = true }
 
 [dev-dependencies]
 animus-embed = { workspace = true }

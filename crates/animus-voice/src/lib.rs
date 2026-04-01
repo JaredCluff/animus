@@ -1,29 +1,38 @@
-//! Voice services for Animus.
+//! Voice services for Animus — multi-provider STT and TTS with automatic fallback.
 //!
-//! - **STT**: delegates to the `macos-stt` HTTP service (SFSpeechRecognizer on macOS).
-//! - **TTS**: Cartesia neural TTS, returning OGG Opus for Telegram inline voice player.
+//! # STT chain (in priority order)
+//! 1. **Groq Whisper** (`whisper-large-v3-turbo`) — fastest cloud option; reuses `GROQ_API_KEY`.
+//! 2. **Deepgram** (`nova-2`) — high-accuracy cloud STT; requires `ANIMUS_DEEPGRAM_KEY`.
+//! 3. **macOS STT** — local HTTP wrapper around SFSpeechRecognizer; requires `ANIMUS_STT_URL`.
 //!
-//! Both operations are handled by [`AnimusVoiceService`], which implements the
-//! [`VoiceService`] trait. The runtime holds an `Option<Arc<dyn VoiceService>>`
-//! and skips voice processing when `None`.
+//! # TTS chain (in priority order)
+//! 1. **Cartesia** (`sonic-2`) — highest-quality neural TTS; requires `ANIMUS_CARTESIA_KEY`.
+//! 2. **espeak-ng** — always available in the container; no config required; robotic but reliable.
+//!
+//! Each provider is tried in order. On failure the next is attempted and a WARN is logged.
+//! This means voice always works as long as at least one provider in each chain is reachable.
 
 use animus_core::{config::VoiceConfig, error::{AnimusError, Result}};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
+mod stt;
+mod tts;
+
+use stt::{DeepgramStt, GroqStt, MacosStt, SttProvider};
+use tts::{CartesiaTts, EspeakTts, TtsProvider};
+
 // ---------------------------------------------------------------------------
-// Trait
+// Public trait — unchanged; runtime holds Arc<dyn VoiceService>
 // ---------------------------------------------------------------------------
 
-/// Abstracts speech-to-text and text-to-speech for the Animus runtime.
 #[async_trait]
 pub trait VoiceService: Send + Sync {
-    /// Transcribe an audio file to text by calling the macos-stt service.
+    /// Transcribe an audio file to text. Tries providers in chain order.
     async fn transcribe(&self, audio_path: &Path) -> Result<String>;
 
-    /// Synthesize text to an OGG Opus audio file via Cartesia.
-    /// Returns the path to a temporary file. The caller (TelegramChannel) is
-    /// responsible for deleting it after the upload completes.
+    /// Synthesize text to an OGG Opus file. Tries providers in chain order.
+    /// Returns a temp file path; the caller is responsible for deleting it after use.
     async fn synthesize(&self, text: &str) -> Result<PathBuf>;
 }
 
@@ -31,19 +40,9 @@ pub trait VoiceService: Send + Sync {
 // AnimusVoiceService
 // ---------------------------------------------------------------------------
 
-/// Unified voice service: STT via `macos-stt` HTTP + TTS via Cartesia.
 pub struct AnimusVoiceService {
-    /// Base URL of the macos-stt service, e.g. "http://127.0.0.1:7600".
-    stt_url: String,
-    /// Bearer key for the macos-stt service.
-    stt_key: String,
-    /// Cartesia API key.
-    cartesia_api_key: String,
-    /// Cartesia voice UUID.
-    cartesia_voice_id: String,
-    /// Cartesia model ID ("sonic-2").
-    cartesia_model: String,
-    http: reqwest::Client,
+    stt_chain: Vec<Box<dyn SttProvider>>,
+    tts_chain: Vec<Box<dyn TtsProvider>>,
 }
 
 impl AnimusVoiceService {
@@ -51,143 +50,90 @@ impl AnimusVoiceService {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()
-            .map_err(|e| AnimusError::Llm(format!("voice: failed to build HTTP client: {e}")))?;
-        Ok(Self {
-            stt_url: config.stt_url.trim_end_matches('/').to_string(),
-            stt_key: config.stt_key.clone(),
-            cartesia_api_key: config.cartesia_api_key.clone(),
-            cartesia_voice_id: config.cartesia_voice_id.clone(),
-            cartesia_model: config.cartesia_model.clone(),
-            http,
-        })
+            .map_err(|e| AnimusError::Voice(format!("voice: HTTP client: {e}")))?;
+
+        // ── STT chain ────────────────────────────────────────────────────────
+        let mut stt_chain: Vec<Box<dyn SttProvider>> = Vec::new();
+
+        if !config.groq_api_key.is_empty() {
+            stt_chain.push(Box::new(GroqStt::new(config.groq_api_key.clone(), http.clone())));
+        }
+        if !config.deepgram_api_key.is_empty() {
+            stt_chain.push(Box::new(DeepgramStt::new(config.deepgram_api_key.clone(), http.clone())));
+        }
+        if !config.stt_url.is_empty() {
+            stt_chain.push(Box::new(MacosStt::new(
+                config.stt_url.clone(),
+                config.stt_key.clone(),
+                http.clone(),
+            )));
+        }
+
+        if stt_chain.is_empty() {
+            return Err(AnimusError::Voice(
+                "voice: no STT providers configured — set GROQ_API_KEY, ANIMUS_DEEPGRAM_KEY, or ANIMUS_STT_URL".to_string(),
+            ));
+        }
+
+        // ── TTS chain ────────────────────────────────────────────────────────
+        let mut tts_chain: Vec<Box<dyn TtsProvider>> = Vec::new();
+
+        if !config.cartesia_api_key.is_empty() && !config.cartesia_voice_id.is_empty() {
+            tts_chain.push(Box::new(CartesiaTts::new(
+                config.cartesia_api_key.clone(),
+                config.cartesia_voice_id.clone(),
+                config.cartesia_model.clone(),
+                http.clone(),
+            )));
+        }
+        // espeak-ng is always last — no config required, always in container
+        tts_chain.push(Box::new(EspeakTts));
+
+        let stt_names: Vec<&str> = stt_chain.iter().map(|p| p.name()).collect();
+        let tts_names: Vec<&str> = tts_chain.iter().map(|p| p.name()).collect();
+        tracing::info!(
+            stt = %stt_names.join(" → "),
+            tts = %tts_names.join(" → "),
+            "Voice service initialized"
+        );
+
+        Ok(Self { stt_chain, tts_chain })
     }
 }
 
 #[async_trait]
 impl VoiceService for AnimusVoiceService {
     async fn transcribe(&self, audio_path: &Path) -> Result<String> {
-        let bytes = tokio::fs::read(audio_path)
-            .await
-            .map_err(|e| AnimusError::Llm(format!("voice: failed to read audio file: {e}")))?;
-
-        let filename = audio_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("voice.ogg")
-            .to_string();
-
-        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-            .file_name(filename.clone())
-            .mime_str("application/octet-stream")
-            .map_err(|e| AnimusError::Llm(format!("voice: MIME error: {e}")))?;
-
-        let form = reqwest::multipart::Form::new().part("audio", part);
-
-        let resp = self
-            .http
-            .post(format!("{}/transcribe", self.stt_url))
-            .header("Authorization", format!("Bearer {}", self.stt_key))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| AnimusError::Llm(format!("voice: STT service unreachable: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AnimusError::Llm(format!(
-                "voice: STT service error {status}: {body}"
-            )));
+        let mut last_err = AnimusError::Voice("no STT providers configured".to_string());
+        for provider in &self.stt_chain {
+            match provider.transcribe(audio_path).await {
+                Ok(text) => {
+                    tracing::debug!(provider = provider.name(), chars = text.len(), "STT success");
+                    return Ok(text);
+                }
+                Err(e) => {
+                    tracing::warn!(provider = provider.name(), error = %e, "STT provider failed, trying next");
+                    last_err = e;
+                }
+            }
         }
-
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| AnimusError::Llm(format!("voice: STT response parse failed: {e}")))?;
-
-        json["transcript"]
-            .as_str()
-            .ok_or_else(|| AnimusError::Llm(format!("voice: unexpected STT response: {json}")))
-            .map(|s| s.to_string())
+        Err(last_err)
     }
 
     async fn synthesize(&self, text: &str) -> Result<PathBuf> {
-        if self.cartesia_api_key.is_empty() {
-            return Err(AnimusError::Llm(
-                "voice: Cartesia API key not configured (set ANIMUS_CARTESIA_KEY)".to_string(),
-            ));
+        let mut last_err = AnimusError::Voice("no TTS providers configured".to_string());
+        for provider in &self.tts_chain {
+            match provider.synthesize(text).await {
+                Ok(path) => {
+                    tracing::debug!(provider = provider.name(), path = %path.display(), "TTS success");
+                    return Ok(path);
+                }
+                Err(e) => {
+                    tracing::warn!(provider = provider.name(), error = %e, "TTS provider failed, trying next");
+                    last_err = e;
+                }
+            }
         }
-        if self.cartesia_voice_id.is_empty() {
-            return Err(AnimusError::Llm(
-                "voice: Cartesia voice ID not configured (set voice.cartesia_voice_id in config)".to_string(),
-            ));
-        }
-
-        // Cartesia does not support OGG output; request MP3 and convert via ffmpeg.
-        let body = serde_json::json!({
-            "model_id": self.cartesia_model,
-            "transcript": text,
-            "voice": {
-                "mode": "id",
-                "id": self.cartesia_voice_id,
-            },
-            "output_format": {
-                "container": "mp3",
-                "bit_rate": 128000,
-                "sample_rate": 44100,
-            },
-        });
-
-        let resp = self
-            .http
-            .post("https://api.cartesia.ai/tts/bytes")
-            .header("X-API-Key", &self.cartesia_api_key)
-            .header("Cartesia-Version", "2024-06-10")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AnimusError::Llm(format!("voice: Cartesia request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err_body = resp.text().await.unwrap_or_default();
-            return Err(AnimusError::Llm(format!(
-                "voice: Cartesia error {status}: {err_body}"
-            )));
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| AnimusError::Llm(format!("voice: Cartesia read failed: {e}")))?;
-
-        let id = uuid::Uuid::new_v4();
-        let mp3_path = std::env::temp_dir().join(format!("animus_tts_{id}.mp3"));
-        let ogg_path = std::env::temp_dir().join(format!("animus_tts_{id}.ogg"));
-
-        tokio::fs::write(&mp3_path, &bytes)
-            .await
-            .map_err(|e| AnimusError::Llm(format!("voice: failed to write MP3: {e}")))?;
-
-        // Convert MP3 → OGG Opus so Telegram routes to sendVoice (inline player).
-        let status = tokio::process::Command::new("ffmpeg")
-            .args([
-                "-y", "-i", mp3_path.to_str().unwrap_or(""),
-                "-c:a", "libopus", "-b:a", "32k",
-                ogg_path.to_str().unwrap_or(""),
-            ])
-            .output()
-            .await
-            .map_err(|e| AnimusError::Llm(format!("voice: ffmpeg not found: {e}")))?;
-
-        let _ = tokio::fs::remove_file(&mp3_path).await;
-
-        if !status.status.success() {
-            let stderr = String::from_utf8_lossy(&status.stderr);
-            return Err(AnimusError::Llm(format!("voice: ffmpeg conversion failed: {stderr}")));
-        }
-
-        tracing::debug!(chars = text.len(), path = %ogg_path.display(), "Cartesia TTS synthesized");
-        Ok(ogg_path)
+        Err(last_err)
     }
 }

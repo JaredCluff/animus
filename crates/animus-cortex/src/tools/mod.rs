@@ -24,6 +24,8 @@ pub mod claude_instances;
 pub mod federate_segment;
 // Provider registration tool — registers new LLM API providers into providers.json
 pub mod register_provider;
+// Provider filter tool — sets per-provider model allow lists in provider_filters.json
+pub mod set_provider_filter;
 // Introspective tools — AILF reasoning thread reaches into the Cortex substrate
 pub mod get_route_stats;
 pub mod propose_route_amendment;
@@ -31,6 +33,8 @@ pub mod get_classification_patterns;
 pub mod update_classification_pattern;
 pub mod get_capability_state;
 pub mod get_mesh_roles;
+pub mod glob_search;
+pub mod grep_search;
 
 use crate::llm::ToolDefinition;
 use crate::task_manager::TaskManager;
@@ -90,6 +94,9 @@ pub struct ToolContext {
     pub budget_state: Option<Arc<parking_lot::RwLock<animus_core::BudgetState>>>,
     /// Budget config — thresholds for pressure tier computation.
     pub budget_config: Option<animus_core::BudgetConfig>,
+    /// Debug mirror channel — tools that perform outbound actions (e.g. nats_publish)
+    /// send human-readable debug messages here. The main loop forwards them to Telegram.
+    pub debug_mirror_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// A tool the AILF can use to interact with the world.
@@ -139,6 +146,30 @@ impl ToolRegistry {
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
+            .map(|t| ToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.parameters_schema(),
+            })
+            .collect()
+    }
+
+    /// Return definitions for tools whose group is in `groups`, plus universal tools (empty group).
+    ///
+    /// If `groups` is empty, returns all definitions (backward-compatible fallback).
+    /// Universal tools (those with an empty group in `tool_group()`) are always included.
+    pub fn definitions_for_groups(&self, groups: &[&str]) -> Vec<ToolDefinition> {
+        if groups.is_empty() {
+            return self.definitions();
+        }
+        self.tools
+            .iter()
+            .filter(|t| {
+                let tg = tool_group(t.name());
+                // Universal (empty group) → always include
+                // Otherwise → include if at least one of the tool's groups is requested
+                tg.is_empty() || tg.iter().any(|g| groups.contains(g))
+            })
             .map(|t| ToolDefinition {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -227,6 +258,71 @@ fn format_params_for_prompt(schema: &serde_json::Value) -> String {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Centralized tool → group mapping.
+///
+/// Returns the group(s) a tool belongs to. An empty slice means the tool is
+/// "universal" — it is included in every task class regardless of `tool_groups`.
+///
+/// Groups: `comms`, `web`, `filesystem`, `memory`, `tasks`, `routing`, `federation`, `system`
+pub fn tool_group(name: &str) -> &'static [&'static str] {
+    match name {
+        // Universal — always sent regardless of task class
+        "remember"          => &[],
+        "list_segments"     => &[],
+        "send_signal"       => &[],
+
+        // comms — communication / notification
+        "telegram_send"     => &["comms"],
+
+        // web — external data retrieval
+        "http_fetch"        => &["web"],
+        "analyze_image"     => &["web"],
+
+        // filesystem — local file I/O
+        "read_file"         => &["filesystem"],
+        "write_file"        => &["filesystem"],
+        "glob_search"       => &["filesystem"],
+        "grep_search"       => &["filesystem"],
+
+        // memory — VectorFS segment management
+        "update_segment"    => &["memory"],
+        "delete_segment"    => &["memory"],
+        "prune_segments"    => &["memory"],
+        "snapshot_memory"   => &["memory"],
+        "list_snapshots"    => &["memory"],
+        "restore_snapshot"  => &["memory"],
+
+        // tasks — background process management
+        "spawn_task"        => &["tasks"],
+        "task_status"       => &["tasks"],
+        "task_output"       => &["tasks"],
+        "task_cancel"       => &["tasks"],
+
+        // routing — introspective model-routing tools
+        "get_route_stats"              => &["routing"],
+        "propose_route_amendment"      => &["routing"],
+        "get_classification_patterns"  => &["routing"],
+        "update_classification_pattern"=> &["routing"],
+        "get_capability_state"         => &["routing"],
+
+        // federation — multi-instance / mesh tools
+        "nats_publish"      => &["federation"],
+        "claude_instances"  => &["federation"],
+        "federate_segment"  => &["federation"],
+        "get_mesh_roles"    => &["federation"],
+
+        // system — operational / administrative
+        "shell_exec"        => &["system"],
+        "set_autonomy"      => &["system"],
+        "manage_watcher"    => &["system"],
+        "register_provider"   => &["system"],
+        "set_provider_filter" => &["system"],
+
+        // Unknown tools are treated as universal (safe default — never silently excluded)
+        _ => &[],
     }
 }
 
