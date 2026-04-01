@@ -4,6 +4,7 @@ pub mod engine_registry;
 pub mod model_plan;
 pub mod smart_router;
 pub mod situational_awareness;
+pub mod mcp;
 pub mod task_manager;
 pub mod watcher;
 pub mod watchers;

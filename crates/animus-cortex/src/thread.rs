@@ -269,11 +269,29 @@ impl<S: VectorStore> ReasoningThread<S> {
         };
 
         // Try each engine in order; fall back on retryable errors
+        {
+            let engine_names: Vec<&str> = engines.iter().map(|e| e.model_name()).collect();
+            tracing::info!(
+                thread = %self.id,
+                engine_count = engines.len(),
+                "process_turn_with_engines: trying [{}]",
+                engine_names.join(" → ")
+            );
+        }
         let mut last_err: Option<animus_core::AnimusError> = None;
+        let mut failed_engine_names: Vec<String> = Vec::new();
         for (engine_index, engine) in engines.iter().enumerate() {
             let engine = *engine;
+            tracing::debug!(
+                thread = %self.id,
+                engine = engine.model_name(),
+                index = engine_index,
+                "process_turn_with_engines: attempting engine"
+            );
+            let think_suppressed = engine.supports_think_control() && !Self::needs_thinking(user_input);
             let engine_conversation: std::borrow::Cow<[Turn]> =
-                if engine.supports_think_control() && !Self::needs_thinking(user_input) {
+                if think_suppressed {
+                    tracing::debug!(engine = engine.model_name(), "Suppressing thinking (/no_think) — input is short/simple");
                     let mut turns = self.conversation.clone();
                     if let Some(last) = turns.last_mut() {
                         if last.role == Role::User {
@@ -293,6 +311,7 @@ impl<S: VectorStore> ReasoningThread<S> {
                     // Tag output with which engine responded and whether it was a fallback.
                     output.engine_used = engine.model_name().to_string();
                     output.fell_back = engine_index > 0;
+                    output.failed_engines = failed_engine_names;
                     // Post-success bookkeeping (same as process_turn)
                     let anchor_set: std::collections::HashSet<_> = self.stored_turn_ids.iter().copied().collect();
                     self.last_retrieved_ids = context.segments.iter()
@@ -319,12 +338,24 @@ impl<S: VectorStore> ReasoningThread<S> {
                         "Engine '{}' unavailable (retryable): {e} — trying next fallback",
                         engine.model_name()
                     );
+                    failed_engine_names.push(engine.model_name().to_string());
                     last_err = Some(e);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        engine = engine.model_name(),
+                        "Engine failed (non-retryable): {e}"
+                    );
+                    return Err(e);
+                }
             }
         }
 
+        tracing::error!(
+            thread = %self.id,
+            engines_tried = engines.len(),
+            "All engines exhausted — no successful response"
+        );
         Err(last_err.unwrap_or_else(|| animus_core::AnimusError::Llm("no engines available".to_string())))
     }
 
@@ -450,10 +481,48 @@ impl<S: VectorStore> ReasoningThread<S> {
 }
 
 /// Returns true if the error is transient and a fallback engine should be tried.
+///
+/// Includes rate limits (429), service unavailable (503), AND model-not-found /
+/// auth errors — because the cascade should keep trying other engines rather
+/// than returning a hard failure to the user when healthy engines remain.
 pub fn is_retryable_error(err: &animus_core::AnimusError) -> bool {
-    matches!(
-        err,
+    match err {
         animus_core::AnimusError::LlmRateLimited(_)
-            | animus_core::AnimusError::LlmServiceUnavailable(_)
-    )
+        | animus_core::AnimusError::LlmServiceUnavailable(_) => true,
+        animus_core::AnimusError::Llm(msg) => {
+            // Model not found, auth failures, and other provider-specific errors
+            // should cascade to the next engine rather than killing the whole turn.
+            msg.contains("404")
+                || msg.contains("not_found")
+                || msg.contains("does not exist")
+                || msg.contains("401")
+                || msg.contains("403")
+                || msg.contains("Unauthorized")
+                || msg.contains("invalid_api_key")
+                // Network/connection failures — endpoint unreachable, cascade to next engine
+                || msg.contains("error sending request")
+                || msg.contains("connection refused")
+                || msg.contains("connect error")
+                || msg.contains("dns error")
+                || msg.contains("connection reset")
+                // 422 = unsupported parameter for this model (e.g. tools sent to a non-chat model)
+                || msg.contains("422")
+                || msg.contains("extra_forbidden")
+                || msg.contains("Unknown parameter")
+                // Context length exceeded — model can't handle our input size, try next
+                || msg.contains("context_length_exceeded")
+                || msg.contains("context window")
+                || msg.contains("reduce the length")
+                // 400: tool choice not supported without special server flags (vLLM/Ollama-served models)
+                || msg.contains("tool choice requires")
+                || msg.contains("enable-auto-tool-choice")
+                || msg.contains("tool-call-parser")
+                // 400: billing/quota exhausted — treat as provider unavailable, cascade to next
+                || msg.contains("credit balance")
+                || msg.contains("too low")
+                || msg.contains("quota")
+                || msg.contains("billing")
+        }
+        _ => false,
+    }
 }

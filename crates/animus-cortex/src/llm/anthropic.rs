@@ -517,6 +517,7 @@ impl ReasoningEngine for AnthropicEngine {
             stop_reason,
             engine_used: self.model_name().to_string(),
             fell_back: false,
+            failed_engines: vec![],
         })
     }
 

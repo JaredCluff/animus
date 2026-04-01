@@ -149,6 +149,7 @@ pub fn known_model_profiles() -> HashMap<String, ModelCapabilityProfile> {
         rate_limit_rpm_ceiling: Some(50), rate_limit_tpd_ceiling: Some(5_000_000),
         cost_tier: CostTier::Expensive, cost_per_mtok_input: Some(15.0), cost_per_mtok_output: Some(75.0),
         trust_score: 3, data_policy: DataPolicy::NoRetention,
+        is_chat_model: true, supports_tool_use: true,
         profile_source: ProfileSource::StaticRegistry,
     });
     add!("anthropic:claude-sonnet-4-6", ModelCapabilityProfile {
@@ -161,6 +162,7 @@ pub fn known_model_profiles() -> HashMap<String, ModelCapabilityProfile> {
         rate_limit_rpm_ceiling: Some(50), rate_limit_tpd_ceiling: Some(10_000_000),
         cost_tier: CostTier::Moderate, cost_per_mtok_input: Some(3.0), cost_per_mtok_output: Some(15.0),
         trust_score: 3, data_policy: DataPolicy::NoRetention,
+        is_chat_model: true, supports_tool_use: true,
         profile_source: ProfileSource::StaticRegistry,
     });
     add!("anthropic:claude-haiku-4-5-20251001", ModelCapabilityProfile {
@@ -173,6 +175,7 @@ pub fn known_model_profiles() -> HashMap<String, ModelCapabilityProfile> {
         rate_limit_rpm_ceiling: Some(50), rate_limit_tpd_ceiling: Some(25_000_000),
         cost_tier: CostTier::Cheap, cost_per_mtok_input: Some(0.8), cost_per_mtok_output: Some(4.0),
         trust_score: 3, data_policy: DataPolicy::NoRetention,
+        is_chat_model: true, supports_tool_use: true,
         profile_source: ProfileSource::StaticRegistry,
     });
 
@@ -187,6 +190,7 @@ pub fn known_model_profiles() -> HashMap<String, ModelCapabilityProfile> {
         rate_limit_rpm_ceiling: Some(30), rate_limit_tpd_ceiling: Some(1_000_000),
         cost_tier: CostTier::Free, cost_per_mtok_input: Some(0.0), cost_per_mtok_output: Some(0.0),
         trust_score: 3, data_policy: DataPolicy::ShortWindow,
+        is_chat_model: true, supports_tool_use: true,
         profile_source: ProfileSource::StaticRegistry,
     });
     add!("cerebras:llama3.3-70b", ModelCapabilityProfile {
@@ -199,6 +203,7 @@ pub fn known_model_profiles() -> HashMap<String, ModelCapabilityProfile> {
         rate_limit_rpm_ceiling: Some(30), rate_limit_tpd_ceiling: Some(1_000_000),
         cost_tier: CostTier::Free, cost_per_mtok_input: Some(0.0), cost_per_mtok_output: Some(0.0),
         trust_score: 3, data_policy: DataPolicy::ShortWindow,
+        is_chat_model: true, supports_tool_use: true,
         profile_source: ProfileSource::StaticRegistry,
     });
     // Qwen3.5-32b on Cerebras: speed AND extended thinking
@@ -212,6 +217,7 @@ pub fn known_model_profiles() -> HashMap<String, ModelCapabilityProfile> {
         rate_limit_rpm_ceiling: Some(30), rate_limit_tpd_ceiling: Some(1_000_000),
         cost_tier: CostTier::Free, cost_per_mtok_input: Some(0.0), cost_per_mtok_output: Some(0.0),
         trust_score: 3, data_policy: DataPolicy::ShortWindow,
+        is_chat_model: true, supports_tool_use: true,
         profile_source: ProfileSource::StaticRegistry,
     });
 
@@ -226,6 +232,7 @@ pub fn known_model_profiles() -> HashMap<String, ModelCapabilityProfile> {
         rate_limit_rpm_ceiling: Some(30), rate_limit_tpd_ceiling: Some(500_000),
         cost_tier: CostTier::Free, cost_per_mtok_input: Some(0.0), cost_per_mtok_output: Some(0.0),
         trust_score: 3, data_policy: DataPolicy::ShortWindow,
+        is_chat_model: true, supports_tool_use: true,
         profile_source: ProfileSource::StaticRegistry,
     });
     add!("groq:llama3.3-70b-versatile", ModelCapabilityProfile {
@@ -238,6 +245,7 @@ pub fn known_model_profiles() -> HashMap<String, ModelCapabilityProfile> {
         rate_limit_rpm_ceiling: Some(30), rate_limit_tpd_ceiling: Some(100_000),
         cost_tier: CostTier::Free, cost_per_mtok_input: Some(0.0), cost_per_mtok_output: Some(0.0),
         trust_score: 3, data_policy: DataPolicy::ShortWindow,
+        is_chat_model: true, supports_tool_use: true,
         profile_source: ProfileSource::StaticRegistry,
     });
 

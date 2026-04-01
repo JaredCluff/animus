@@ -18,6 +18,7 @@ animus-sensorium = { workspace = true }
 animus-federation = { workspace = true }
 animus-channel = { workspace = true }
 animus-voice = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -33,3 +34,7 @@ toml = { workspace = true }
 async-nats = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
 hostname = "0.3"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }

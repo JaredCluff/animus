@@ -36,6 +36,11 @@ use parking_lot::Mutex;
 /// Threshold: confidence below this triggers Perception engine classification.
 const HEURISTIC_CONFIDENCE_THRESHOLD: f32 = 0.5;
 
+/// Minimum confidence required to use the classified task class for tool selection.
+/// Below this threshold we fall back to "Conversational" (fewest tools, smallest context).
+/// This prevents a coin-flip classification from loading 11 tools when 6 would do.
+const CLASS_CONFIDENCE_FLOOR: f32 = 0.65;
+
 /// Consecutive failures before marking a route as degraded.
 const DEGRADATION_THRESHOLD: u32 = 3;
 
@@ -149,9 +154,41 @@ impl SmartRouter {
         *classifier = new_classifier;
     }
 
+    /// Return the `tool_groups` configured for a task class.
+    /// Empty vec means "use all tools" (class not found, or no groups configured).
+    pub async fn tool_groups_for_class(&self, class_name: &str) -> Vec<String> {
+        let plan = self.plan.read().await;
+        if let Some(tc) = plan.task_classes.iter().find(|tc| tc.name == class_name) {
+            return tc.tool_groups.clone();
+        }
+        vec![]
+    }
+
     /// Classify input using heuristics only (no LLM). Returns (class_name, confidence).
+    ///
+    /// If confidence is below `CLASS_CONFIDENCE_FLOOR`, the class is coerced to
+    /// "Conversational" so tool selection uses the smallest tool set rather than
+    /// guessing a heavier class from a coin-flip.
     pub async fn classify_heuristic(&self, input: &str) -> (String, f32) {
-        self.classifier.read().await.classify(input)
+        let (raw_class, confidence) = self.classifier.read().await.classify(input);
+        let class_name = if confidence < CLASS_CONFIDENCE_FLOOR && raw_class != "Conversational" {
+            tracing::debug!(
+                raw_class = %raw_class,
+                confidence = format!("{confidence:.2}"),
+                "SmartRouter: low-confidence class — coercing to Conversational"
+            );
+            "Conversational".to_string()
+        } else {
+            raw_class
+        };
+        let preview = &input[..input.len().min(60)];
+        tracing::info!(
+            class = %class_name,
+            confidence = format!("{confidence:.2}"),
+            input_preview = preview,
+            "SmartRouter: classified input"
+        );
+        (class_name, confidence)
     }
 
     /// Select the best available `ModelSpec` for an input using heuristics.
@@ -161,6 +198,12 @@ impl SmartRouter {
         let (class_name, confidence) = self.classify_heuristic(input).await;
         let needs_escalation = confidence < HEURISTIC_CONFIDENCE_THRESHOLD;
         let decision = self.select_for_class(&class_name, pressure).await;
+        tracing::info!(
+            class = %class_name,
+            selected = format!("{}:{}", decision.model_spec.provider, decision.model_spec.model),
+            escalation = needs_escalation,
+            "SmartRouter: route decision"
+        );
         (decision, needs_escalation)
     }
 
@@ -263,6 +306,8 @@ impl SmartRouter {
                     cost_per_mtok_input: None, cost_per_mtok_output: None,
                     trust_score: 2,
                     data_policy: animus_core::provider_meta::DataPolicy::Unknown,
+                    is_chat_model: true,
+                    supports_tool_use: true,
                     profile_source: animus_core::model_capability::ProfileSource::Inferred,
                 },
                 pressure,
@@ -281,6 +326,11 @@ impl SmartRouter {
                 raw_score
             }) * health_w;
 
+            tracing::debug!(
+                "select_for_class: {}:{} — raw={raw_score:.3} health={health_w:.2} near_limit={near_limit} remaining={remaining_pct:.2} → final={score:.3}",
+                spec.provider, spec.model
+            );
+
             if score > 0.0 {
                 match &best {
                     None => best = Some((idx, spec.clone(), score)),
@@ -295,10 +345,14 @@ impl SmartRouter {
         let emergency_spec = route.candidates.first().cloned();
         drop(plan);
 
-        if let Some((idx, spec, _)) = best {
+        if let Some((idx, ref spec, score)) = best {
+            tracing::info!(
+                "select_for_class: winner for '{class_name}' → {}:{} (idx={idx}, score={score:.3})",
+                spec.provider, spec.model
+            );
             return RouteDecision {
                 class_name: class_name.to_string(),
-                model_spec: spec,
+                model_spec: spec.clone(),
                 fallback_index: idx,
             };
         }
@@ -593,40 +647,163 @@ impl SmartRouter {
         ))
     }
 
-    /// Returns ALL candidates (primary + fallbacks) that pass static constraints, in priority order.
-    /// Used by the runtime to try each in sequence on transient failures (rate limits, 503s).
+    /// Select a short, tiered cascade for the given input.
+    ///
+    /// Replaces `route_all_candidates`. Instead of returning every passing candidate
+    /// (often 60+), this groups the plan's candidates by `ModelTier` and picks at most
+    /// `MAX_PER_TIER` engines from each preferred tier — giving a cascade of 3–5 engines
+    /// where every engine is already known-healthy at decision time.
+    ///
+    /// # Tier preference by task class
+    /// | Class          | Normal        | Careful       | Emergency  |
+    /// |----------------|---------------|---------------|------------|
+    /// | Conversational | Tier2→3→4     | Tier2→3→4     | Tier3→4    |
+    /// | Analytical     | Tier1→2→3     | Tier2→3→4     | Tier3→4    |
+    /// | Technical      | Tier1→2→3     | Tier2→3→4     | Tier3→4    |
+    /// | ToolExecution  | Tier1→2→3     | Tier2→3→4     | Tier3→4    |
+    /// | Voice          | Tier2→4       | Tier2→4       | Tier4      |
+    /// | Critical sens. | Tier4 only    | Tier4 only    | Tier4 only |
+    pub async fn select_cascade(
+        &self,
+        input: &str,
+        pressure: BudgetPressure,
+        sensitivity: ContentSensitivity,
+    ) -> Vec<RouteDecision> {
+        use animus_core::model_tier::tier_from_profile;
+
+        let (class_name, _confidence) = self.classify_heuristic(input).await;
+        let tier_order = tier_preference(&class_name, pressure, sensitivity);
+        let required_floor = sensitivity.required_trust_floor();
+
+        // How many engines to take from each tier and in total.
+        const MAX_PER_TIER: usize = 2;
+        const MAX_TOTAL: usize = 5;
+
+        let plan = self.plan.read().await;
+        let route = match plan.routes.get(&class_name).or_else(|| plan.routes.values().next()) {
+            Some(r) => r,
+            None => {
+                tracing::warn!("select_cascade: no route for class '{class_name}' — returning empty");
+                return vec![];
+            }
+        };
+
+        // Build per-tier buckets from the plan's already-scored candidate list.
+        // The plan's candidates are pre-sorted by capability score (desc), so within-tier
+        // ordering is preserved without re-scoring.
+        let mut buckets: std::collections::HashMap<animus_core::ModelTier, Vec<(usize, &crate::model_plan::ModelSpec)>> =
+            std::collections::HashMap::new();
+
+        for (idx, spec) in route.candidates.iter().enumerate() {
+            // Skip immediately if not passing static constraints
+            if self.is_prohibited(&spec.provider) { continue; }
+            if sensitivity == ContentSensitivity::Critical && !Self::is_local_provider(&spec.provider) { continue; }
+            if !self.passes_trust(spec, required_floor) { continue; }
+            if !Self::passes_budget(spec, pressure) { continue; }
+            if !self.is_engine_healthy(spec) { continue; }
+
+            // Assign tier from capability profile; fall back to Tier3 if unknown
+            let tier = self.capability_registry
+                .get(&spec.provider, &spec.model)
+                .map(tier_from_profile)
+                .unwrap_or(animus_core::ModelTier::Tier3);
+
+            buckets.entry(tier).or_default().push((idx, spec));
+        }
+
+        // Assemble cascade: take MAX_PER_TIER from each preferred tier in order
+        let mut results: Vec<RouteDecision> = Vec::with_capacity(MAX_TOTAL);
+        for tier in &tier_order {
+            if results.len() >= MAX_TOTAL { break; }
+            if let Some(candidates) = buckets.get(tier) {
+                let take = (MAX_TOTAL - results.len()).min(MAX_PER_TIER);
+                for (fallback_index, spec) in candidates.iter().take(take) {
+                    results.push(RouteDecision {
+                        class_name: class_name.clone(),
+                        model_spec: (*spec).clone(),
+                        fallback_index: *fallback_index,
+                    });
+                }
+            }
+        }
+
+        let tier_labels: Vec<String> = tier_order.iter().map(|t| t.label().to_string()).collect();
+        let names: Vec<String> = results.iter()
+            .map(|d| format!("{}:{}", d.model_spec.provider, d.model_spec.model))
+            .collect();
+        tracing::info!(
+            class = %class_name,
+            tiers = %tier_labels.join("→"),
+            cascade_len = results.len(),
+            pressure = ?pressure,
+            "select_cascade: [{}]",
+            names.join(" → ")
+        );
+
+        results
+    }
+
+    /// Returns ALL candidates that pass constraints — legacy behaviour used by tests.
+    /// Production code should call `select_cascade` for the tiered short cascade.
     pub async fn route_all_candidates(
         &self,
         input: &str,
         pressure: BudgetPressure,
         sensitivity: ContentSensitivity,
     ) -> Vec<RouteDecision> {
-        let (class_name, _confidence) = self.classify_heuristic(input).await;
-        let required_floor = sensitivity.required_trust_floor();
+        self.select_cascade(input, pressure, sensitivity).await
+    }
+}
 
-        let plan = self.plan.read().await;
-        let route = match plan.routes.get(&class_name).or_else(|| plan.routes.values().next()) {
-            Some(r) => r,
-            None => return vec![],
+// ---------------------------------------------------------------------------
+// Tier preference helper
+// ---------------------------------------------------------------------------
+
+/// Return the preferred tier order for a task class + budget pressure + sensitivity.
+///
+/// The routing layer draws from these tiers in order (max 2 engines per tier, 5 total).
+/// Critical sensitivity always collapses to Tier4-only (local inference, no data leaves host).
+fn tier_preference(
+    class_name: &str,
+    pressure: BudgetPressure,
+    sensitivity: ContentSensitivity,
+) -> Vec<animus_core::ModelTier> {
+    use animus_core::ModelTier::*;
+
+    // Critical content: must stay local — no cloud engines regardless of pressure
+    if sensitivity == ContentSensitivity::Critical {
+        return vec![Tier4];
+    }
+
+    // Emergency / Exceeded budget: free tiers only
+    if matches!(pressure, BudgetPressure::Emergency | BudgetPressure::Exceeded) {
+        return match class_name {
+            "Voice" => vec![Tier4],
+            _ => vec![Tier3, Tier4],
         };
+    }
 
-        let candidates: Vec<(usize, &crate::model_plan::ModelSpec)> =
-            route.candidates.iter().enumerate().collect();
+    // Careful budget: skip Tier1 (paid premium) — quality is good enough from Tier2+
+    if pressure == BudgetPressure::Careful {
+        return match class_name {
+            "Voice" => vec![Tier2, Tier4],
+            _ => vec![Tier2, Tier3, Tier4],
+        };
+    }
 
-        candidates.into_iter()
-            .filter(|(_, spec)| {
-                !self.is_prohibited(&spec.provider)
-                && !(sensitivity == ContentSensitivity::Critical && !Self::is_local_provider(&spec.provider))
-                && self.passes_trust(spec, required_floor)
-                && Self::passes_budget(spec, pressure)
-                && self.is_engine_healthy(spec)
-            })
-            .map(|(fallback_index, spec)| RouteDecision {
-                class_name: class_name.clone(),
-                model_spec: spec.clone(),
-                fallback_index,
-            })
-            .collect()
+    // Normal budget: full tier access, class-specific preference
+    match class_name {
+        // Chat/comms: speed > quality — Tier2 first, premium not worth the cost
+        "Conversational" => vec![Tier2, Tier3, Tier4],
+
+        // Analytical/Technical/ToolExecution: quality matters — start at Tier1
+        "Analytical" | "Technical" | "ToolExecution" => vec![Tier1, Tier2, Tier3],
+
+        // Voice: latency is paramount — fast cloud first, then local
+        "Voice" => vec![Tier2, Tier4],
+
+        // Unknown class: default to quality-first
+        _ => vec![Tier2, Tier3, Tier4],
     }
 }
 
@@ -848,6 +1025,7 @@ mod tests {
             task_classes: default_task_classes(),
             routes,
             build_reason: "test".to_string(),
+            plan_version: 0,
         };
 
         let (tx, _rx) = mpsc::channel(32);

@@ -103,6 +103,10 @@ pub struct ReasoningOutput {
     /// True when a fallback engine was used because the primary was unavailable.
     /// Set (and may override the value from `reason()`) by `process_turn_with_engines`.
     pub fell_back: bool,
+    /// Model names (as returned by `engine.model_name()`) that failed with retryable errors
+    /// during the cascade before a successful engine was found.
+    /// Populated by `process_turn_with_engines`; empty when the first engine succeeded.
+    pub failed_engines: Vec<String>,
 }
 
 /// Trait abstracting LLM providers.
@@ -180,6 +184,7 @@ impl ReasoningEngine for MockEngine {
             stop_reason: StopReason::EndTurn,
             engine_used: String::new(),
             fell_back: false,
+            failed_engines: vec![],
         })
     }
 
@@ -240,6 +245,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             engine_used: String::new(),
             fell_back: false,
+            failed_engines: vec![],
         };
         assert!(output.tool_calls.is_empty());
         assert_eq!(output.stop_reason, StopReason::EndTurn);

@@ -32,6 +32,9 @@ pub enum AnimusError {
     #[error("LLM error: {0}")]
     Llm(String),
 
+    #[error("voice error: {0}")]
+    Voice(String),
+
     /// Transient rate-limit response (HTTP 429). Retryable with a fallback engine.
     #[error("LLM rate limited: {0}")]
     LlmRateLimited(String),

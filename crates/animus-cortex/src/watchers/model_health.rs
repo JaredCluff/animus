@@ -38,14 +38,22 @@ async fn probe_endpoint(http: &reqwest::Client, base_url: &str) -> bool {
     }
 }
 
-/// Probe a batch of `(registry_key, base_url)` pairs concurrently and update router health.
-/// Fires signals on confirmed state transitions (up→down or down→up only).
-async fn probe_batch(
+/// Probe a batch and update health states.
+///
+/// When `emit_signals` is false the router health is updated but no Signals are fired.
+/// This is used for the T=0 baseline probe.
+///
+/// When `emit_signals` is true, fires AT MOST ONE summary Signal per call regardless of
+/// how many engines changed state. This prevents signal storms when many engines flip
+/// simultaneously (e.g. a provider outage restoring 40+ endpoints at once).
+/// Per-engine changes are still logged for diagnostics.
+async fn probe_batch_inner(
     snapshot: &[(String, String)],
     router: &SmartRouter,
     signal_tx: &mpsc::Sender<Signal>,
     source_id: ThreadId,
     http: &reqwest::Client,
+    emit_signals: bool,
 ) {
     if snapshot.is_empty() {
         return;
@@ -67,60 +75,57 @@ async fn probe_batch(
 
     let results = futures::future::join_all(probe_futures).await;
 
+    let mut went_down: Vec<String> = Vec::new();
+    let mut came_up: Vec<String> = Vec::new();
+
     for (key, available) in results {
         let prev_weight = router.engine_health_weight(&key);
         router.set_engine_health(&key, if available { 1.0 } else { 0.0 });
 
         if prev_weight >= 1.0 && !available {
-            // Was confirmed healthy, now confirmed down
-            let summary = format!(
-                "Adapting: engine '{key}' probe failed — routing around it until it recovers"
-            );
-            tracing::warn!("{summary}");
-            let _ = signal_tx.try_send(Signal {
-                source_thread: source_id,
-                target_thread: ThreadId::default(),
-                priority: SignalPriority::Normal,
-                summary,
-                segment_refs: vec![],
-                created: Utc::now(),
-            });
+            tracing::warn!("ModelHealthWatcher: '{}' went offline", key);
+            went_down.push(key);
         } else if prev_weight <= 0.0 && available {
-            // Was confirmed down (weight=0.0), now recovered
-            let summary = format!("Engine '{key}' is back online — resuming normal routing");
-            tracing::info!("{summary}");
-            let _ = signal_tx.try_send(Signal {
-                source_thread: source_id,
-                target_thread: ThreadId::default(),
-                priority: SignalPriority::Normal,
-                summary,
-                segment_refs: vec![],
-                created: Utc::now(),
-            });
-        } else {
-            tracing::debug!(
-                "ModelHealthWatcher: '{}' = {}",
-                key,
-                if available { "up" } else { "down" }
-            );
+            tracing::info!("ModelHealthWatcher: '{}' recovered", key);
+            came_up.push(key);
         }
+        // no-change cases: silent (debug builds only noise up logs)
+    }
+
+    if emit_signals && (!went_down.is_empty() || !came_up.is_empty()) {
+        // One summary signal per cycle — never more than one regardless of engine count.
+        let total_up = snapshot.iter().filter(|(k, _)| router.engine_health_weight(k) >= 1.0).count();
+        let summary = match (went_down.len(), came_up.len()) {
+            (d, 0) => format!("Adapting: {d} engine(s) offline — routing around them ({total_up} active)"),
+            (0, u) => format!("Recovery: {u} engine(s) back online ({total_up} active)"),
+            (d, u) => format!("Health update: {d} offline, {u} recovered ({total_up} active)"),
+        };
+        tracing::info!("ModelHealthWatcher: {summary}");
+        let _ = signal_tx.try_send(Signal {
+            source_thread: source_id,
+            target_thread: ThreadId::default(),
+            priority: SignalPriority::Normal,
+            summary,
+            segment_refs: vec![],
+            created: Utc::now(),
+        });
     }
 }
 
 /// Launch the model health watcher as a background task.
 ///
-/// `endpoints` — shared, mutable list of `(registry_key, base_url)` pairs where
-/// `registry_key` is the `"provider:model"` string used in `EngineRegistry::by_name`
-/// and the SmartRouter's `engine_health` map.
+/// `endpoints` — shared, mutable list of `(registry_key, base_url)` pairs.
+/// Only inference endpoints (chat models) should be in this list — the caller
+/// filters out embedding, guard, reward, and TTS models before passing it here.
 ///
 /// The caller holds the same `Arc` and extends it at runtime when engines are
-/// hot-loaded, so newly registered engines are probed on the next cycle without
-/// restarting the watcher (CRITICAL-4).
+/// hot-loaded (CRITICAL-4).
 ///
-/// `interval_secs` — how often to probe all endpoints.
+/// `interval_secs` — periodic full-scan interval. 120s is a reasonable default;
+/// targeted probes handle faster recovery from inference failures.
 ///
-/// `probe_trigger_rx` — channel for targeted on-demand probes (e.g. after a routing
-/// failure). Fires with backoff to avoid hammering a known-down engine.
+/// `probe_trigger_rx` — channel for targeted on-demand probes after an inference
+/// failure. Fires with exponential backoff to avoid hammering a known-down engine.
 pub async fn run_model_health_watcher(
     endpoints: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
     router: SmartRouter,
@@ -141,14 +146,21 @@ pub async fn run_model_health_watcher(
     };
 
     tracing::info!(
-        "ModelHealthWatcher started — probing engine(s) every {}s (T=0 probe firing now)",
+        "ModelHealthWatcher started — {} endpoint(s), {}s interval (T=0 baseline probe, no signals)",
+        endpoints.lock().len(),
         interval_secs,
     );
 
-    // T=0: probe all known endpoints immediately — don't wait for the first interval tick.
+    // T=0: establish baseline health state WITHOUT firing signals.
+    // Firing individual signals for every engine at startup floods the proactive channel
+    // (signal storm) since all 100+ endpoints complete simultaneously. The baseline just
+    // sets health weights so the router has accurate state before the first request arrives.
     {
         let snapshot: Vec<(String, String)> = endpoints.lock().clone();
-        probe_batch(&snapshot, &router, &signal_tx, source_id, &http).await;
+        probe_batch_inner(&snapshot, &router, &signal_tx, source_id, &http, false).await;
+        let up = snapshot.iter().filter(|(k, _)| router.engine_health_weight(k) >= 1.0).count();
+        let down = snapshot.iter().filter(|(k, _)| router.engine_health_weight(k) == 0.0).count();
+        tracing::info!("ModelHealthWatcher: baseline established — {up} up, {down} down out of {}", snapshot.len());
     }
 
     // Track consecutive triggered-probe failures per engine for backoff.
@@ -163,8 +175,9 @@ pub async fn run_model_health_watcher(
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // Periodic full scan — emit signals for state transitions
                 let snapshot: Vec<(String, String)> = endpoints.lock().clone();
-                probe_batch(&snapshot, &router, &signal_tx, source_id, &http).await;
+                probe_batch_inner(&snapshot, &router, &signal_tx, source_id, &http, true).await;
                 // Reset backoff counters for engines that recovered.
                 for (key, _) in &snapshot {
                     if router.engine_health_weight(key) > 0.0 {
@@ -174,6 +187,7 @@ pub async fn run_model_health_watcher(
                 }
             }
             Some(keys) = probe_trigger_rx.recv() => {
+                // Targeted probe after an inference failure — emit signals, apply backoff
                 let now = std::time::Instant::now();
                 let all_endpoints = endpoints.lock().clone();
                 let targeted: Vec<(String, String)> = all_endpoints.into_iter()
@@ -199,7 +213,7 @@ pub async fn run_model_health_watcher(
                     .collect();
 
                 if !targeted.is_empty() {
-                    probe_batch(&targeted, &router, &signal_tx, source_id, &http).await;
+                    probe_batch_inner(&targeted, &router, &signal_tx, source_id, &http, true).await;
                     for (key, _) in &targeted {
                         last_triggered_probe.insert(key.clone(), now);
                         if router.engine_health_weight(key) == 0.0 {

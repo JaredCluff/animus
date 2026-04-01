@@ -192,10 +192,25 @@ impl ChannelPlugin for NatsChannel {
             .filter(|s| !s.is_empty())
             .unwrap_or(&msg.thread_id);
 
+        tracing::info!(
+            target = %target,
+            payload_len = msg.text.len(),
+            "NATS adapter: publishing outbound message"
+        );
+
         self.client
-            .publish(target.to_string(), msg.text.into())
+            .publish(target.to_string(), msg.text.clone().into())
             .await
             .map_err(|e| AnimusError::Llm(format!("NATS publish failed ({target}): {e}")))?;
+
+        // Flush immediately so the response is delivered without waiting for
+        // async_nats' internal buffered-write cycle.
+        self.client
+            .flush()
+            .await
+            .map_err(|e| AnimusError::Llm(format!("NATS flush failed ({target}): {e}")))?;
+
+        tracing::info!(target = %target, "NATS adapter: published and flushed");
 
         Ok(())
     }

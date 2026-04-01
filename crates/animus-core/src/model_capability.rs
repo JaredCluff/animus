@@ -97,9 +97,22 @@ pub struct ModelCapabilityProfile {
     pub trust_score: u8,
     pub data_policy: DataPolicy,
 
+        /// Whether this is a chat/instruction-following model.
+    /// False for embedding, guard, reward, TTS, transcription, PII, and retriever models.
+    /// These non-chat models fail when tools or chat messages are sent to them.
+    /// Defaults to `true` (safe for unknown models from inference registries).
+    #[serde(default = "default_true")]
+    pub is_chat_model: bool,
+    /// Whether this model supports tool/function calling.
+    /// False for models that return 422/400 when tools are included in the request.
+    /// Defaults to `true` (optimistic — retryable errors handle mismatches gracefully).
+    #[serde(default = "default_true")]
+    pub supports_tool_use: bool,
     /// How this profile was obtained.
     pub profile_source: ProfileSource,
 }
+
+fn default_true() -> bool { true }
 
 #[cfg(test)]
 mod tests {
@@ -123,6 +136,8 @@ mod tests {
             cost_per_mtok_output: Some(75.0),
             trust_score: 3,
             data_policy: DataPolicy::NoRetention,
+            is_chat_model: true,
+            supports_tool_use: true,
             profile_source: ProfileSource::StaticRegistry,
         }
     }

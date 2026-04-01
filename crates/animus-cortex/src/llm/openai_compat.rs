@@ -135,6 +135,7 @@ impl OpenAICompatEngine {
     pub fn new(base_url: &str, api_key: &str, model: &str, max_tokens: usize) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| AnimusError::Llm(format!("openai-compat: failed to build HTTP client: {e}")))?;
         Ok(Self {
@@ -418,6 +419,7 @@ impl ReasoningEngine for OpenAICompatEngine {
             stop_reason,
             engine_used: self.model_name().to_string(),
             fell_back: false,
+            failed_engines: vec![],
         })
     }
 

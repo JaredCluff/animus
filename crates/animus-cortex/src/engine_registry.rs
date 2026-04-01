@@ -55,24 +55,46 @@ impl EngineRegistry {
     /// Returns None if the engine was not registered via `register_named`.
     pub fn engine_by_spec(&self, provider: &str, model: &str) -> Option<Arc<dyn ReasoningEngine>> {
         let key = format!("{provider}:{model}");
-        self.by_name.get(&key).cloned()
+        let result = self.by_name.get(&key).cloned();
+        if result.is_none() {
+            tracing::debug!("EngineRegistry: lookup miss for '{key}' (not registered)");
+        }
+        result
     }
 
     /// Get a reference to the engine for a cognitive role, falling back to the default engine.
     pub fn engine_for(&self, role: CognitiveRole) -> &dyn ReasoningEngine {
-        self.engines
-            .get(&role)
-            .map(|e| e.as_ref())
-            .unwrap_or(self.fallback.as_ref())
+        if let Some(engine) = self.engines.get(&role) {
+            tracing::debug!(
+                "EngineRegistry: {role:?} → '{}' (assigned)",
+                engine.model_name()
+            );
+            engine.as_ref()
+        } else {
+            tracing::debug!(
+                "EngineRegistry: {role:?} → '{}' (fallback — no engine assigned for role)",
+                self.fallback.model_name()
+            );
+            self.fallback.as_ref()
+        }
     }
 
     /// Get a cloned Arc to the engine for a cognitive role, falling back to the default engine.
     /// Use when you need to store or share the engine beyond a single function call.
     pub fn engine_for_arc(&self, role: CognitiveRole) -> Arc<dyn ReasoningEngine> {
-        self.engines
-            .get(&role)
-            .cloned()
-            .unwrap_or_else(|| self.fallback.clone())
+        if let Some(engine) = self.engines.get(&role) {
+            tracing::debug!(
+                "EngineRegistry: {role:?} → '{}' (assigned, arc)",
+                engine.model_name()
+            );
+            engine.clone()
+        } else {
+            tracing::debug!(
+                "EngineRegistry: {role:?} → '{}' (fallback, arc — no engine assigned for role)",
+                self.fallback.model_name()
+            );
+            self.fallback.clone()
+        }
     }
 
     /// Get a reference to the fallback engine.
