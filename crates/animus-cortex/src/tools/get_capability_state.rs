@@ -103,6 +103,7 @@ mod tests {
             role_mesh: None,
             budget_state: None,
             budget_config: None,
+            debug_mirror_tx: None,
         }
     }
 
@@ -133,6 +134,7 @@ mod tests {
             role_mesh: None,
             budget_state: None,
             budget_config: None,
+            debug_mirror_tx: None,
         };
         let result = GetCapabilityStateTool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(result.is_error);

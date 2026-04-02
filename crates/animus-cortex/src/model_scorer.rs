@@ -230,6 +230,7 @@ mod tests {
             cost_tier: cost,
             cost_per_mtok_input: None, cost_per_mtok_output: None,
             trust_score: 3, data_policy: DataPolicy::NoRetention,
+            is_chat_model: true, supports_tool_use: true,
             profile_source: ProfileSource::StaticRegistry,
         }
     }

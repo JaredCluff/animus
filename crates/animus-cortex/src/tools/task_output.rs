@@ -89,6 +89,7 @@ mod tests {
             role_mesh: None,
             budget_state: None,
             budget_config: None,
+            debug_mirror_tx: None,
         };
         (ctx, rx)
     }
