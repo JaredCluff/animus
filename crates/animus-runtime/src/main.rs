@@ -904,6 +904,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::update_classification_pattern::UpdateClassificationPatternTool));
         reg.register(Box::new(animus_cortex::tools::get_capability_state::GetCapabilityStateTool));
         reg.register(Box::new(animus_cortex::tools::get_mesh_roles::GetMeshRolesTool));
+        // Memory health: scan and repair VectorFS
+        reg.register(Box::new(animus_cortex::tools::vectorfs_health::VectorFsHealthTool));
         reg
     };
 
@@ -979,6 +981,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         budget_state: Some(budget_state.clone()),
         budget_config: Some(config.budget.clone()),
         debug_mirror_tx: Some(debug_mirror_tx.clone()),
+        turn_tool_calls: Arc::new(parking_lot::RwLock::new(Vec::new())),
     };
     tracing::info!("{} tools registered", tool_registry.definitions().len());
 
@@ -1023,8 +1026,25 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let goals = Arc::new(parking_lot::Mutex::new(goals));
 
     // Initialize thread scheduler
-    let token_budget = 8000;
-    let mut scheduler = ThreadScheduler::new(store.clone(), token_budget);
+    let token_budget = 8000; // VectorFS recall budget (ContextAssembler)
+    // Conversation token budget: env var override, otherwise dynamic per-turn from engine.context_limit().
+    // Store the env var value (or sentinel 0 = "use dynamic") for use in run_reasoning_turn.
+    let conversation_budget_override: usize = std::env::var("ANIMUS_CONVERSATION_TOKEN_BUDGET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0); // 0 = derive dynamically from engine.context_limit()
+    let initial_conv_budget = if conversation_budget_override > 0 {
+        conversation_budget_override
+    } else {
+        animus_cortex::thread::DEFAULT_CONVERSATION_TOKEN_BUDGET
+    };
+    tracing::info!(
+        budget = initial_conv_budget,
+        dynamic = conversation_budget_override == 0,
+        "Conversation token budget"
+    );
+    let mut scheduler = ThreadScheduler::new(store.clone(), token_budget, initial_conv_budget);
     let _main_thread_id = scheduler.create_thread("main".to_string());
 
     // Initialize federation
@@ -1652,6 +1672,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     None, // terminal has no peripheral awareness injection
                     &system_prompt_preamble,
                     &system_prompt_suffix,
+                    conversation_budget_override,
                 ).await;
 
                 match response {
@@ -1918,6 +1939,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             awareness_block.as_deref(),
                             &system_prompt_preamble,
                             &system_prompt_suffix,
+                            conversation_budget_override,
                         ).await;
 
                         let response_text = match response {
@@ -2113,7 +2135,13 @@ async fn run_reasoning_turn(
     peripheral_awareness: Option<&str>,
     prompt_preamble: &str,
     prompt_suffix: &str,
+    // 0 = derive from engine.context_limit(); >0 = use this fixed value (ANIMUS_CONVERSATION_TOKEN_BUDGET)
+    conversation_budget_override: usize,
 ) -> animus_core::Result<String> {
+    // Reset per-turn provenance tracking. Each reasoning turn starts with a clean slate
+    // so remember() calls get tagged with only the tool calls from this specific turn.
+    tool_ctx.turn_tool_calls.write().clear();
+
     let system = {
         let goals_guard = goals.lock();
         build_system_prompt(scheduler, &goals_guard, tool_registry, reconstitution_summary, peripheral_awareness, prompt_preamble, prompt_suffix)
@@ -2172,6 +2200,23 @@ async fn run_reasoning_turn(
             engine_refs.len(),
             names.join(" → ")
         );
+    }
+
+    // Update the active thread's conversation token budget based on the primary engine's
+    // context limit. This ensures the sliding window is calibrated to the model actually
+    // answering this turn (e.g. 128k for gemma4:26b, 32k for qwen3.6-plus).
+    // env var override (>0) takes absolute precedence; dynamic derivation is the default.
+    {
+        let primary_engine = engine_registry.engine_for(CognitiveRole::Reasoning);
+        let dynamic_budget = (primary_engine.context_limit() * 55 / 100).max(4096);
+        let budget = if conversation_budget_override > 0 {
+            conversation_budget_override
+        } else {
+            dynamic_budget
+        };
+        if let Some(active) = scheduler.active_thread_mut() {
+            active.set_conversation_budget(budget);
+        }
     }
 
     // Placeholder — actual tool_engine is selected AFTER inference, using the engine
@@ -2428,6 +2473,13 @@ async fn run_reasoning_turn(
                 tool_span.finish_ok();
             }
 
+            // Accumulate for provenance tagging and grounding check.
+            tool_ctx.turn_tool_calls.write().push(animus_cortex::tools::TurnToolCall {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                succeeded: !result.is_error,
+            });
+
             tool_results.push(animus_cortex::TurnContent::ToolResult {
                 tool_use_id: tc.id.clone(),
                 content: result.content,
@@ -2468,10 +2520,28 @@ async fn run_reasoning_turn(
         }
     }
 
+    // Deterministic grounding check: annotate the response if it claims external
+    // actions that aren't backed by tool calls in this turn.
+    {
+        let calls = tool_ctx.turn_tool_calls.read();
+        if let Some(annotation) = grounding_check(&output.content, &calls) {
+            tracing::warn!(
+                annotation = %annotation,
+                "Grounding check: unverified action claim in response"
+            );
+            output.content.push_str(&annotation);
+        }
+    }
+
     // Store response segment and push assistant turn
     {
         let active = scheduler.active_thread_mut().unwrap();
-        active.store_response_segment(&output.content, embedder).await.ok();
+        if let Err(e) = active.store_response_segment(&output.content, embedder).await {
+            tracing::warn!("VectorFS write failed (response segment): {e}");
+            if let Some(ref tx) = tool_ctx.debug_mirror_tx {
+                let _ = tx.send(format!("⚠️ VectorFS write failed: {e}. Run vectorfs_health(action='scan') to check memory health."));
+            }
+        }
         active.push_turn(animus_cortex::Turn::text(
             animus_cortex::Role::Assistant,
             &output.content,
@@ -2500,6 +2570,47 @@ async fn run_reasoning_turn(
     }
 
     Ok(output.content)
+}
+
+// ---------------------------------------------------------------------------
+// Grounding check
+// ---------------------------------------------------------------------------
+
+/// Deterministically check whether a response claims external actions that
+/// are not backed by actual tool calls in the current turn.
+///
+/// Returns `Some(annotation)` to append to the response if unverified claims
+/// are detected; `None` if the response is clean.
+///
+/// This is purely string-matching — no LLM involved.
+fn grounding_check(response: &str, turn_calls: &[animus_cortex::tools::TurnToolCall]) -> Option<String> {
+    // Phrases that indicate a claimed external action
+    const ACTION_PHRASES: &[&str] = &[
+        "i posted", "i published", "i sent", "i registered", "i created an account",
+        "i submitted", "i uploaded", "i joined", "i signed up",
+        "profile is live", "account is ready", "successfully registered",
+        "account is now active", "i've created", "i have created",
+        "i've registered", "i have registered", "i've posted", "i have posted",
+        "i've published", "i have published", "i've submitted", "i have submitted",
+    ];
+
+    let lower = response.to_lowercase();
+    let has_action_claim = ACTION_PHRASES.iter().any(|phrase| lower.contains(phrase));
+    if !has_action_claim {
+        return None;
+    }
+
+    // Tool calls that constitute external actions
+    const MUTATING_TOOLS: &[&str] = &["http_fetch", "write_file", "shell_exec"];
+    let has_grounding = turn_calls.iter().any(|c| {
+        c.succeeded && MUTATING_TOOLS.contains(&c.name.as_str())
+    });
+
+    if has_grounding {
+        None
+    } else {
+        Some("\n\n⚠️ *[Grounding: this message claims an external action was taken, but no supporting tool call was executed this turn.]*".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
