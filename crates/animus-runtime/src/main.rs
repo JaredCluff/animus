@@ -361,13 +361,13 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         // Helper: build an engine for a given provider/model/max_tokens.
         // Returns Arc so the same instance can be registered under both a cognitive role
         // and a named "provider:model" key without duplicating the rate_limit_state handle (CRITICAL-1).
-        let build_engine = |provider: &str, model: &str, max_tokens: usize, url: &str, key: &str|
+        let build_engine = |provider: &str, model: &str, max_tokens: usize, url: &str, key: &str, num_ctx: Option<usize>|
             -> Option<Arc<dyn animus_cortex::ReasoningEngine>>
         {
             match provider.to_lowercase().as_str() {
                 "ollama" => {
-                    match OpenAICompatEngine::for_ollama(url, model, max_tokens) {
-                        Ok(e) => { tracing::info!("LLM engine: ollama/{model} @ {url}"); Some(Arc::new(e)) }
+                    match OpenAICompatEngine::for_ollama_with_ctx(url, model, max_tokens, num_ctx) {
+                        Ok(e) => { tracing::info!("LLM engine: ollama/{model} @ {url} (num_ctx={num_ctx:?})"); Some(Arc::new(e)) }
                         Err(e) => { eprintln!("Warning: ollama engine init failed: {e}"); None }
                     }
                 }
@@ -398,7 +398,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         // The primary provider is registered under CognitiveRole::Reasoning below.
         let safety_net_engine: Arc<dyn animus_cortex::ReasoningEngine> =
             if let Some(ref model) = fallback_model {
-                build_engine(&fallback_provider, model, 4096, &fallback_url, "")
+                build_engine(&fallback_provider, model, 4096, &fallback_url, "", None)
                     .unwrap_or_else(|| {
                         tracing::warn!("Safety-net engine construction failed for {fallback_provider}/{model}");
                         Arc::new(animus_cortex::MockEngine::new(
@@ -407,7 +407,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     })
             } else {
                 // No safety-net models discovered — try primary provider as fallback
-                build_engine(&provider_str, &model_id, 4096, &base_url, &api_key)
+                build_engine(&provider_str, &model_id, 4096, &base_url, &api_key, None)
                     .unwrap_or_else(|| {
                         eprintln!("Warning: No LLM provider available. Running with mock.");
                         eprintln!("Configure a safety-net endpoint: ANIMUS_FALLBACK_URL, ANIMUS_FALLBACK_PROVIDER, ANIMUS_FALLBACK_MODEL");
@@ -427,10 +427,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         // If _MODEL is set, use that model. Otherwise, discover models at the
         // endpoint and pick the first one. If no URL/key is set, the role uses
         // the registry fallback (safety net).
-        for (role, model_env, provider_env, url_env, key_env, max_tok) in [
-            (CognitiveRole::Perception, "ANIMUS_PERCEPTION_MODEL",  "ANIMUS_PERCEPTION_PROVIDER",  "ANIMUS_PERCEPTION_BASE_URL",  "ANIMUS_PERCEPTION_API_KEY",  1024usize),
-            (CognitiveRole::Reflection, "ANIMUS_REFLECTION_MODEL",  "ANIMUS_REFLECTION_PROVIDER",  "ANIMUS_REFLECTION_BASE_URL",  "ANIMUS_REFLECTION_API_KEY",  4096),
-            (CognitiveRole::Reasoning,  "ANIMUS_REASONING_MODEL",   "ANIMUS_REASONING_PROVIDER",   "ANIMUS_REASONING_BASE_URL",   "ANIMUS_REASONING_API_KEY",   4096),
+        for (role, model_env, provider_env, url_env, key_env, max_tok, num_ctx_env) in [
+            (CognitiveRole::Perception, "ANIMUS_PERCEPTION_MODEL",  "ANIMUS_PERCEPTION_PROVIDER",  "ANIMUS_PERCEPTION_BASE_URL",  "ANIMUS_PERCEPTION_API_KEY",  1024usize, "ANIMUS_PERCEPTION_NUM_CTX"),
+            (CognitiveRole::Reflection, "ANIMUS_REFLECTION_MODEL",  "ANIMUS_REFLECTION_PROVIDER",  "ANIMUS_REFLECTION_BASE_URL",  "ANIMUS_REFLECTION_API_KEY",  4096,      "ANIMUS_REFLECTION_NUM_CTX"),
+            (CognitiveRole::Reasoning,  "ANIMUS_REASONING_MODEL",   "ANIMUS_REASONING_PROVIDER",   "ANIMUS_REASONING_BASE_URL",   "ANIMUS_REASONING_API_KEY",   4096,      "ANIMUS_REASONING_NUM_CTX"),
         ] {
             let has_custom_url = std::env::var(url_env).ok().filter(|s| !s.is_empty()).is_some();
             let role_url = std::env::var(url_env).ok()
@@ -471,8 +471,12 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     }
                 });
 
+            let role_num_ctx: Option<usize> = std::env::var(num_ctx_env).ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok());
+
             if let Some(ref model) = role_model {
-                if let Some(arc_engine) = build_engine(&role_provider, model, max_tok, &role_url, &role_key) {
+                if let Some(arc_engine) = build_engine(&role_provider, model, max_tok, &role_url, &role_key, role_num_ctx) {
                     tracing::info!("{role:?} role: {role_provider}/{model} @ {role_url}");
                     registry.register_named(&role_provider, model, arc_engine.clone());
                     registry.set_engine(role, arc_engine);
@@ -548,7 +552,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             };
             for model in &to_register {
                 if registry.engine_by_spec(name, model).is_none() {
-                    if let Some(arc) = build_engine("openai_compat", model, 4096, &url, &api_key) {
+                    if let Some(arc) = build_engine("openai_compat", model, 4096, &url, &api_key, None) {
                         registry.register_named(name, model, arc);
                         tracing::info!("{name} engine registered: {name}/{model}");
                     }
@@ -560,7 +564,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         // Works with any OpenAI-compatible server (Ollama, LM Studio, vLLM, etc.).
         for model_name in &discovered_local_models {
             if registry.engine_by_spec(&fallback_provider, model_name).is_none() {
-                if let Some(arc) = build_engine(&fallback_provider, model_name, 4096, &fallback_url, "") {
+                if let Some(arc) = build_engine(&fallback_provider, model_name, 4096, &fallback_url, "", None) {
                     registry.register_named(&fallback_provider, model_name, arc);
                     tracing::info!("Safety-net engine registered: {}:{}", fallback_provider, model_name);
                 }
