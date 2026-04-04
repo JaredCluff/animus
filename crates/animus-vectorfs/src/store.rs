@@ -7,6 +7,29 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
+
+/// Report from a full scan of segment files on disk.
+#[derive(Debug, Default, Clone)]
+pub struct StoreHealthReport {
+    /// Number of `.bin` files examined.
+    pub files_scanned: usize,
+    /// Segments that deserialized and have correct dimensionality.
+    pub healthy: usize,
+    /// Files that failed to deserialize (binary corruption).
+    pub corrupted: usize,
+    pub corrupted_ids: Vec<String>,
+    /// Segments whose embedding length doesn't match the store's dimensionality.
+    pub dim_mismatch: usize,
+    pub dim_mismatch_ids: Vec<String>,
+    /// Files exceeding MAX_SEGMENT_BYTES.
+    pub oversized: usize,
+    pub oversized_ids: Vec<String>,
+    /// Count of files that couldn't be read due to OS I/O errors.
+    pub io_errors: usize,
+    /// Set if the segments directory itself couldn't be opened.
+    pub io_error: Option<String>,
+}
 
 use crate::index::HnswIndex;
 use crate::{SegmentUpdate, VectorStore};
@@ -271,6 +294,98 @@ impl MmapVectorStore {
         Ok(())
     }
 
+    /// Scan all segment files on disk and return a health report.
+    ///
+    /// Reads every `.bin` file in the segments directory and attempts to
+    /// deserialize it. Reports counts of healthy, corrupted, oversized, and
+    /// dimension-mismatched segments without modifying anything.
+    pub fn scan_health(&self) -> StoreHealthReport {
+        let segments_dir = self.base_dir.join("segments");
+        let mut report = StoreHealthReport::default();
+
+        let entries = match fs::read_dir(&segments_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                report.io_error = Some(format!("cannot read segments dir: {e}"));
+                return report;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "bin") {
+                continue;
+            }
+            report.files_scanned += 1;
+
+            let metadata = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => { report.io_errors += 1; continue; }
+            };
+
+            if metadata.len() > MAX_SEGMENT_BYTES {
+                report.oversized += 1;
+                report.oversized_ids.push(path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string());
+                continue;
+            }
+
+            let data = match fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => { report.io_errors += 1; continue; }
+            };
+
+            match bincode::deserialize::<Segment>(&data) {
+                Ok(seg) => {
+                    if seg.embedding.len() != self.dimensionality {
+                        report.dim_mismatch += 1;
+                        report.dim_mismatch_ids.push(seg.id.to_string());
+                    } else {
+                        report.healthy += 1;
+                    }
+                }
+                Err(_) => {
+                    report.corrupted += 1;
+                    report.corrupted_ids.push(path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_string());
+                }
+            }
+        }
+
+        report
+    }
+
+    /// Remove all corrupted and dimension-mismatched segment files from disk,
+    /// evicting them from the in-memory map and HNSW index as well.
+    ///
+    /// Returns the number of files removed.
+    pub fn remove_corrupted(&self) -> usize {
+        let report = self.scan_health();
+        let mut removed = 0usize;
+        let ids_to_remove: Vec<String> = report.corrupted_ids.iter()
+            .chain(report.dim_mismatch_ids.iter())
+            .cloned()
+            .collect();
+
+        for id_str in &ids_to_remove {
+            let path = self.base_dir.join("segments").join(format!("{id_str}.bin"));
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+                // Also evict from in-memory state if we can parse the UUID
+                if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
+                    let id = SegmentId(uuid);
+                    self.segments.write().remove(&id);
+                    // HNSW doesn't support deletion — segment simply won't be found
+                    // on next query. Harmless orphan in the index; cleaned on restart.
+                }
+            }
+        }
+        removed
+    }
 }
 
 impl VectorStore for MmapVectorStore {

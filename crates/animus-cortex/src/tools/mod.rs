@@ -35,6 +35,7 @@ pub mod get_capability_state;
 pub mod get_mesh_roles;
 pub mod glob_search;
 pub mod grep_search;
+pub mod vectorfs_health;
 
 use crate::llm::ToolDefinition;
 use crate::task_manager::TaskManager;
