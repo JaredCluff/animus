@@ -979,6 +979,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         budget_state: Some(budget_state.clone()),
         budget_config: Some(config.budget.clone()),
         debug_mirror_tx: Some(debug_mirror_tx.clone()),
+        turn_tool_calls: Arc::new(parking_lot::RwLock::new(Vec::new())),
     };
     tracing::info!("{} tools registered", tool_registry.definitions().len());
 
@@ -2114,6 +2115,10 @@ async fn run_reasoning_turn(
     prompt_preamble: &str,
     prompt_suffix: &str,
 ) -> animus_core::Result<String> {
+    // Reset per-turn provenance tracking. Each reasoning turn starts with a clean slate
+    // so remember() calls get tagged with only the tool calls from this specific turn.
+    tool_ctx.turn_tool_calls.write().clear();
+
     let system = {
         let goals_guard = goals.lock();
         build_system_prompt(scheduler, &goals_guard, tool_registry, reconstitution_summary, peripheral_awareness, prompt_preamble, prompt_suffix)
@@ -2428,6 +2433,13 @@ async fn run_reasoning_turn(
                 tool_span.finish_ok();
             }
 
+            // Accumulate for provenance tagging and grounding check.
+            tool_ctx.turn_tool_calls.write().push(animus_cortex::tools::TurnToolCall {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                succeeded: !result.is_error,
+            });
+
             tool_results.push(animus_cortex::TurnContent::ToolResult {
                 tool_use_id: tc.id.clone(),
                 content: result.content,
@@ -2468,6 +2480,19 @@ async fn run_reasoning_turn(
         }
     }
 
+    // Deterministic grounding check: annotate the response if it claims external
+    // actions that aren't backed by tool calls in this turn.
+    {
+        let calls = tool_ctx.turn_tool_calls.read();
+        if let Some(annotation) = grounding_check(&output.content, &calls) {
+            tracing::warn!(
+                annotation = %annotation,
+                "Grounding check: unverified action claim in response"
+            );
+            output.content.push_str(&annotation);
+        }
+    }
+
     // Store response segment and push assistant turn
     {
         let active = scheduler.active_thread_mut().unwrap();
@@ -2500,6 +2525,47 @@ async fn run_reasoning_turn(
     }
 
     Ok(output.content)
+}
+
+// ---------------------------------------------------------------------------
+// Grounding check
+// ---------------------------------------------------------------------------
+
+/// Deterministically check whether a response claims external actions that
+/// are not backed by actual tool calls in the current turn.
+///
+/// Returns `Some(annotation)` to append to the response if unverified claims
+/// are detected; `None` if the response is clean.
+///
+/// This is purely string-matching — no LLM involved.
+fn grounding_check(response: &str, turn_calls: &[animus_cortex::tools::TurnToolCall]) -> Option<String> {
+    // Phrases that indicate a claimed external action
+    const ACTION_PHRASES: &[&str] = &[
+        "i posted", "i published", "i sent", "i registered", "i created an account",
+        "i submitted", "i uploaded", "i joined", "i signed up",
+        "profile is live", "account is ready", "successfully registered",
+        "account is now active", "i've created", "i have created",
+        "i've registered", "i have registered", "i've posted", "i have posted",
+        "i've published", "i have published", "i've submitted", "i have submitted",
+    ];
+
+    let lower = response.to_lowercase();
+    let has_action_claim = ACTION_PHRASES.iter().any(|phrase| lower.contains(phrase));
+    if !has_action_claim {
+        return None;
+    }
+
+    // Tool calls that constitute external actions
+    const MUTATING_TOOLS: &[&str] = &["http_fetch", "write_file", "shell_exec"];
+    let has_grounding = turn_calls.iter().any(|c| {
+        c.succeeded && MUTATING_TOOLS.contains(&c.name.as_str())
+    });
+
+    if has_grounding {
+        None
+    } else {
+        Some("\n\n⚠️ *[Grounding: this message claims an external action was taken, but no supporting tool call was executed this turn.]*".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
