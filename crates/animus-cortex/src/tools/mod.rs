@@ -51,6 +51,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Record of a single tool call executed within a reasoning turn.
+/// Accumulated by the runtime; read by `remember` for provenance tagging
+/// and by the grounding check before responses are returned.
+#[derive(Debug, Clone)]
+pub struct TurnToolCall {
+    pub id: String,
+    pub name: String,
+    pub succeeded: bool,
+}
+
 /// Context provided to tools at execution time by the runtime.
 pub struct ToolContext {
     /// Root data directory for the AILF.
@@ -97,6 +107,11 @@ pub struct ToolContext {
     /// Debug mirror channel — tools that perform outbound actions (e.g. nats_publish)
     /// send human-readable debug messages here. The main loop forwards them to Telegram.
     pub debug_mirror_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Tool calls executed so far in the current reasoning turn.
+    /// Reset at the start of each `run_reasoning_turn` call.
+    /// Used by `remember` to auto-tag memories with provenance, and by the
+    /// grounding check to detect unverified action claims in responses.
+    pub turn_tool_calls: Arc<parking_lot::RwLock<Vec<TurnToolCall>>>,
 }
 
 /// A tool the AILF can use to interact with the world.

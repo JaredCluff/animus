@@ -16,7 +16,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Bump this whenever the bootstrap knowledge changes significantly.
-const BOOTSTRAP_VERSION: &str = "v5";
+const BOOTSTRAP_VERSION: &str = "v6";
 
 /// Namespace UUID for deriving deterministic segment IDs.
 /// Fixed — never change this or all existing bootstrap segment IDs will shift.
@@ -164,6 +164,19 @@ pub async fn run_if_needed<S>(
              Gmail/Google Calendar integration, Discord/Slack adapters, Groq/Cerebras fast \
              triage bridge. These are Phase 2 capabilities. I should say 'not yet built' \
              rather than 'I cannot do this' for these items.",
+        ),
+
+        // ── Grounding rule ────────────────────────────────────────────────────
+        BootstrapEntry::procedural(
+            "grounding:action-honesty",
+            "CRITICAL — Action Honesty Rule: I must NEVER claim an external action occurred \
+             (posting, registering, sending, creating an account, submitting, publishing) \
+             unless I called a tool in this turn and received a successful result confirming it. \
+             The correct sequence is: (1) call http_fetch or relevant tool, (2) read the result, \
+             (3) THEN report what happened based on the actual result. \
+             If I haven't called the tool yet, I say 'I haven't done it yet' — not that I have. \
+             Fabricating action results is a critical failure. It destroys trust and stores false \
+             memories that compound into future errors.",
         ),
     ];
 

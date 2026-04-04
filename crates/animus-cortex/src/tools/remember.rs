@@ -51,6 +51,20 @@ impl Tool for RememberTool {
         );
         segment.decay_class = decay_class;
 
+        // Auto-tag with provenance from the current turn's tool calls.
+        // This is deterministic — the LLM has no control over what gets tagged here.
+        {
+            let calls = ctx.turn_tool_calls.read();
+            let grounded = calls.iter().any(|c| c.succeeded);
+            segment.tags.insert("grounded".to_string(), grounded.to_string());
+            if !calls.is_empty() {
+                let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                segment.tags.insert("provenance_tools".to_string(), names.join(","));
+                let ids: Vec<&str> = calls.iter().map(|c| c.id.as_str()).collect();
+                segment.tags.insert("provenance_call_ids".to_string(), ids.join(","));
+            }
+        }
+
         match ctx.store.store(segment) {
             Ok(id) => Ok(ToolResult {
                 content: format!("Knowledge stored (id: {id}, class: {decay_class_str})"),
