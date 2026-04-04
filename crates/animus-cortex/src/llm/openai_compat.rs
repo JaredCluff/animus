@@ -155,8 +155,14 @@ impl OpenAICompatEngine {
     /// Sets `num_ctx = 32768`, `kv_cache_type = "q8_0"`, and enables
     /// think-control (dynamic `/no_think` suppression for simple inputs).
     pub fn for_ollama(ollama_url: &str, model: &str, max_tokens: usize) -> Result<Self> {
+        Self::for_ollama_with_ctx(ollama_url, model, max_tokens, None)
+    }
+
+    /// Like `for_ollama` but with an explicit KV-cache context window size.
+    /// Pass `Some(n)` to override the default 32768; `None` uses the default.
+    pub fn for_ollama_with_ctx(ollama_url: &str, model: &str, max_tokens: usize, num_ctx: Option<usize>) -> Result<Self> {
         let mut engine = Self::new(ollama_url, "", model, max_tokens)?;
-        engine.num_ctx = Some(32_768);
+        engine.num_ctx = Some(num_ctx.unwrap_or(32_768));
         engine.kv_cache_type = Some("q8_0".to_string());
         engine.think_control = true;
         Ok(engine)
