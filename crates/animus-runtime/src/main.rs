@@ -904,6 +904,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::update_classification_pattern::UpdateClassificationPatternTool));
         reg.register(Box::new(animus_cortex::tools::get_capability_state::GetCapabilityStateTool));
         reg.register(Box::new(animus_cortex::tools::get_mesh_roles::GetMeshRolesTool));
+        // Memory health: scan and repair VectorFS
+        reg.register(Box::new(animus_cortex::tools::vectorfs_health::VectorFsHealthTool));
         reg
     };
 
@@ -2496,7 +2498,12 @@ async fn run_reasoning_turn(
     // Store response segment and push assistant turn
     {
         let active = scheduler.active_thread_mut().unwrap();
-        active.store_response_segment(&output.content, embedder).await.ok();
+        if let Err(e) = active.store_response_segment(&output.content, embedder).await {
+            tracing::warn!("VectorFS write failed (response segment): {e}");
+            if let Some(ref tx) = tool_ctx.debug_mirror_tx {
+                let _ = tx.send(format!("⚠️ VectorFS write failed: {e}. Run vectorfs_health(action='scan') to check memory health."));
+            }
+        }
         active.push_turn(animus_cortex::Turn::text(
             animus_cortex::Role::Assistant,
             &output.content,
