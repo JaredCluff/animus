@@ -32,6 +32,10 @@ pub struct ReasoningThread<S: VectorStore> {
     /// Segment IDs retrieved (not anchors) in the most recent turn.
     /// Used for explicit feedback commands (/accept, /correct).
     last_retrieved_ids: Vec<SegmentId>,
+    /// Max estimated tokens to retain in conversation history.
+    /// Updated per-turn by run_reasoning_turn based on the active engine's context_limit.
+    /// Can be overridden at startup via ANIMUS_CONVERSATION_TOKEN_BUDGET.
+    pub conversation_token_budget: usize,
 }
 
 impl<S: VectorStore> ReasoningThread<S> {
@@ -39,6 +43,7 @@ impl<S: VectorStore> ReasoningThread<S> {
         name: String,
         store: Arc<S>,
         token_budget: usize,
+        conversation_token_budget: usize,
     ) -> Self {
         let assembler = ContextAssembler::new(store.clone(), token_budget);
         Self {
@@ -52,7 +57,15 @@ impl<S: VectorStore> ReasoningThread<S> {
             status: ThreadStatus::Active,
             pending_signals: Vec::new(),
             last_retrieved_ids: Vec::new(),
+            conversation_token_budget,
         }
+    }
+
+    /// Update the conversation token budget.
+    /// Called by run_reasoning_turn after the active engine is selected,
+    /// so the budget reflects the real context limit of the model answering.
+    pub fn set_conversation_budget(&mut self, budget: usize) {
+        self.conversation_token_budget = budget;
     }
 
     /// Classify whether a user input warrants extended thinking.
@@ -436,7 +449,7 @@ impl<S: VectorStore> ReasoningThread<S> {
     /// then injects a single summary turn capturing what was dropped. Always trims in
     /// whole "exchange" units (minimum 2 turns) to avoid leaving orphaned tool-result turns.
     fn trim_conversation_if_needed(&mut self) {
-        if estimate_conversation_tokens(&self.conversation) <= MAX_CONVERSATION_TOKENS {
+        if estimate_conversation_tokens(&self.conversation) <= self.conversation_token_budget {
             return;
         }
 
@@ -445,7 +458,7 @@ impl<S: VectorStore> ReasoningThread<S> {
         let mut drop_count = 0usize;
         let mut dropped_tokens = 0usize;
         let target_drop = estimate_conversation_tokens(&self.conversation)
-            .saturating_sub(MAX_CONVERSATION_TOKENS / 2); // trim to 50% to amortise cost
+            .saturating_sub(self.conversation_token_budget / 2); // trim to 50% to amortise cost
 
         for turn in &self.conversation {
             if dropped_tokens >= target_drop && drop_count >= 4 {
@@ -538,10 +551,9 @@ impl<S: VectorStore> ReasoningThread<S> {
 // Conversation windowing
 // ---------------------------------------------------------------------------
 
-/// Rough token budget for the conversation history passed to the LLM.
-/// Keeps well under typical 32k context limits; leaves headroom for system prompt
-/// (bootstrap + VectorFS recall) and the model's own response.
-const MAX_CONVERSATION_TOKENS: usize = 16_000;
+/// Default conversation token budget used when no engine context limit is known yet
+/// and ANIMUS_CONVERSATION_TOKEN_BUDGET is not set.
+pub const DEFAULT_CONVERSATION_TOKEN_BUDGET: usize = 16_000;
 
 /// Estimate tokens in a single turn (4 chars ≈ 1 token, plus per-message overhead).
 fn estimate_turn_tokens(turn: &Turn) -> usize {
