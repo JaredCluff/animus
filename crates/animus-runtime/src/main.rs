@@ -904,6 +904,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         reg.register(Box::new(animus_cortex::tools::update_classification_pattern::UpdateClassificationPatternTool));
         reg.register(Box::new(animus_cortex::tools::get_capability_state::GetCapabilityStateTool));
         reg.register(Box::new(animus_cortex::tools::get_mesh_roles::GetMeshRolesTool));
+        // Memory health: scan and repair VectorFS
+        reg.register(Box::new(animus_cortex::tools::vectorfs_health::VectorFsHealthTool));
         reg
     };
 
@@ -1024,8 +1026,25 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let goals = Arc::new(parking_lot::Mutex::new(goals));
 
     // Initialize thread scheduler
-    let token_budget = 8000;
-    let mut scheduler = ThreadScheduler::new(store.clone(), token_budget);
+    let token_budget = 8000; // VectorFS recall budget (ContextAssembler)
+    // Conversation token budget: env var override, otherwise dynamic per-turn from engine.context_limit().
+    // Store the env var value (or sentinel 0 = "use dynamic") for use in run_reasoning_turn.
+    let conversation_budget_override: usize = std::env::var("ANIMUS_CONVERSATION_TOKEN_BUDGET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0); // 0 = derive dynamically from engine.context_limit()
+    let initial_conv_budget = if conversation_budget_override > 0 {
+        conversation_budget_override
+    } else {
+        animus_cortex::thread::DEFAULT_CONVERSATION_TOKEN_BUDGET
+    };
+    tracing::info!(
+        budget = initial_conv_budget,
+        dynamic = conversation_budget_override == 0,
+        "Conversation token budget"
+    );
+    let mut scheduler = ThreadScheduler::new(store.clone(), token_budget, initial_conv_budget);
     let _main_thread_id = scheduler.create_thread("main".to_string());
 
     // Initialize federation
@@ -1653,6 +1672,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     None, // terminal has no peripheral awareness injection
                     &system_prompt_preamble,
                     &system_prompt_suffix,
+                    conversation_budget_override,
                 ).await;
 
                 match response {
@@ -1919,6 +1939,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             awareness_block.as_deref(),
                             &system_prompt_preamble,
                             &system_prompt_suffix,
+                            conversation_budget_override,
                         ).await;
 
                         let response_text = match response {
@@ -2114,6 +2135,8 @@ async fn run_reasoning_turn(
     peripheral_awareness: Option<&str>,
     prompt_preamble: &str,
     prompt_suffix: &str,
+    // 0 = derive from engine.context_limit(); >0 = use this fixed value (ANIMUS_CONVERSATION_TOKEN_BUDGET)
+    conversation_budget_override: usize,
 ) -> animus_core::Result<String> {
     // Reset per-turn provenance tracking. Each reasoning turn starts with a clean slate
     // so remember() calls get tagged with only the tool calls from this specific turn.
@@ -2177,6 +2200,23 @@ async fn run_reasoning_turn(
             engine_refs.len(),
             names.join(" → ")
         );
+    }
+
+    // Update the active thread's conversation token budget based on the primary engine's
+    // context limit. This ensures the sliding window is calibrated to the model actually
+    // answering this turn (e.g. 128k for gemma4:26b, 32k for qwen3.6-plus).
+    // env var override (>0) takes absolute precedence; dynamic derivation is the default.
+    {
+        let primary_engine = engine_registry.engine_for(CognitiveRole::Reasoning);
+        let dynamic_budget = (primary_engine.context_limit() * 55 / 100).max(4096);
+        let budget = if conversation_budget_override > 0 {
+            conversation_budget_override
+        } else {
+            dynamic_budget
+        };
+        if let Some(active) = scheduler.active_thread_mut() {
+            active.set_conversation_budget(budget);
+        }
     }
 
     // Placeholder — actual tool_engine is selected AFTER inference, using the engine
@@ -2496,7 +2536,12 @@ async fn run_reasoning_turn(
     // Store response segment and push assistant turn
     {
         let active = scheduler.active_thread_mut().unwrap();
-        active.store_response_segment(&output.content, embedder).await.ok();
+        if let Err(e) = active.store_response_segment(&output.content, embedder).await {
+            tracing::warn!("VectorFS write failed (response segment): {e}");
+            if let Some(ref tx) = tool_ctx.debug_mirror_tx {
+                let _ = tx.send(format!("⚠️ VectorFS write failed: {e}. Run vectorfs_health(action='scan') to check memory health."));
+            }
+        }
         active.push_turn(animus_cortex::Turn::text(
             animus_cortex::Role::Assistant,
             &output.content,

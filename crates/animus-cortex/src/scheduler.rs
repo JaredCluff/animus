@@ -12,16 +12,20 @@ pub struct ThreadScheduler<S: VectorStore> {
     threads: HashMap<ThreadId, ReasoningThread<S>>,
     active_thread: Option<ThreadId>,
     store: Arc<S>,
+    /// VectorFS recall budget passed to ContextAssembler.
     token_budget: usize,
+    /// Conversation history token budget passed to new threads.
+    conversation_token_budget: usize,
 }
 
 impl<S: VectorStore> ThreadScheduler<S> {
-    pub fn new(store: Arc<S>, token_budget: usize) -> Self {
+    pub fn new(store: Arc<S>, token_budget: usize, conversation_token_budget: usize) -> Self {
         Self {
             threads: HashMap::new(),
             active_thread: None,
             store,
             token_budget,
+            conversation_token_budget,
         }
     }
 
@@ -30,6 +34,7 @@ impl<S: VectorStore> ThreadScheduler<S> {
             name,
             self.store.clone(),
             self.token_budget,
+            self.conversation_token_budget,
         );
 
         let id = thread.id;

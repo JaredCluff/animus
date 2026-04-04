@@ -7,7 +7,7 @@ use animus_vectorfs::VectorStore;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::llm::{ReasoningEngine, Role, Turn};
+use crate::llm::{ReasoningEngine, Role, Turn, TurnContent};
 
 /// An isolated reasoning context — a single conversation thread.
 pub struct ReasoningThread<S: VectorStore> {
@@ -32,6 +32,10 @@ pub struct ReasoningThread<S: VectorStore> {
     /// Segment IDs retrieved (not anchors) in the most recent turn.
     /// Used for explicit feedback commands (/accept, /correct).
     last_retrieved_ids: Vec<SegmentId>,
+    /// Max estimated tokens to retain in conversation history.
+    /// Updated per-turn by run_reasoning_turn based on the active engine's context_limit.
+    /// Can be overridden at startup via ANIMUS_CONVERSATION_TOKEN_BUDGET.
+    pub conversation_token_budget: usize,
 }
 
 impl<S: VectorStore> ReasoningThread<S> {
@@ -39,6 +43,7 @@ impl<S: VectorStore> ReasoningThread<S> {
         name: String,
         store: Arc<S>,
         token_budget: usize,
+        conversation_token_budget: usize,
     ) -> Self {
         let assembler = ContextAssembler::new(store.clone(), token_budget);
         Self {
@@ -52,7 +57,15 @@ impl<S: VectorStore> ReasoningThread<S> {
             status: ThreadStatus::Active,
             pending_signals: Vec::new(),
             last_retrieved_ids: Vec::new(),
+            conversation_token_budget,
         }
+    }
+
+    /// Update the conversation token budget.
+    /// Called by run_reasoning_turn after the active engine is selected,
+    /// so the budget reflects the real context limit of the model answering.
+    pub fn set_conversation_budget(&mut self, budget: usize) {
+        self.conversation_token_budget = budget;
     }
 
     /// Classify whether a user input warrants extended thinking.
@@ -402,6 +415,7 @@ impl<S: VectorStore> ReasoningThread<S> {
     /// Push a turn directly to the conversation (used by runtime tool loop).
     pub fn push_turn(&mut self, turn: Turn) {
         self.conversation.push(turn);
+        self.trim_conversation_if_needed();
     }
 
     /// Store a response as a VectorFS segment (called by runtime after final response).
@@ -427,6 +441,59 @@ impl<S: VectorStore> ReasoningThread<S> {
             self.stored_turn_ids.drain(..self.stored_turn_ids.len() - MAX_ANCHOR_IDS);
         }
         Ok(())
+    }
+
+    /// Trim conversation history to MAX_CONVERSATION_TOKENS if needed.
+    ///
+    /// Removes turns from the front until the estimated token count is within budget,
+    /// then injects a single summary turn capturing what was dropped. Always trims in
+    /// whole "exchange" units (minimum 2 turns) to avoid leaving orphaned tool-result turns.
+    fn trim_conversation_if_needed(&mut self) {
+        if estimate_conversation_tokens(&self.conversation) <= self.conversation_token_budget {
+            return;
+        }
+
+        // Find how many turns from the front we must drop.
+        // Drop at least 4 at a time (2 full exchanges) so we don't spin trimming one turn per call.
+        let mut drop_count = 0usize;
+        let mut dropped_tokens = 0usize;
+        let target_drop = estimate_conversation_tokens(&self.conversation)
+            .saturating_sub(self.conversation_token_budget / 2); // trim to 50% to amortise cost
+
+        for turn in &self.conversation {
+            if dropped_tokens >= target_drop && drop_count >= 4 {
+                break;
+            }
+            dropped_tokens += estimate_turn_tokens(turn);
+            drop_count += 1;
+        }
+
+        // Round up to even to keep user/assistant pairs together.
+        if drop_count % 2 != 0 {
+            drop_count += 1;
+        }
+        let drop_count = drop_count.min(self.conversation.len().saturating_sub(4));
+        if drop_count == 0 {
+            return;
+        }
+
+        let dropped: Vec<Turn> = self.conversation.drain(..drop_count).collect();
+        let summary = summarize_turns(&dropped);
+
+        tracing::info!(
+            thread = %self.id,
+            dropped = drop_count,
+            summary_len = summary.len(),
+            "Conversation trimmed: {drop_count} turns dropped to stay within token budget"
+        );
+
+        // Inject summary as a System turn at the front so context isn't lost entirely.
+        self.conversation.insert(0, Turn {
+            role: Role::System,
+            content: vec![TurnContent::Text(format!(
+                "[Earlier conversation ({drop_count} turns) condensed: {summary}]"
+            ))],
+        });
     }
 
     /// Get the number of turns.
@@ -478,6 +545,66 @@ impl<S: VectorStore> ReasoningThread<S> {
         signals.sort_by(|a, b| b.priority.cmp(&a.priority));
         signals
     }
+}
+
+// ---------------------------------------------------------------------------
+// Conversation windowing
+// ---------------------------------------------------------------------------
+
+/// Default conversation token budget used when no engine context limit is known yet
+/// and ANIMUS_CONVERSATION_TOKEN_BUDGET is not set.
+pub const DEFAULT_CONVERSATION_TOKEN_BUDGET: usize = 16_000;
+
+/// Estimate tokens in a single turn (4 chars ≈ 1 token, plus per-message overhead).
+fn estimate_turn_tokens(turn: &Turn) -> usize {
+    let content_chars: usize = turn.content.iter().map(|c| match c {
+        TurnContent::Text(s) => s.len(),
+        TurnContent::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
+        TurnContent::ToolResult { content, .. } => content.len(),
+    }).sum();
+    (content_chars / 4).max(1) + 8 // 8 tokens per-message overhead
+}
+
+/// Estimate total tokens for the full conversation slice.
+fn estimate_conversation_tokens(conversation: &[Turn]) -> usize {
+    conversation.iter().map(estimate_turn_tokens).sum()
+}
+
+/// Build a terse plain-text summary of a slice of turns.
+/// Used as the injected summary when old turns are trimmed.
+fn summarize_turns(turns: &[Turn]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for turn in turns {
+        let text: String = turn.content.iter().filter_map(|c| match c {
+            TurnContent::Text(t) => {
+                let preview: String = t.chars().take(120).collect();
+                if !preview.trim().is_empty() {
+                    Some(preview)
+                } else {
+                    None
+                }
+            }
+            TurnContent::ToolUse { name, .. } => Some(format!("[called {}]", name)),
+            TurnContent::ToolResult { content, is_error, .. } => {
+                if *is_error {
+                    Some(format!("[tool error: {}]", &content[..content.len().min(60)]))
+                } else {
+                    let preview: String = content.chars().take(80).collect();
+                    Some(format!("[result: {preview}]"))
+                }
+            }
+        }).collect::<Vec<_>>().join(" ");
+
+        if !text.trim().is_empty() {
+            let role_label = match turn.role {
+                Role::User => "User",
+                Role::Assistant => "Animus",
+                Role::System => "System",
+            };
+            parts.push(format!("{role_label}: {text}"));
+        }
+    }
+    parts.join(" | ")
 }
 
 /// Returns true if the error is transient and a fallback engine should be tried.
