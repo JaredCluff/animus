@@ -146,6 +146,23 @@ pub trait ReasoningEngine: Send + Sync {
     fn probe_url(&self) -> Option<&str> {
         None
     }
+
+    /// Like `reason`, but instructs the model it MUST call a tool.
+    ///
+    /// Used on hallucination retry: after a model claims tool use in text without
+    /// actually invoking any tool, retrying with `tool_choice: required` forces
+    /// the model to emit a real tool call rather than another text response.
+    ///
+    /// Default implementation falls back to `reason` (safe for all engines;
+    /// override in engines that support `tool_choice: required`).
+    async fn reason_tool_required(
+        &self,
+        system: &str,
+        messages: &[Turn],
+        tools: &[ToolDefinition],
+    ) -> Result<ReasoningOutput> {
+        self.reason(system, messages, Some(tools)).await
+    }
 }
 
 /// Mock reasoning engine for testing.

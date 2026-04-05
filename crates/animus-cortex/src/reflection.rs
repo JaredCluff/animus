@@ -18,8 +18,13 @@ pub struct ReflectionOutput {
     /// New synthesized knowledge to store.
     pub syntheses: Vec<Synthesis>,
     /// Contradictions detected between segments.
+    /// Non-UUID segment IDs in individual entries are silently dropped rather than
+    /// failing the entire parse — the LLM occasionally emits descriptive labels.
+    #[serde(default, deserialize_with = "deserialize_contradictions")]
     pub contradictions: Vec<Contradiction>,
     /// Goal progress updates.
+    /// Non-UUID goal IDs in individual entries are silently dropped.
+    #[serde(default, deserialize_with = "deserialize_goal_updates")]
     pub goal_updates: Vec<GoalUpdate>,
     /// Signals to send to Reasoning.
     pub signals: Vec<ReflectionSignal>,
@@ -70,6 +75,73 @@ pub struct GoalUpdate {
     pub goal_id: GoalId,
     pub progress_note: String,
     pub suggest_complete: bool,
+}
+
+/// Deserialize a Vec<Contradiction> tolerantly: skip entries where segment_a or segment_b
+/// are non-UUID strings (the LLM occasionally emits descriptive labels instead of UUIDs).
+fn deserialize_contradictions<'de, D>(d: D) -> Result<Vec<Contradiction>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct RawContradiction {
+        segment_a: serde_json::Value,
+        segment_b: serde_json::Value,
+        description: String,
+        suggested_resolution: String,
+    }
+
+    let raw: Vec<RawContradiction> = Vec::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|r| {
+            let parse_id = |v: serde_json::Value| {
+                v.as_str()
+                    .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                    .map(SegmentId)
+            };
+            Some(Contradiction {
+                segment_a: parse_id(r.segment_a)?,
+                segment_b: parse_id(r.segment_b)?,
+                description: r.description,
+                suggested_resolution: r.suggested_resolution,
+            })
+        })
+        .collect())
+}
+
+/// Deserialize a Vec<GoalUpdate> tolerantly: skip entries with non-UUID goal_id values.
+fn deserialize_goal_updates<'de, D>(d: D) -> Result<Vec<GoalUpdate>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct RawGoalUpdate {
+        goal_id: serde_json::Value,
+        progress_note: String,
+        suggest_complete: bool,
+    }
+
+    let raw: Vec<RawGoalUpdate> = Vec::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|r| {
+            let goal_id = r
+                .goal_id
+                .as_str()
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                .map(GoalId)?;
+            Some(GoalUpdate {
+                goal_id,
+                progress_note: r.progress_note,
+                suggest_complete: r.suggest_complete,
+            })
+        })
+        .collect())
 }
 
 /// A signal Reflection wants to send to Reasoning.
