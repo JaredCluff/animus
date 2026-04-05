@@ -321,13 +321,15 @@ fn tools_to_oai(tools: &[ToolDefinition]) -> Vec<OaiTool> {
 // ReasoningEngine impl
 // ---------------------------------------------------------------------------
 
-#[async_trait]
-impl ReasoningEngine for OpenAICompatEngine {
-    async fn reason(
+impl OpenAICompatEngine {
+    /// Core inference path. `forced_tool_choice` overrides the default `"auto"` — pass
+    /// `Some("required")` on hallucination retry to force the model to call a tool.
+    async fn do_reason(
         &self,
         system: &str,
         messages: &[Turn],
         tools: Option<&[ToolDefinition]>,
+        forced_tool_choice: Option<&'static str>,
     ) -> Result<ReasoningOutput> {
         let oai_messages = turns_to_messages(system, messages);
         let oai_tools = tools.map(tools_to_oai);
@@ -340,10 +342,16 @@ impl ReasoningEngine for OpenAICompatEngine {
             (None,    None)     => None,
         };
 
+        let tool_choice = if has_tools {
+            Some(forced_tool_choice.unwrap_or("auto"))
+        } else {
+            None
+        };
+
         let req = ChatRequest {
             model: &self.model,
             messages: oai_messages,
-            tool_choice: if has_tools { Some("auto") } else { None },
+            tool_choice,
             tools: oai_tools,
             max_tokens: self.max_tokens,
             stream: false,
@@ -374,7 +382,7 @@ impl ReasoningEngine for OpenAICompatEngine {
             });
         }
 
-        // Capture rate limit headers before consuming the body (headers are on the response, body consumes it)
+        // Capture rate limit headers before consuming the body
         let rl_parsed = parse_oai_rate_limit_headers(resp.headers());
         {
             let mut state = self.rate_limit_state.write();
@@ -427,6 +435,27 @@ impl ReasoningEngine for OpenAICompatEngine {
             fell_back: false,
             failed_engines: vec![],
         })
+    }
+}
+
+#[async_trait]
+impl ReasoningEngine for OpenAICompatEngine {
+    async fn reason(
+        &self,
+        system: &str,
+        messages: &[Turn],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<ReasoningOutput> {
+        self.do_reason(system, messages, tools, None).await
+    }
+
+    async fn reason_tool_required(
+        &self,
+        system: &str,
+        messages: &[Turn],
+        tools: &[ToolDefinition],
+    ) -> Result<ReasoningOutput> {
+        self.do_reason(system, messages, Some(tools), Some("required")).await
     }
 
     fn context_limit(&self) -> usize {

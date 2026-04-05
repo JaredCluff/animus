@@ -1,6 +1,6 @@
 use animus_core::error::{AnimusError, Result};
-use animus_core::identity::SegmentId;
-use animus_core::segment::{Content, DecayClass, Segment, Source, Tier};
+use animus_core::identity::{PolicyId, SegmentId};
+use animus_core::segment::{Content, DecayClass, Principal, Segment, Source, Tier};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,6 +52,172 @@ pub struct ReembedEntry {
     pub source: Source,
     pub decay_class: DecayClass,
     pub tags: std::collections::HashMap<String, String>,
+}
+
+// ---------------------------------------------------------------------------
+// Legacy segment formats for migration
+//
+// When the Segment struct gains new fields, old .bin files serialized without
+// those fields fail to deserialize with bincode (binary layout is positional).
+// The structs below mirror historical layouts so we can attempt recovery before
+// quarantining an unreadable segment.
+//
+// Version history:
+//   V0 (ac964d5 → 59b3ed5): no tags, no alpha/beta, no decay_class
+//   V1 (59b3ed6 → 3b2e826): tags added, still no alpha/beta/decay_class
+//   Current (3b2e827+):      alpha, beta, decay_class added (with serde defaults)
+// ---------------------------------------------------------------------------
+
+/// Segment layout before lifecycle capabilities (59b3ed6): no tags, alpha, beta, or decay_class.
+#[derive(serde::Deserialize)]
+struct SegmentV0 {
+    id: SegmentId,
+    embedding: Vec<f32>,
+    content: Content,
+    source: Source,
+    confidence: f32,
+    lineage: Vec<SegmentId>,
+    tier: Tier,
+    relevance_score: f32,
+    access_count: u64,
+    last_accessed: chrono::DateTime<chrono::Utc>,
+    created: chrono::DateTime<chrono::Utc>,
+    associations: Vec<(SegmentId, f32)>,
+    consent_policy: Option<PolicyId>,
+    observable_by: Vec<Principal>,
+}
+
+/// Segment layout after lifecycle capabilities (59b3ed6) but before quality gate (3b2e827):
+/// has tags, but no alpha/beta/decay_class.
+#[derive(serde::Deserialize)]
+struct SegmentV1 {
+    id: SegmentId,
+    embedding: Vec<f32>,
+    content: Content,
+    source: Source,
+    confidence: f32,
+    lineage: Vec<SegmentId>,
+    tier: Tier,
+    relevance_score: f32,
+    access_count: u64,
+    last_accessed: chrono::DateTime<chrono::Utc>,
+    created: chrono::DateTime<chrono::Utc>,
+    associations: Vec<(SegmentId, f32)>,
+    consent_policy: Option<PolicyId>,
+    observable_by: Vec<Principal>,
+    tags: std::collections::HashMap<String, String>,
+}
+
+fn migrate_v0(v: SegmentV0) -> Segment {
+    Segment {
+        id: v.id,
+        embedding: v.embedding,
+        content: v.content,
+        source: v.source,
+        confidence: v.confidence,
+        lineage: v.lineage,
+        tier: v.tier,
+        relevance_score: v.relevance_score,
+        access_count: v.access_count,
+        last_accessed: v.last_accessed,
+        created: v.created,
+        associations: v.associations,
+        consent_policy: v.consent_policy,
+        observable_by: v.observable_by,
+        tags: std::collections::HashMap::new(),
+        alpha: 1.0,
+        beta: 1.0,
+        decay_class: DecayClass::default(),
+    }
+}
+
+fn migrate_v1(v: SegmentV1) -> Segment {
+    Segment {
+        id: v.id,
+        embedding: v.embedding,
+        content: v.content,
+        source: v.source,
+        confidence: v.confidence,
+        lineage: v.lineage,
+        tier: v.tier,
+        relevance_score: v.relevance_score,
+        access_count: v.access_count,
+        last_accessed: v.last_accessed,
+        created: v.created,
+        associations: v.associations,
+        consent_policy: v.consent_policy,
+        observable_by: v.observable_by,
+        tags: v.tags,
+        alpha: 1.0,
+        beta: 1.0,
+        decay_class: DecayClass::default(),
+    }
+}
+
+/// Attempt to deserialize a segment from raw bytes, trying legacy formats
+/// (V1 then V0) if the current format fails.
+///
+/// Returns `Some(segment)` if any version succeeded, `None` if all fail.
+fn try_deserialize_any_version(data: &[u8]) -> Option<(Segment, &'static str)> {
+    if let Ok(s) = bincode::deserialize::<SegmentV1>(data) {
+        return Some((migrate_v1(s), "V1"));
+    }
+    if let Ok(s) = bincode::deserialize::<SegmentV0>(data) {
+        return Some((migrate_v0(s), "V0"));
+    }
+    None
+}
+
+/// Move an unrecoverable segment file to the quarantine directory.
+/// NEVER deletes from disk — per CLAUDE.md VectorFS Memory Rules.
+fn quarantine_segment(path: &Path, quarantine_dir: &Path) {
+    if let Err(e) = fs::create_dir_all(quarantine_dir) {
+        tracing::error!(
+            "cannot create quarantine dir {}: {e}; segment {} left in place",
+            quarantine_dir.display(),
+            path.display()
+        );
+        return;
+    }
+
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown.bin".to_string());
+    let ts = chrono::Utc::now().timestamp();
+    let dest = quarantine_dir.join(format!("{ts}-{file_name}"));
+
+    // Try atomic rename first; fall back to copy+remove for cross-device moves.
+    if fs::rename(path, &dest).is_ok() {
+        tracing::warn!(
+            "quarantined unrecoverable segment: {} → {}",
+            path.display(),
+            dest.display()
+        );
+        return;
+    }
+    match fs::copy(path, &dest) {
+        Ok(_) => {
+            if let Err(e) = fs::remove_file(path) {
+                tracing::warn!(
+                    "quarantined segment to {} but could not remove original: {e}",
+                    dest.display()
+                );
+            } else {
+                tracing::warn!(
+                    "quarantined unrecoverable segment: {} → {}",
+                    path.display(),
+                    dest.display()
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "failed to quarantine segment {} (copy error: {e}); left in place",
+                path.display()
+            );
+        }
+    }
 }
 
 /// File-backed VectorStore using bincode-serialized segment files and HNSW index.
@@ -107,6 +273,8 @@ impl MmapVectorStore {
         let index = HnswIndex::new(dimensionality, 10_000);
         let mut segments = HashMap::new();
 
+        let quarantine_dir = dir.join("quarantine");
+
         // Load existing segments from disk
         for entry in fs::read_dir(&segments_dir)? {
             let entry = entry?;
@@ -122,26 +290,46 @@ impl MmapVectorStore {
                     continue;
                 }
                 let data = fs::read(&path)?;
-                match bincode::deserialize::<Segment>(&data) {
-                    Ok(segment) => {
-                        if segment.embedding.len() != dimensionality {
-                            tracing::warn!(
-                                "segment {} has {} dims (expected {}), removing",
-                                segment.id, segment.embedding.len(), dimensionality
-                            );
-                            let _ = fs::remove_file(&path);
-                            continue;
+                let segment = match bincode::deserialize::<Segment>(&data) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        // Current format failed — try legacy versions before giving up.
+                        match try_deserialize_any_version(&data) {
+                            Some((migrated, version)) => {
+                                tracing::info!(
+                                    "migrated segment {} from legacy format {version} to current",
+                                    migrated.id
+                                );
+                                // Re-persist in current format so future loads succeed.
+                                let final_path = segments_dir.join(format!("{}.bin", migrated.id.0));
+                                let tmp_path = segments_dir.join(format!("{}.bin.tmp", migrated.id.0));
+                                if let Ok(encoded) = bincode::serialize(&migrated) {
+                                    let _ = fs::write(&tmp_path, &encoded)
+                                        .and_then(|_| fs::rename(&tmp_path, &final_path));
+                                }
+                                migrated
+                            }
+                            None => {
+                                // All versions failed — quarantine, never delete.
+                                quarantine_segment(&path, &quarantine_dir);
+                                continue;
+                            }
                         }
-                        if let Err(e) = index.insert(segment.id, &segment.embedding) {
-                            tracing::warn!("failed to index segment {}: {e}", segment.id);
-                            continue;
-                        }
-                        segments.insert(segment.id, segment);
                     }
-                    Err(e) => {
-                        tracing::warn!("failed to load segment from {}: {e}", path.display());
-                    }
+                };
+                if segment.embedding.len() != dimensionality {
+                    tracing::warn!(
+                        "segment {} has {} dims (expected {}), removing",
+                        segment.id, segment.embedding.len(), dimensionality
+                    );
+                    let _ = fs::remove_file(&path);
+                    continue;
                 }
+                if let Err(e) = index.insert(segment.id, &segment.embedding) {
+                    tracing::warn!("failed to index segment {}: {e}", segment.id);
+                    continue;
+                }
+                segments.insert(segment.id, segment);
             }
         }
 
@@ -642,27 +830,37 @@ impl VectorStore for MmapVectorStore {
                     tracing::warn!("Skipping oversized snapshot segment: {}", path.display());
                     continue;
                 }
-                match bincode::deserialize::<Segment>(&data) {
-                    Ok(segment) => {
-                        if segment.embedding.len() != self.dimensionality {
-                            tracing::warn!(
-                                "Skipping snapshot segment {} (dim {} != {})",
-                                segment.id.0, segment.embedding.len(), self.dimensionality
+                let segment = match bincode::deserialize::<Segment>(&data) {
+                    Ok(s) => s,
+                    Err(_) => match try_deserialize_any_version(&data) {
+                        Some((migrated, version)) => {
+                            tracing::info!(
+                                "migrated snapshot segment {} from legacy format {version}",
+                                migrated.id
                             );
+                            migrated
+                        }
+                        None => {
+                            let quarantine_dir = self.base_dir.join("quarantine");
+                            quarantine_segment(&path, &quarantine_dir);
                             continue;
                         }
-                        self.persist_segment(&segment)?;
-                        {
-                            let mut segs = self.segments.write();
-                            if !segs.contains_key(&segment.id) {
-                                self.index.insert(segment.id, &segment.embedding)?;
-                                segs.insert(segment.id, segment);
-                                count += 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Skipping corrupt snapshot segment {}: {e}", path.display());
+                    },
+                };
+                if segment.embedding.len() != self.dimensionality {
+                    tracing::warn!(
+                        "Skipping snapshot segment {} (dim {} != {})",
+                        segment.id.0, segment.embedding.len(), self.dimensionality
+                    );
+                    continue;
+                }
+                self.persist_segment(&segment)?;
+                {
+                    let mut segs = self.segments.write();
+                    if !segs.contains_key(&segment.id) {
+                        self.index.insert(segment.id, &segment.embedding)?;
+                        segs.insert(segment.id, segment);
+                        count += 1;
                     }
                 }
             }

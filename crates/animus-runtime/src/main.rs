@@ -2353,11 +2353,23 @@ async fn run_reasoning_turn(
     {
         let lower = output.content.to_lowercase();
         let hallucination_patterns = [
+            // Messaging (nats_publish, telegram_send)
             "i've sent", "i have sent", "i sent", "message sent",
             "i've published", "i have published", "i published", "published to nats",
             "i've forwarded", "i have forwarded", "forwarded the message",
             "i've delivered", "message delivered", "notification sent",
             "i've notified", "i notified",
+            // File operations (write_file, shell_exec)
+            "i've written", "i've saved the file", "file saved", "wrote to the file",
+            "i've created the file", "file created", "wrote the file",
+            // Memory operations (remember)
+            "i've stored", "i've remembered", "saved to memory", "added to memory",
+            "stored in memory", "i've added it to memory",
+            // Shell execution (shell_exec)
+            "i've executed", "i've run the", "ran the command", "command executed",
+            "executed successfully", "i've run the script",
+            // HTTP / API (http_fetch)
+            "i've fetched", "i fetched the", "retrieved the page",
         ];
         let likely_hallucinated = hallucination_patterns.iter().any(|p| lower.contains(p));
 
@@ -2365,10 +2377,12 @@ async fn run_reasoning_turn(
             tracing::warn!(
                 engine = %output.engine_used,
                 response_preview = %&output.content[..output.content.len().min(200)],
-                "Hallucination detected: model claimed tool use without calling any tool — retrying with corrective prompt"
+                "Hallucination detected: model claimed tool use without calling any tool — retrying with tool_choice:required"
             );
 
-            // Push the hallucinated response as assistant turn, then a corrective user turn
+            // Push the hallucinated response as assistant turn, then a corrective user turn.
+            // Use reason_tool_required on the retry so the engine is forced to emit a tool call
+            // rather than producing another text response.
             {
                 let active = scheduler.active_thread_mut().unwrap();
                 active.push_turn(animus_cortex::Turn::text(
@@ -2382,8 +2396,10 @@ async fn run_reasoning_turn(
                      tool (e.g. nats_publish, telegram_send) to actually perform the action. \
                      Do it now. Call the tool.",
                 ));
+                // SAFETY: tools_slice.is_some() was checked above.
+                let tools_required = tools_slice.unwrap();
                 output = tool_engine
-                    .reason(&system, active.conversation(), tools_slice)
+                    .reason_tool_required(&system, active.conversation(), tools_required)
                     .await
                     .unwrap_or_else(|e| {
                         tracing::error!("Engine error during hallucination retry: {e}");
