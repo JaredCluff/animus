@@ -63,20 +63,41 @@ impl ResilientEmbedding {
     }
 }
 
+/// Number of immediate retries before marking Ollama unhealthy.
+/// Handles the model cold-start case: Ollama responds but returns empty embeddings
+/// while loading mxbai-embed-large. Retrying after a short delay resolves this
+/// without incurring the 30-second cooldown of a full health-mark cycle.
+const IMMEDIATE_RETRIES: usize = 2;
+const RETRY_DELAY_MS: u64 = 500;
+
 #[async_trait::async_trait]
 impl EmbeddingService for ResilientEmbedding {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        // If Ollama is healthy, try it first
+        // If Ollama is healthy, try it — retrying immediately on transient cold-start failures
+        // before escalating to a full mark-unhealthy + 30s cooldown.
         if self.ollama_healthy.load(Ordering::Relaxed) {
-            match self.ollama.embed_text(text).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    tracing::warn!("Ollama embedding failed, falling back to synthetic: {e}");
-                    self.record_failure();
+            for attempt in 0..=IMMEDIATE_RETRIES {
+                match self.ollama.embed_text(text).await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        if attempt < IMMEDIATE_RETRIES {
+                            tracing::debug!(
+                                "Ollama embed attempt {}/{} failed: {e} — retrying in {RETRY_DELAY_MS}ms",
+                                attempt + 1, IMMEDIATE_RETRIES + 1
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                        } else {
+                            tracing::warn!(
+                                "Ollama embedding failed after {} attempts, falling back to synthetic: {e}",
+                                IMMEDIATE_RETRIES + 1
+                            );
+                            self.record_failure();
+                        }
+                    }
                 }
             }
         } else if self.should_retry_ollama() {
-            // Try to reconnect
+            // Periodic reconnect attempt after sustained failure.
             match self.ollama.embed_text(text).await {
                 Ok(v) => {
                     tracing::info!("Ollama reconnected successfully");
@@ -96,11 +117,24 @@ impl EmbeddingService for ResilientEmbedding {
 
     async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if self.ollama_healthy.load(Ordering::Relaxed) {
-            match self.ollama.embed_texts(texts).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    tracing::warn!("Ollama batch embedding failed, falling back to synthetic: {e}");
-                    self.record_failure();
+            for attempt in 0..=IMMEDIATE_RETRIES {
+                match self.ollama.embed_texts(texts).await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        if attempt < IMMEDIATE_RETRIES {
+                            tracing::debug!(
+                                "Ollama batch embed attempt {}/{} failed: {e} — retrying in {RETRY_DELAY_MS}ms",
+                                attempt + 1, IMMEDIATE_RETRIES + 1
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                        } else {
+                            tracing::warn!(
+                                "Ollama batch embedding failed after {} attempts, falling back to synthetic: {e}",
+                                IMMEDIATE_RETRIES + 1
+                            );
+                            self.record_failure();
+                        }
+                    }
                 }
             }
         } else if self.should_retry_ollama() {

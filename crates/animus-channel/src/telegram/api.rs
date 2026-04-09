@@ -116,6 +116,24 @@ struct SendMessageParams<'a> {
     reply_to_message_id: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+struct InlineKeyboardButton<'a> {
+    text: &'a str,
+    url: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct InlineKeyboardMarkup<'a> {
+    inline_keyboard: Vec<Vec<InlineKeyboardButton<'a>>>,
+}
+
+#[derive(Debug, Serialize)]
+struct SendMessageWithButtonParams<'a> {
+    chat_id: i64,
+    text: &'a str,
+    reply_markup: InlineKeyboardMarkup<'a>,
+}
+
 // ---------------------------------------------------------------------------
 // Client implementation
 // ---------------------------------------------------------------------------
@@ -239,6 +257,46 @@ impl TelegramClient {
 
             tracing::info!(chat_id, chars = chunk.len(), "Telegram: sent message");
         }
+        Ok(())
+    }
+
+    /// Send a plain-text message with a single URL inline keyboard button.
+    /// The URL is sent as-is in a JSON field — no HTML encoding — so `&` is preserved exactly.
+    pub async fn send_message_with_url_button(
+        &self,
+        chat_id: i64,
+        text: &str,
+        button_text: &str,
+        button_url: &str,
+    ) -> Result<()> {
+        let params = SendMessageWithButtonParams {
+            chat_id,
+            text,
+            reply_markup: InlineKeyboardMarkup {
+                inline_keyboard: vec![vec![InlineKeyboardButton {
+                    text: button_text,
+                    url: button_url,
+                }]],
+            },
+        };
+        let resp = self
+            .http
+            .post(self.url("sendMessage"))
+            .json(&params)
+            .send()
+            .await
+            .map_err(|e| AnimusError::Llm(format!("sendMessage (button) request failed: {e}")))?;
+        let api_resp: ApiResponse<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| AnimusError::Llm(format!("sendMessage (button) parse failed: {e}")))?;
+        if !api_resp.ok {
+            return Err(AnimusError::Llm(format!(
+                "sendMessage (button) failed: {}",
+                api_resp.description.unwrap_or_default()
+            )));
+        }
+        tracing::info!(chat_id, "Telegram: sent message with URL button");
         Ok(())
     }
 

@@ -6,9 +6,131 @@ use std::{path::PathBuf, sync::Arc};
 
 use super::{ReasoningEngine, ReasoningOutput, Role, StopReason, ToolCall, ToolDefinition, Turn, TurnContent};
 
-const TOKEN_REFRESH_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+/// Token refresh URL — platform.claude.com canonical endpoint.
+const TOKEN_REFRESH_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// Claude Code's public OAuth client ID (the same one used by the Claude CLI).
-const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// Authorization endpoint — matches `claude auth login` exactly.
+pub const OAUTH_AUTH_URL: &str = "https://claude.com/cai/oauth/authorize";
+/// Token exchange endpoint.
+pub const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+
+// ---------------------------------------------------------------------------
+// Global re-auth notifier — fired when the refresh token is rejected (401/403)
+// so the main runtime can initiate a new PKCE browser flow.
+// ---------------------------------------------------------------------------
+
+static OAUTH_REAUTH_NOTIFIER: std::sync::OnceLock<std::sync::Arc<tokio::sync::Notify>> =
+    std::sync::OnceLock::new();
+
+/// Returns the global notifier that fires when OAuth re-authentication is needed.
+/// The main runtime watches this and sends the browser link to the user.
+pub fn oauth_reauth_notifier() -> &'static std::sync::Arc<tokio::sync::Notify> {
+    OAUTH_REAUTH_NOTIFIER.get_or_init(|| std::sync::Arc::new(tokio::sync::Notify::new()))
+}
+
+/// Generate a PKCE (code_verifier, code_challenge) pair.
+/// Returns `(verifier, challenge)` where challenge = BASE64URL(SHA256(verifier)).
+pub fn generate_pkce() -> (String, String) {
+    use base64::Engine;
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    use sha2::Digest;
+    let mut rng = OsRng;
+    let mut verifier_bytes = [0u8; 32];
+    rng.fill_bytes(&mut verifier_bytes);
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
+    let challenge_bytes = sha2::Sha256::digest(verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge_bytes);
+    (verifier, challenge)
+}
+
+/// Generate a random CSRF state token.
+pub fn random_oauth_state() -> String {
+    use base64::Engine;
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    let mut rng = OsRng;
+    let mut bytes = [0u8; 16];
+    rng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Redirect URI — matches `claude auth login` exactly.
+/// After approval platform.claude.com displays the code on-screen for the user to copy.
+pub const OAUTH_CONSOLE_REDIRECT_URI: &str =
+    "https://platform.claude.com/oauth/code/callback";
+
+/// Build the OAuth authorization URL.
+///
+/// Uses `claude.ai/oauth/authorize` with the `console.anthropic.com/oauth/code/callback`
+/// redirect URI so the authorization page displays the code on-screen for the user
+/// to copy and paste into Telegram — no localhost callback server required.
+pub fn build_oauth_url(challenge: &str, state: &str) -> String {
+    // Parameter order and values match `claude auth login` exactly.
+    let params = form_urlencoded_pairs(&[
+        ("code", "true"),
+        ("client_id", CLAUDE_CLIENT_ID),
+        ("response_type", "code"),
+        ("redirect_uri", OAUTH_CONSOLE_REDIRECT_URI),
+        ("scope", "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("state", state),
+    ]);
+    format!("{OAUTH_AUTH_URL}?{params}")
+}
+
+/// Percent-encode query parameters (key=value pairs joined by '&').
+/// Avoids pulling in the `url` crate — uses only `percent-encoding` which
+/// animus-cortex already depends on transitively via reqwest.
+fn form_urlencoded_pairs(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                percent_encode(k.as_bytes()),
+                percent_encode(v.as_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn percent_encode(input: &[u8]) -> String {
+    // application/x-www-form-urlencoded: space → '+', everything else percent-encoded.
+    let mut out = String::with_capacity(input.len() * 2);
+    for &byte in input {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b' ' => out.push('+'),
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Return the path to the Claude Code credentials file (respects `CLAUDE_CREDENTIALS_PATH`).
+pub fn claude_credentials_path_pub() -> PathBuf {
+    claude_credentials_path()
+}
+
+/// Probe whether the stored OAuth credentials are still valid.
+/// If the access token is expired, attempts a refresh.
+/// If the refresh token is also dead, fires `oauth_reauth_notifier()` immediately.
+/// Call this at startup so the user gets a re-auth link without having to send a message first.
+pub async fn probe_oauth_health(client: &reqwest::Client) {
+    match get_claude_code_token(client).await {
+        Ok(_) => tracing::info!("Startup OAuth probe: credentials valid"),
+        Err(AnimusError::NeedsOAuthReAuth) => {
+            tracing::warn!("Startup OAuth probe: credentials dead — re-auth link will be sent");
+            // notify_one() was already called inside get_claude_code_token
+        }
+        Err(e) => tracing::warn!("Startup OAuth probe: {e}"),
+    }
+}
 
 /// How to authenticate with the Anthropic API.
 #[derive(Clone)]
@@ -114,6 +236,14 @@ async fn get_claude_code_token(client: &reqwest::Client) -> Result<String> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // Dead refresh token: 401/403, or 400 with invalid_grant — user must re-authenticate via browser.
+        let needs_reauth = matches!(status.as_u16(), 401 | 403)
+            || (status.as_u16() == 400 && body.contains("invalid_grant"));
+        if needs_reauth {
+            tracing::warn!("OAuth refresh token rejected ({status}) — signaling re-authentication needed");
+            oauth_reauth_notifier().notify_one();
+            return Err(AnimusError::NeedsOAuthReAuth);
+        }
         return Err(AnimusError::Llm(format!("token refresh failed ({status}): {body}")));
     }
 
@@ -222,9 +352,9 @@ impl AnthropicEngine {
     /// Try the best available auth:
     /// `ANTHROPIC_API_KEY` → `CLAUDE_CODE_OAUTH_TOKEN` → credentials file (with refresh) → `ANTHROPIC_OAUTH_TOKEN`.
     ///
-    /// `ANTHROPIC_API_KEY` takes priority when explicitly set — it supports all models including
-    /// Sonnet and Opus. OAuth tokens (from Claude Code CLI or credentials file) only support
-    /// Haiku-class models, so using them with Sonnet/Opus produces a 400.
+    /// `ANTHROPIC_API_KEY` takes priority when explicitly set.
+    /// Claude Max OAuth credentials (from `claude auth login`) support all models including
+    /// Opus, Sonnet, and Haiku — unlike free-tier OAuth which is Haiku-only.
     ///
     /// `CLAUDE_CODE_OAUTH_TOKEN` is the fallback for local dev sessions launched from a Claude Code
     /// terminal where no API key is configured.

@@ -40,6 +40,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        espeak-ng \
         ffmpeg \
         libssl3 \
         python3 \

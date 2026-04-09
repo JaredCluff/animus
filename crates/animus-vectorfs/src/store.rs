@@ -470,6 +470,49 @@ impl MmapVectorStore {
         Ok(())
     }
 
+    /// Replace the embedding for an existing segment with a new vector.
+    ///
+    /// Updates the in-memory segment map, re-indexes the segment in HNSW
+    /// (remove old mapping + insert with new vector), and persists the updated
+    /// segment to disk atomically. Used by the startup synthetic-embedding
+    /// migration to replace hash-based synthetic vectors with real embeddings.
+    ///
+    /// The old HNSW entry becomes a ghost node (no SegmentId mapping), which
+    /// is harmless — search results filter unmapped nodes via filter_map.
+    pub fn update_embedding(&self, id: SegmentId, embedding: Vec<f32>) -> Result<()> {
+        if embedding.len() != self.dimensionality {
+            return Err(AnimusError::DimensionMismatch {
+                expected: self.dimensionality,
+                actual: embedding.len(),
+            });
+        }
+        if embedding.iter().any(|v| !v.is_finite()) {
+            return Err(AnimusError::Storage(
+                "replacement embedding contains NaN or Inf".to_string(),
+            ));
+        }
+
+        let segment_clone = {
+            let mut segments = self.segments.write();
+            let seg = segments
+                .get_mut(&id)
+                .ok_or(AnimusError::SegmentNotFound(id.0))?;
+            seg.embedding = embedding.clone();
+            seg.clone()
+        };
+
+        // Re-index: remove old vector mapping, insert new one.
+        // hnsw_rs doesn't support true deletion; remove() clears the ID map entry
+        // so the old vector becomes an unreachable ghost. The new insert gives
+        // the segment a fresh internal ID pointing to the real embedding.
+        let _ = self.index.remove(id); // ok if not in index
+        if let Err(e) = self.index.insert(id, &embedding) {
+            tracing::warn!("update_embedding: HNSW re-insert for {id} failed: {e}");
+        }
+
+        self.persist_segment(&segment_clone)
+    }
+
     /// Remove a segment file from disk.
     fn remove_segment_file(&self, id: SegmentId) -> Result<()> {
         let path = self

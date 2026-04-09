@@ -1,86 +1,99 @@
 # Animus ↔ Claude Code Communication Protocol
 
-Shared filesystem channel for bidirectional communication between the Animus daemon
-and Claude Code running on the same Mac Studio host.
+NATS message bus for bidirectional communication between the Animus daemon
+and Claude Code, bridged by the **nuntius** MCP server.
 
-## Directory Layout
+## Architecture
 
 ```
-~/animus-comms/           (host path)
-/home/animus/comms/       (container path, same directory via bind mount)
-├── to-claude/            Animus writes here; Claude Code reads
-└── from-claude/          Claude Code writes here; Animus reads
+Claude Code  ←→  nuntius (MCP server)  ←→  NATS  ←→  Animus (container)
 ```
 
-## Message Format
+- **nuntius**: MCP server that bridges NATS ↔ Claude Code. Runs as a local process.
+  Subscribes to `animus.out.>` and delivers messages as MCP channel notifications.
+  Provides `nats_publish`/`nats_subscribe` tools for Claude Code to send messages.
+- **NATS**: Runs inside the Animus pod (`animus-nats` container) on port 14222,
+  exposed to localhost.
+- **Animus**: Subscribes to `animus.in.>` via the NATS channel adapter.
+  Publishes responses to `animus.out.*` via the channel bus.
+  Can proactively publish to `animus.out.claude` via the `nats_publish` tool.
 
-Each message is a JSON file named `<timestamp>-<id>.json`:
+## Subjects
 
+| Subject Pattern    | Direction         | Purpose                                  |
+|--------------------|-------------------|------------------------------------------|
+| `animus.in.*`      | Claude → Animus   | Messages addressed to Animus. Leaf = sender ID. |
+| `animus.out.*`     | Animus → Claude   | Responses and proactive messages. Leaf = recipient. |
+| `animus.out.claude` | Animus → Claude  | The subject Claude Code listens on.      |
+| `animus.in.claude`  | Claude → Animus  | Messages from Claude Code to Animus.     |
+| `animus.in.permission_request` | Claude → Animus | Permission request/reply (NATS request pattern). |
+
+## Sending a Message (Claude Code → Animus)
+
+Via nuntius MCP tools:
+```
+nats_publish(subject="animus.in.claude", payload="Hello from Claude Code")
+```
+
+Or via Claude Code's channel system (automatic when using `server:nuntius` channel).
+
+## Sending a Message (Animus → Claude Code)
+
+Animus calls its `nats_publish` tool:
+```
+nats_publish(subject="animus.out.claude", payload="Task complete.")
+```
+
+Replies to inbound NATS messages are routed automatically by the channel bus —
+Animus just responds in the conversation thread.
+
+## Debug Mirror
+
+When `ANIMUS_NATS_DEBUG=1`, all NATS traffic is mirrored to Telegram as
+`[NATS-DBG]` messages for visibility. This covers:
+- Inbound messages from NATS
+- Outbound responses via the channel bus
+- Proactive publishes via the `nats_publish` tool
+
+## MCP Channel Notification Format
+
+nuntius delivers messages to Claude Code as JSON-RPC notifications:
 ```json
 {
-  "id": "short-uuid",
-  "from": "animus" | "claude",
-  "timestamp": "2026-03-23T14:00:00Z",
-  "type": "message" | "request" | "response" | "alert",
-  "subject": "one-line summary",
-  "content": "full message body",
-  "in_reply_to": "id of message being replied to, or null",
-  "status": "pending" | "read" | "done"
+  "jsonrpc": "2.0",
+  "method": "notifications/claude/channel",
+  "params": {
+    "content": "message text",
+    "meta": {
+      "subject": "animus.out.claude",
+      "ts": "2026-03-29T01:00:00+00:00"
+    }
+  }
 }
 ```
 
-## How Animus Sends a Message
+## Configuration
 
-```python
-import json, uuid
-from datetime import datetime
-
-msg = {
-    "id": str(uuid.uuid4())[:8],
-    "from": "animus",
-    "timestamp": datetime.utcnow().isoformat() + "Z",
-    "type": "message",
-    "subject": "Memory audit complete",
-    "content": "Ran /audit. Found 170 duplicate wake summaries. Ready to prune.",
-    "in_reply_to": None,
-    "status": "pending"
+**nuntius** (`.mcp.json` or plugin config):
+```json
+{
+  "mcpServers": {
+    "nuntius": {
+      "command": "/path/to/nuntius",
+      "env": {
+        "NUNTIUS_NATS_URL": "nats://localhost:14222",
+        "NUNTIUS_STARTUP_SUBS": "animus.out.>"
+      }
+    }
+  }
 }
-
-with open(f"/home/animus/comms/to-claude/{msg['timestamp']}-{msg['id']}.json", "w") as f:
-    json.dump(msg, f, indent=2)
 ```
 
-Or using shell_exec + python3:
-```
-python3 -c "
-import json, uuid
-from datetime import datetime, timezone
-msg = {'id': str(uuid.uuid4())[:8], 'from': 'animus', 'timestamp': datetime.now(timezone.utc).isoformat(), 'type': 'message', 'subject': 'hello', 'content': 'Test message from Animus', 'in_reply_to': None, 'status': 'pending'}
-path = f\"/home/animus/comms/to-claude/{msg['timestamp']}-{msg['id']}.json\"
-open(path, 'w').write(json.dumps(msg, indent=2))
-print('sent:', path)
-"
-```
+**Animus** (`compose.yaml` / env):
+- `ANIMUS_NATS_URL`: NATS server URL (default: `nats://nats:14222` inside container)
+- `ANIMUS_NATS_DEBUG`: Set to `1` to enable debug mirror to Telegram
 
-## How Claude Code Checks for Messages
+## Legacy: Filesystem Protocol
 
-Claude Code reads `~/animus-comms/to-claude/` and replies by writing to `~/animus-comms/from-claude/`.
-
-## How Animus Reads Replies
-
-```python
-import json, os
-
-for fname in sorted(os.listdir("/home/animus/comms/from-claude/")):
-    if fname.endswith(".json"):
-        with open(f"/home/animus/comms/from-claude/{fname}") as f:
-            msg = json.load(f)
-        print(f"[{msg['subject']}] {msg['content']}")
-```
-
-## Conventions
-
-- Messages are append-only; never delete or overwrite
-- Mark a message read by updating `"status": "read"` in place
-- Use `"type": "request"` when you need a response; `"type": "message"` for one-way info
-- Keep `subject` under 80 chars — it's used as a log line
+The original filesystem-based protocol (`~/animus-comms/to-claude/`, `~/animus-comms/from-claude/`)
+is superseded by NATS. The bind mount still exists in `compose.yaml` but is not actively used.

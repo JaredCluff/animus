@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "animus-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "animus-embed"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "animus-core",
  "async-trait",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "animus-federation"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "animus-core",
  "animus-cortex",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "animus-mnemos"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "animus-core",
  "animus-vectorfs",
@@ -159,8 +159,10 @@ dependencies = [
  "chrono",
  "rand 0.8.5",
  "serde",
+ "serde_json",
  "tempfile",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -201,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "animus-sensorium"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "animus-core",
  "arboard",
@@ -218,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "animus-tests"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "animus-core",
  "animus-cortex",
@@ -241,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "animus-vectorfs"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "animus-core",
  "bincode",
@@ -259,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "animus-voice"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "animus-core",
  "async-trait",
