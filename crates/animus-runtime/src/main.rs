@@ -235,6 +235,44 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         }
     }
 
+    // Fix any memories stored with synthetic (hash-based) embeddings.
+    // Runs after the reembed-queue pass so dimensionality migrations settle first.
+    let remaining_synthetic = reembed_synthetic_segments(&store, &*embedder).await;
+    if remaining_synthetic > 0 {
+        // Ollama was warming up during the initial pass — spawn a background task
+        // that retries once per minute until all segments are fixed or Ollama stays
+        // unavailable for 10 minutes.
+        let retry_store = store.clone();
+        let retry_embedder = embedder.clone();
+        tokio::spawn(async move {
+            for attempt in 1u32..=10 {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let still_remaining = reembed_synthetic_segments(&retry_store, &*retry_embedder).await;
+                if still_remaining == 0 {
+                    tracing::info!(
+                        "Synthetic embedding migration complete on background retry (attempt {attempt})"
+                    );
+                    break;
+                }
+                tracing::debug!(
+                    "Synthetic embedding background retry {attempt}/10: {still_remaining} segments still pending"
+                );
+            }
+        });
+    }
+
+    // ── Persistent short-term memory ("The Dreaming Effect") ────────────
+    // Append-only journal that captures every conversation turn to disk
+    // immediately. No embedding, no LLM — just raw text + fsync. Survives
+    // container restarts, crashes, and embedder failures. Background
+    // "dreaming" consolidates journal entries into VectorFS segments later.
+    let journal_path = data_dir.join("conversation_journal.jsonl");
+    let mut conversation_journal = animus_mnemos::ConversationJournal::open(&journal_path)?;
+    tracing::info!(
+        "Conversation journal opened: {} existing entries",
+        conversation_journal.entry_count()
+    );
+
     // Compute snapshot directory — outside data_dir so the shell_exec guard covers both.
     let snapshot_dir: PathBuf = if config.snapshot.snapshot_dir.is_empty() {
         // Default: sibling of data_dir, named "<data_dir_name>-snapshots"
@@ -286,13 +324,17 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     network_monitor.start();
     tracing::info!("NetworkMonitor started (30s poll interval)");
 
-    // Start process monitor sensor
+    // Start process monitor sensor (respects config flag)
     let mut process_monitor = animus_sensorium::sensors::process_monitor::ProcessMonitor::new(
         event_bus.clone(),
         std::time::Duration::from_secs(30),
     );
-    process_monitor.start();
-    tracing::info!("ProcessMonitor started (30s poll interval)");
+    if config.sensorium.process_monitoring_enabled {
+        process_monitor.start();
+        tracing::info!("ProcessMonitor started (30s poll interval)");
+    } else {
+        tracing::info!("ProcessMonitor disabled by config");
+    }
 
     // Start clipboard monitor — skip in headless/container environments (no display server)
     let headless = std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err();
@@ -322,7 +364,22 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     let fallback_url = config.cortex.fallback_url.trim_end_matches('/').to_string();
     let fallback_provider = config.cortex.fallback_provider.clone();
     let discovered_local_models: Vec<String> = {
-        discover_models_at_endpoint(&fallback_url, "").await
+        let raw = discover_models_at_endpoint(&fallback_url, "").await;
+        // Apply allowlist immediately — before safety-net engine registration and
+        // model plan building, so non-allowed models never enter any downstream list.
+        if config.cortex.ollama_allowed_models.is_empty() {
+            raw
+        } else {
+            let allowed = &config.cortex.ollama_allowed_models;
+            let filtered: Vec<String> = raw.into_iter()
+                .filter(|m| allowed.iter().any(|a| a == m))
+                .collect();
+            tracing::info!(
+                "Ollama allowlist active ({} allowed): {} of discovered models admitted",
+                allowed.len(), filtered.len()
+            );
+            filtered
+        }
     };
     // Resolve which model the safety net uses: explicit config > first discovered > empty
     let fallback_model: Option<String> = if !config.cortex.fallback_model.is_empty() {
@@ -480,6 +537,33 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     tracing::info!("{role:?} role: {role_provider}/{model} @ {role_url}");
                     registry.register_named(&role_provider, model, arc_engine.clone());
                     registry.set_engine(role, arc_engine);
+                }
+            }
+        }
+
+        // Register sibling Anthropic models.
+        // When the primary provider is Anthropic and credentials exist, instantiate
+        // engines for all known Anthropic models in the capability catalog.
+        // Claude Max OAuth supports all model tiers (Opus, Sonnet, Haiku) — the
+        // SmartRouter scores them per task class, using Opus for deep reasoning,
+        // Sonnet for technical work, and Haiku for fast conversational responses.
+        // Local models remain available as tail-end fallbacks and for background
+        // cognitive roles (Perception, Reflection).
+        if provider_str == "anthropic" {
+            let sibling_models = ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"];
+            for sibling in &sibling_models {
+                if registry.engine_by_spec("anthropic", sibling).is_some() {
+                    continue; // Already registered (e.g. the primary model)
+                }
+                match AnthropicEngine::from_best_available(sibling, 4096) {
+                    Ok(engine) => {
+                        let arc: Arc<dyn animus_cortex::ReasoningEngine> = Arc::new(engine);
+                        registry.register_named("anthropic", sibling, arc);
+                        tracing::info!("Anthropic sibling engine registered: anthropic/{sibling}");
+                    }
+                    Err(e) => {
+                        tracing::debug!("Anthropic sibling {sibling} skipped (no credentials): {e}");
+                    }
                 }
             }
         }
@@ -1177,6 +1261,10 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         tracing::warn!("ChannelBus start error: {e}");
     }
 
+    // Shared state for the OAuth PKCE re-auth flow
+    let pending_oauth: PendingOAuthState = Arc::new(parking_lot::Mutex::new(None));
+    let credentials_path = animus_cortex::llm::anthropic::claude_credentials_path_pub();
+
     // Start health + invoke endpoint (after channel_bus is ready)
     if let Some(bind) = health_bind {
         start_health_server(
@@ -1185,6 +1273,8 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
             format!("{}", identity.instance_id),
             Some(channel_bus.clone()),
             http_responses.clone(),
+            pending_oauth.clone(),
+            credentials_path.clone(),
         );
     }
 
@@ -1278,6 +1368,59 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         }
     };
 
+    // ── Journal recovery: rebuild recent conversation context ─────────
+    // Unlike reconstitution (which depends on LLM + embedder), this reads
+    // raw conversation history from the durable journal. Even if the embedder
+    // was cold or crashed on the last run, the journal has everything.
+    let mut journal_turn_count = 0u32;
+    let mut journal_context = {
+        match animus_mnemos::ConversationJournal::read_recent(&journal_path, 30) {
+            Ok(entries) if !entries.is_empty() => {
+                let mut ctx = String::with_capacity(8192);
+                ctx.push_str("## Recent Conversation Journal (recovered from persistent storage)\n");
+                ctx.push_str("The following conversations happened before this session started.\n");
+                ctx.push_str("Use this to maintain continuity — you remember these exchanges.\n\n");
+                let mut total_chars = 0usize;
+                const MAX_JOURNAL_CHARS: usize = 12_000;
+                // Take entries from newest to oldest, but display chronologically
+                let mut display_entries: Vec<&animus_mnemos::JournalEntry> = Vec::new();
+                for entry in entries.iter().rev() {
+                    let entry_size = entry.input.len() + entry.output.len() + 80;
+                    if total_chars + entry_size > MAX_JOURNAL_CHARS {
+                        break;
+                    }
+                    total_chars += entry_size;
+                    display_entries.push(entry);
+                }
+                display_entries.reverse(); // chronological order
+                for entry in &display_entries {
+                    ctx.push_str(&format!(
+                        "[{} via {} thread:{}]\nUser: {}\nAnimus: {}\n\n",
+                        entry.timestamp.format("%Y-%m-%d %H:%M UTC"),
+                        entry.channel_id,
+                        entry.thread_id,
+                        truncate_safe(&entry.input, 2000),
+                        truncate_safe(&entry.output, 2000),
+                    ));
+                }
+                tracing::info!(
+                    "Journal recovery: {} entries loaded ({} chars of context)",
+                    display_entries.len(),
+                    total_chars,
+                );
+                Some(ctx)
+            }
+            Ok(_) => {
+                tracing::info!("No journal entries to recover");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Journal recovery failed: {e}");
+                None
+            }
+        }
+    };
+
     // Start Perception loop (replaces mechanical event processing)
     let perception_signal_tx = signal_tx.clone();
     let perception_store = store.clone();
@@ -1339,6 +1482,98 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
         }
     });
     tracing::info!("Mnemos periodic consolidation started (60 min interval, similarity ≥ 0.85)");
+
+    // ── Dreaming: journal → VectorFS consolidation (every 5 minutes) ──
+    // Reads unconsolidated journal entries, embeds them, and stores as
+    // proper VectorFS Episodic segments. This is the background "dreaming"
+    // that turns raw conversation captures into searchable long-term memory.
+    let dreaming_store = gated_store.clone();
+    let dreaming_embedder = embedder.clone();
+    let dreaming_journal_path = journal_path.clone();
+    tokio::spawn(async move {
+        // Wait 2 minutes after boot to let embedder warm up
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        interval.tick().await; // skip first immediate tick
+        loop {
+            interval.tick().await;
+            match animus_mnemos::ConversationJournal::read_unconsolidated(&dreaming_journal_path) {
+                Ok(entries) if entries.is_empty() => {
+                    tracing::debug!("Dreaming: no unconsolidated journal entries");
+                }
+                Ok(entries) => {
+                    tracing::info!("Dreaming: consolidating {} journal entries", entries.len());
+                    let mut consolidated = 0usize;
+                    let mut last_id = String::new();
+                    for entry in &entries {
+                        // Build a full-text record (no truncation — this is long-term memory)
+                        let record = format!(
+                            "[{} channel:{} thread:{}]\nUser: {}\nAnimus: {}",
+                            entry.timestamp.format("%Y-%m-%d %H:%M UTC"),
+                            entry.channel_id,
+                            entry.thread_id,
+                            entry.input,
+                            entry.output,
+                        );
+                        match dreaming_embedder.embed_text(&record).await {
+                            Ok(embedding) => {
+                                // Use Source::Conversation for correct decay inference,
+                                // federation filtering, and structured metadata.
+                                // Derive a deterministic ThreadId from channel+thread
+                                // so all entries from the same conversation group together.
+                                let thread_uuid = uuid::Uuid::new_v5(
+                                    &uuid::Uuid::NAMESPACE_URL,
+                                    format!("{}:{}", entry.channel_id, entry.thread_id).as_bytes(),
+                                );
+                                let mut seg = Segment::new(
+                                    Content::Text(record),
+                                    embedding,
+                                    Source::Conversation {
+                                        thread_id: animus_core::identity::ThreadId(thread_uuid),
+                                        turn: 0, // journal doesn't track per-thread turn numbers
+                                    },
+                                );
+                                // Override decay: conversation exchanges are episodic
+                                // (14-day half-life), not General (30-day).
+                                seg.decay_class = DecayClass::Episodic;
+                                // Tag with journal entry ID for dedup on re-consolidation.
+                                seg.tags.insert("journal_id".to_string(), entry.id.clone());
+                                match dreaming_store.store(seg) {
+                                    Ok(_) => {
+                                        consolidated += 1;
+                                        last_id = entry.id.clone();
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Dreaming: failed to store segment: {e}");
+                                        break; // stop on store error, retry next cycle
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Dreaming: embedder unavailable, will retry next cycle: {e}"
+                                );
+                                break; // embedder cold — try again in 5 min
+                            }
+                        }
+                    }
+                    if consolidated > 0 {
+                        if let Err(e) = animus_mnemos::ConversationJournal::advance_watermark(
+                            &dreaming_journal_path,
+                            &last_id,
+                        ) {
+                            tracing::warn!("Dreaming: failed to advance watermark: {e}");
+                        }
+                        tracing::info!("Dreaming: consolidated {consolidated}/{} entries into VectorFS", entries.len());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Dreaming: failed to read journal: {e}");
+                }
+            }
+        }
+    });
+    tracing::info!("Dreaming consolidation started (5 min interval, 2 min initial delay)");
 
     // Start Reflection loop (replaces standalone consolidation)
     let reflection_signal_tx = signal_tx.clone();
@@ -1429,7 +1664,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 };
                 for (id, threshold, text) in pending {
                     alerted.insert((id, threshold));
-                    let _ = deadline_tx.send(ProactiveMessage { text, source: "goal_deadline" }).await;
+                    let _ = deadline_tx.send(ProactiveMessage { text, source: "goal_deadline", urgent: false }).await;
                 }
             }
         });
@@ -1441,6 +1676,23 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
     interface.display_banner(instance_str.get(..8).unwrap_or(&instance_str), engine_registry.engine_for(CognitiveRole::Reasoning).model_name(), segment_count);
     if let Some(thread) = scheduler.active_thread() {
         interface.display_status(&format!("Active thread: {}", thread.name));
+    }
+
+    // Startup OAuth health check — if Anthropic credentials are expired/invalid, fire re-auth
+    // proactively rather than waiting for the first user message to discover it.
+    {
+        let creds_path = animus_cortex::llm::anthropic::claude_credentials_path_pub();
+        if creds_path.exists() {
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .ok();
+            if let Some(client) = http {
+                // Attempt a token refresh; if credentials are bad, the notifier fires immediately.
+                // We ignore the result — the notifier arm in the main loop handles the link.
+                let _ = animus_cortex::llm::anthropic::probe_oauth_health(&client).await;
+            }
+        }
     }
 
     // Sleep/wake state
@@ -1563,6 +1815,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 if let Err(e) = proactive_tx.try_send(ProactiveMessage {
                     text: signal.summary.trim_start_matches("Adapting: ").to_string(),
                     source: "model_adaptation",
+                    urgent: false,
                 }) {
                     tracing::warn!("adaptation signal dropped — proactive channel full: {e}");
                 }
@@ -1572,6 +1825,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                 if let Err(e) = proactive_tx.try_send(ProactiveMessage {
                     text: signal.summary.clone(),
                     source: "signal",
+                    urgent: false,
                 }) {
                     tracing::warn!("urgent signal dropped — proactive channel full: {e}");
                 }
@@ -1669,23 +1923,90 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                     &*embedder,
                     &goals,
                     reconstitution_summary.as_deref(),
+                    journal_context.as_deref(),
                     None, // terminal has no peripheral awareness injection
                     &system_prompt_preamble,
                     &system_prompt_suffix,
                     conversation_budget_override,
                 ).await;
 
-                match response {
-                    Ok(text) => interface.display_response(&text),
-                    Err(e) => interface.display_status(&format!("Error: {e}")),
+                let response_text = match response {
+                    Ok(text) => {
+                        interface.display_response(&text);
+                        text
+                    }
+                    Err(e) => {
+                        let msg = format!("Sorry, I encountered an error: {e}");
+                        interface.display_status(&format!("Error: {e}"));
+                        msg
+                    }
+                };
+
+                // ── Journal: persist terminal conversation turn ──────
+                {
+                    let entry = animus_mnemos::new_journal_entry(
+                        "terminal",
+                        "stdin",
+                        &input,
+                        &response_text,
+                    );
+                    if let Err(e) = conversation_journal.append(&entry) {
+                        tracing::error!("CRITICAL: Failed to write conversation journal: {e}");
+                    }
+                }
+
+                // Expire journal recovery context after enough turns
+                if journal_context.is_some() {
+                    journal_turn_count += 1;
+                    if journal_turn_count >= 5 {
+                        tracing::info!("Journal recovery context expired after {journal_turn_count} turns");
+                        journal_context = None;
+                    }
+                }
+            }
+
+            // ── OAuth re-auth signal (refresh token rejected) ───────────────
+            _ = animus_cortex::llm::anthropic::oauth_reauth_notifier().notified() => {
+                // Only start one flow at a time
+                if pending_oauth.lock().is_none() {
+                    let (verifier, challenge) = animus_cortex::llm::anthropic::generate_pkce();
+                    let oauth_state = animus_cortex::llm::anthropic::random_oauth_state();
+                    let url = animus_cortex::llm::anthropic::build_oauth_url(&challenge, &oauth_state);
+                    *pending_oauth.lock() = Some(PendingOAuth { code_verifier: verifier, csrf_state: oauth_state });
+                    tracing::warn!("OAuth re-auth needed — sending link to user");
+                    // Send as an inline keyboard URL button (not HTML text) so Telegram preserves
+                    // the exact URL — no HTML entity encoding of '&' separators.
+                    let chat_id_opt = active_telegram_chat_id.lock().as_ref().copied()
+                        .or_else(|| config.security.trusted_telegram_ids.first().copied());
+                    if let Some(chat_id) = chat_id_opt {
+                        let mut outbound = OutboundMessage::text(
+                            "telegram",
+                            &chat_id.to_string(),
+                            "Anthropic authentication expired. Tap the button below to reconnect,\
+                             then paste the code shown on Anthropic's page back here.",
+                        );
+                        outbound.metadata = serde_json::json!({
+                            "url_button": {
+                                "text": "Sign in with Claude",
+                                "url": url
+                            }
+                        });
+                        if let Err(e) = channel_bus.send(outbound).await {
+                            tracing::warn!("OAuth re-auth: failed to send link: {e}");
+                        } else {
+                            tracing::info!(chat_id, source = "oauth_reauth", "Proactive message sent");
+                        }
+                    } else {
+                        tracing::warn!("OAuth re-auth: no known chat_id to deliver link to");
+                    }
                 }
             }
 
             // ── Proactive message from background cognitive loops ────────────
             proactive_msg = proactive_rx.recv() => {
                 let Some(pm) = proactive_msg else { continue };
-                // Only deliver if autonomy mode permits independent action.
-                if autonomy_mode == animus_core::config::AutonomyMode::Reactive {
+                // Only deliver if autonomy mode permits independent action — unless urgent.
+                if autonomy_mode == animus_core::config::AutonomyMode::Reactive && !pm.urgent {
                     tracing::debug!(source = pm.source, "Proactive message suppressed (Reactive mode)");
                     continue;
                 }
@@ -1891,6 +2212,24 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string());
 
+                        // ── OAuth callback paste handler ───────────────────
+                        // Phone users can't reach localhost:8081 after OAuth approval.
+                        // They copy the redirect URL from their browser's address bar and
+                        // paste it here. We detect it and complete the token exchange inline.
+                        if input_text.contains("/oauth/callback") ||
+                           (input_text.contains("code=") && input_text.contains("state=")) {
+                            let reply_text = match complete_oauth_exchange_from_url(&input_text, &pending_oauth, &credentials_path).await {
+                                Ok(()) => "Anthropic authentication complete! I'll use Haiku on the next message.".to_string(),
+                                Err(e) => format!("OAuth exchange failed: {e}"),
+                            };
+                            let mut out = OutboundMessage::text(&channel_id, &thread_id_str, reply_text);
+                            if let Some(id) = reply_to {
+                                out.metadata = serde_json::json!({"telegram_message_id": id});
+                            }
+                            let _ = channel_bus.send(out).await;
+                            continue;
+                        }
+
                         // ── NATS debug mirror: inbound ─────────────────────
                         if nats_debug && channel_id == "nats" {
                             if let Some(chat_id) = trusted_chat_id {
@@ -1936,6 +2275,7 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                             &*embedder,
                             &goals,
                             reconstitution_summary.as_deref(),
+                            journal_context.as_deref(),
                             awareness_block.as_deref(),
                             &system_prompt_preamble,
                             &system_prompt_suffix,
@@ -1948,6 +2288,17 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         };
 
                         // Send text response
+                        // Guard: don't send empty messages to Telegram (causes API error).
+                        // This happens when a model responds with only tool calls and no text.
+                        let response_text = if response_text.trim().is_empty() {
+                            tracing::warn!(
+                                "Engine returned empty text content — sending fallback message"
+                            );
+                            "I processed your request but couldn't formulate a text response. Please try again.".to_string()
+                        } else {
+                            response_text
+                        };
+
                         tracing::info!(
                             channel = %channel_id,
                             thread = %thread_id_str,
@@ -2021,29 +2372,37 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
                         // Set idle after response sent (runs even on error path above).
                         situational_awareness.set_idle(thread_key);
 
-                        // ── Auto-persist channel exchange to VectorFS ────────
-                        // Stores a compact record of every channel turn so Animus
-                        // can recall cross-channel conversations (e.g. NATS↔Telegram).
+                        // ── Journal: persist full conversation turn to disk ───
+                        // Written BEFORE VectorFS auto-persist because this has
+                        // zero dependencies (no embedder, no LLM). If the embedder
+                        // is cold or crashed, the journal still captures everything.
                         {
-                            let record = format!(
-                                "[channel:{channel_id} thread:{thread_id_str}]\nIN: {}\nOUT: {}",
-                                &input_text[..input_text.len().min(800)],
-                                &response_text[..response_text.len().min(800)],
+                            let entry = animus_mnemos::new_journal_entry(
+                                &channel_id,
+                                &thread_id_str,
+                                &input_text,
+                                &response_text,
                             );
-                            if let Ok(embedding) = embedder.embed_text(&record).await {
-                                let mut seg = Segment::new(
-                                    Content::Text(record),
-                                    embedding,
-                                    Source::Manual {
-                                        description: format!("channel:{channel_id} thread:{thread_id_str}"),
-                                    },
-                                );
-                                seg.decay_class = DecayClass::Episodic;
-                                if let Err(e) = gated_store.store(seg) {
-                                    tracing::warn!("Failed to auto-persist channel exchange: {e}");
-                                }
+                            if let Err(e) = conversation_journal.append(&entry) {
+                                tracing::error!("CRITICAL: Failed to write conversation journal: {e}");
                             }
                         }
+
+                        // Expire journal recovery context after enough turns in this session.
+                        // The recovered history is already in the conversation thread at this
+                        // point — keeping it in the system prompt just wastes tokens.
+                        if journal_context.is_some() {
+                            journal_turn_count += 1;
+                            if journal_turn_count >= 5 {
+                                tracing::info!("Journal recovery context expired after {journal_turn_count} turns");
+                                journal_context = None;
+                            }
+                        }
+
+                        // NOTE: The old auto-persist (truncated to 800 chars, embedder-dependent)
+                        // has been removed. The journal write above + dreaming consolidation
+                        // background task now handles durable VectorFS persistence with full
+                        // text, no truncation, and no embedder dependency at write time.
                     }
                 }
             }
@@ -2057,6 +2416,17 @@ async fn run(data_dir: PathBuf, config: AnimusConfig) -> animus_core::Result<()>
 
     // Graceful shutdown
     interface.display_status("Shutting down...");
+
+    // Flush conversation journal first — this is the most critical persistence
+    // operation. Everything else can be reconstructed; conversation context cannot.
+    if let Err(e) = conversation_journal.flush() {
+        tracing::error!("CRITICAL: Failed to flush conversation journal on shutdown: {e}");
+    } else {
+        tracing::info!(
+            "Conversation journal flushed ({} entries)",
+            conversation_journal.entry_count()
+        );
+    }
 
     // Stop sensors
     network_monitor.stop();
@@ -2132,6 +2502,7 @@ async fn run_reasoning_turn(
     embedder: &dyn animus_core::EmbeddingService,
     goals: &Arc<parking_lot::Mutex<GoalManager>>,
     reconstitution_summary: Option<&str>,
+    journal_context: Option<&str>,
     peripheral_awareness: Option<&str>,
     prompt_preamble: &str,
     prompt_suffix: &str,
@@ -2144,7 +2515,7 @@ async fn run_reasoning_turn(
 
     let system = {
         let goals_guard = goals.lock();
-        build_system_prompt(scheduler, &goals_guard, tool_registry, reconstitution_summary, peripheral_awareness, prompt_preamble, prompt_suffix)
+        build_system_prompt(scheduler, &goals_guard, tool_registry, reconstitution_summary, journal_context, peripheral_awareness, prompt_preamble, prompt_suffix)
     };
 
     // Determine routing constraints from sensitivity scan and budget pressure
@@ -2257,6 +2628,15 @@ async fn run_reasoning_turn(
     const MAX_TOOL_ROUNDS: usize = 10;
 
     let primary_engine_name = engine_refs.first().map(|e| e.model_name().to_string());
+
+    // Inject the actual engine name so Animus can answer factually about which model is running it.
+    // The LLM has no other way to know — it must be told explicitly in the system prompt.
+    let system = match primary_engine_name.as_deref() {
+        Some(name) => format!(
+            "{system}\n\n## Current Engine\nYou are currently being executed by engine: {name}. When asked which model, engine, or AI is responding, state this accurately.",
+        ),
+        None => system,
+    };
 
     // OpenTelemetry: trace the reasoning turn
     let mut reasoning_span = observability::ReasoningSpan::start(
@@ -2630,6 +3010,117 @@ fn grounding_check(response: &str, turn_calls: &[animus_cortex::tools::TurnToolC
 }
 
 // ---------------------------------------------------------------------------
+// Startup: synthetic embedding migration
+// ---------------------------------------------------------------------------
+
+/// Scan all loaded VectorFS segments and replace synthetic (hash-based) embeddings
+/// with real semantic embeddings from the current embedder.
+///
+/// Synthetic embeddings are identified by every component being non-negative
+/// (≥ −1e-6). This is a mathematically reliable fingerprint of the byte-
+/// accumulation hash formula in `animus_embed::SyntheticEmbedding`: bytes are
+/// in [0, 255], dividing by 255 keeps them non-negative, and L2 normalisation
+/// preserves sign, so all synthetic values land in [0, 1] after normalisation.
+/// Real mxbai-embed-large embeddings (1024-dim) have ~50% negative values; the
+/// probability of all 1024 dims being non-negative by chance is ≈ 0.5^1024 ≈ 0.
+///
+/// Only `Content::Text` segments can be re-embedded (other variants have no
+/// recoverable text). Non-text synthetic segments are logged and skipped.
+///
+/// The function is idempotent: segments already holding real embeddings are
+/// skipped in O(dim) time with no disk I/O.
+/// Returns the number of synthetic segments that could NOT be re-embedded this run
+/// (e.g. because Ollama was warming up). A non-zero return means the caller should
+/// schedule a retry once the embedder is available.
+async fn reembed_synthetic_segments(
+    store: &Arc<MmapVectorStore>,
+    embedder: &dyn animus_core::EmbeddingService,
+) -> usize {
+    let ids = store.segment_ids(None);
+    let total = ids.len();
+    if total == 0 {
+        return 0;
+    }
+
+    let mut synthetic_count = 0usize;
+    let mut fixed = 0usize;
+    let mut skipped_non_text = 0usize;
+    let mut embed_errors = 0usize;
+
+    for id in &ids {
+        let seg = match store.get_raw(*id) {
+            Ok(Some(s)) => s,
+            _ => continue,
+        };
+
+        // Fast real-embedding check: any negative value → definitely real.
+        if !seg.embedding.iter().all(|&v| v >= -1e-6) {
+            continue;
+        }
+        synthetic_count += 1;
+
+        let text = match &seg.content {
+            Content::Text(t) => t.clone(),
+            _ => {
+                skipped_non_text += 1;
+                tracing::debug!(
+                    "synthetic migration: segment {} is non-text ({:?}), cannot re-embed — skipping",
+                    id, seg.content
+                );
+                continue;
+            }
+        };
+
+        match embedder.embed_text(&text).await {
+            Ok(embedding) => {
+                // Guard: ResilientEmbedding silently returns synthetic fallback on
+                // Ollama failure (e.g. model cold-start). Detect it the same way
+                // as above — all non-negative values. If the returned embedding is
+                // still synthetic, skip this segment; it will be retried on next
+                // startup once Ollama is fully warmed up.
+                if embedding.iter().all(|&v| v >= -1e-6) {
+                    embed_errors += 1;
+                    tracing::warn!(
+                        "synthetic migration: embedder returned synthetic fallback for \
+                         segment {id} (Ollama cold-start?) — will retry on next startup"
+                    );
+                    continue;
+                }
+                match store.update_embedding(*id, embedding) {
+                    Ok(()) => {
+                        fixed += 1;
+                        tracing::debug!("synthetic migration: fixed segment {}", id);
+                    }
+                    Err(e) => {
+                        embed_errors += 1;
+                        tracing::warn!("synthetic migration: update_embedding for {id} failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                embed_errors += 1;
+                tracing::warn!("synthetic migration: embed_text for segment {id} failed: {e}");
+            }
+        }
+    }
+
+    if synthetic_count > 0 {
+        tracing::info!(
+            "Synthetic embedding migration complete: scanned {total} segments, \
+             found {synthetic_count} synthetic — fixed {fixed}, \
+             skipped {skipped_non_text} (non-text), errors {embed_errors}"
+        );
+    } else {
+        tracing::debug!(
+            "Synthetic embedding migration: all {total} segments already have real embeddings"
+        );
+    }
+
+    // Return count of segments that still need fixing (embed_errors = Ollama cold-start misses)
+    embed_errors
+}
+
+// ---------------------------------------------------------------------------
 // Safety-net model discovery
 // ---------------------------------------------------------------------------
 
@@ -2813,6 +3304,8 @@ struct HealthState {
     version: &'static str,
     channel_bus: Option<Arc<animus_channel::bus::ChannelBus>>,
     http_responses: HttpResponseMap,
+    pending_oauth: PendingOAuthState,
+    credentials_path: std::path::PathBuf,
 }
 
 async fn health_handler(State(state): State<HealthState>) -> Json<serde_json::Value> {
@@ -2907,12 +3400,170 @@ async fn invoke_handler(
     }
 }
 
+/// Complete the OAuth token exchange given a code and state string.
+/// Used by both the browser callback handler and the Telegram paste handler.
+async fn complete_oauth_exchange(
+    code: &str,
+    incoming_state: &str,
+    pending_oauth: &PendingOAuthState,
+    credentials_path: &std::path::Path,
+) -> Result<(), String> {
+    let pending = pending_oauth.lock().clone();
+    let pending = pending.ok_or_else(|| "No pending OAuth flow — may have already completed".to_string())?;
+    if pending.csrf_state != incoming_state {
+        return Err("State mismatch (possible CSRF) — start the flow again".to_string());
+    }
+
+    let client = reqwest::Client::new();
+
+    // Must match the redirect_uri used in the authorization request.
+    let redirect_uri = animus_cortex::llm::anthropic::OAUTH_CONSOLE_REDIRECT_URI;
+
+    // Anthropic's token endpoint requires a JSON body, not form-urlencoded.
+    let resp = client
+        .post(animus_cortex::llm::anthropic::OAUTH_TOKEN_URL)
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "grant_type": "authorization_code",
+            "client_id": animus_cortex::llm::anthropic::CLAUDE_CLIENT_ID,
+            "code": code,
+            "state": incoming_state,
+            "redirect_uri": redirect_uri,
+            "code_verifier": pending.code_verifier,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Token exchange request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Token exchange failed ({status}): {body}"));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TokenResp {
+        access_token: String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        expires_in: Option<u64>,
+    }
+
+    let tokens: TokenResp = resp.json().await.map_err(|e| format!("Failed to parse token response: {e}"))?;
+
+    let expires_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        + tokens.expires_in.unwrap_or(3600) * 1000;
+
+    let creds = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": tokens.access_token,
+            "refreshToken": tokens.refresh_token.unwrap_or_default(),
+            "expiresAt": expires_at_ms,
+            "scopes": ["org:create_api_key", "user:file_upload", "user:inference", "user:mcp_servers", "user:profile", "user:sessions:claude_code"],
+            "subscriptionType": "max"
+        }
+    });
+
+    let creds_str = serde_json::to_string_pretty(&creds).map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    let tmp_path = credentials_path.with_extension("tmp");
+    std::fs::write(&tmp_path, &creds_str).map_err(|e| format!("Failed to write credentials: {e}"))?;
+    std::fs::rename(&tmp_path, credentials_path).map_err(|e| format!("Failed to save credentials: {e}"))?;
+    *pending_oauth.lock() = None;
+    tracing::info!("OAuth credentials saved — Haiku will resume on next request");
+    Ok(())
+}
+
+/// Accept whatever the user pasted after approving on Anthropic's page and complete the OAuth exchange.
+///
+/// Anthropic's console callback (`https://console.anthropic.com/oauth/code/callback`) displays
+/// the authorization code on-screen after approval. The user copies it and pastes it here.
+/// Three formats are accepted:
+///   1. Raw code: `abc123...`
+///   2. Code with embedded state (Anthropic's `code#state` format): `abc123#stateXYZ`
+///   3. Legacy URL (left for backwards compat): `http://localhost:8081/oauth/callback?code=X&state=Y`
+async fn complete_oauth_exchange_from_url(
+    text: &str,
+    pending_oauth: &PendingOAuthState,
+    credentials_path: &std::path::Path,
+) -> Result<(), String> {
+    let text = text.trim();
+
+    // Retrieve the stored CSRF state — used as state for token exchange
+    // and to validate any embedded state in the pasted value.
+    let expected_state = {
+        let guard = pending_oauth.lock();
+        guard.as_ref().map(|p| p.csrf_state.clone())
+            .ok_or_else(|| "No pending OAuth flow — send /reauth to start a new one".to_string())?
+    };
+
+    // Format 3: legacy URL (contains '?code=')
+    if let Some(qs_start) = text.find('?') {
+        let query = &text[qs_start + 1..];
+        let mut code = None;
+        for part in query.split('&') {
+            if let Some(v) = part.strip_prefix("code=") { code = Some(v.to_string()); }
+        }
+        let code = code.ok_or_else(|| "No 'code=' parameter found in pasted URL".to_string())?;
+        return complete_oauth_exchange(&code, &expected_state, pending_oauth, credentials_path).await;
+    }
+
+    // Format 2: Anthropic's code#state display format
+    if let Some(hash_pos) = text.find('#') {
+        let code = &text[..hash_pos];
+        let embedded_state = &text[hash_pos + 1..];
+        if !embedded_state.is_empty() && embedded_state != expected_state {
+            return Err("Embedded state doesn't match — this code may be stale. Send /reauth to restart.".to_string());
+        }
+        return complete_oauth_exchange(code, &expected_state, pending_oauth, credentials_path).await;
+    }
+
+    // Format 1: raw code
+    complete_oauth_exchange(text, &expected_state, pending_oauth, credentials_path).await
+}
+
+/// GET /oauth/callback — receives the authorization code from claude.ai and exchanges it for tokens.
+async fn oauth_callback_handler(
+    State(state): State<HealthState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(code) = params.get("code").cloned() else {
+        return (axum::http::StatusCode::BAD_REQUEST, "Missing 'code' parameter").into_response();
+    };
+    let Some(incoming_state) = params.get("state").cloned() else {
+        return (axum::http::StatusCode::BAD_REQUEST, "Missing 'state' parameter").into_response();
+    };
+
+    match complete_oauth_exchange(&code, &incoming_state, &state.pending_oauth, &state.credentials_path).await {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            axum::response::Html(
+                "<html><body style='font-family:sans-serif;max-width:400px;margin:80px auto;text-align:center'>\
+                <h2>Connected!</h2>\
+                <p>Animus is now authenticated with Anthropic. You can close this tab.</p>\
+                </body></html>"
+            ),
+        ).into_response(),
+        Err(e) => {
+            tracing::error!("OAuth callback exchange failed: {e}");
+            (axum::http::StatusCode::BAD_GATEWAY, e).into_response()
+        }
+    }
+}
+
 fn start_health_server(
     bind: String,
     store: Arc<MmapVectorStore>,
     instance_id: String,
     channel_bus: Option<Arc<animus_channel::bus::ChannelBus>>,
     http_responses: HttpResponseMap,
+    pending_oauth: PendingOAuthState,
+    credentials_path: std::path::PathBuf,
 ) {
     let state = HealthState {
         instance_id,
@@ -2920,10 +3571,13 @@ fn start_health_server(
         version: env!("CARGO_PKG_VERSION"),
         channel_bus,
         http_responses,
+        pending_oauth,
+        credentials_path,
     };
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/invoke", post(invoke_handler))
+        .route("/oauth/callback", get(oauth_callback_handler))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -2973,6 +3627,7 @@ fn build_system_prompt(
     goals: &GoalManager,
     tool_registry: &ToolRegistry,
     reconstitution_summary: Option<&str>,
+    journal_context: Option<&str>,
     peripheral_awareness: Option<&str>,
     prompt_preamble: &str,
     prompt_suffix: &str,
@@ -2996,6 +3651,12 @@ fn build_system_prompt(
         prompt.push_str("\n\n## Session Context (from reconstitution)\n");
         prompt.push_str(summary);
     }
+    // Journal recovery: raw conversation history from persistent journal.
+    // More reliable than reconstitution (no LLM/embedder dependency).
+    if let Some(journal) = journal_context {
+        prompt.push_str("\n\n");
+        prompt.push_str(journal);
+    }
     // Peripheral awareness is appended last — first to be compressed under context pressure.
     if let Some(awareness) = peripheral_awareness {
         if !awareness.trim().is_empty() {
@@ -3006,13 +3667,41 @@ fn build_system_prompt(
     prompt
 }
 
+/// Truncate a string at a UTF-8 character boundary, never panicking on
+/// multi-byte sequences. Returns a slice up to `max_bytes` in length.
+fn truncate_safe(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk backwards from max_bytes to find a char boundary
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// A message that Animus initiates to the user unprompted.
 /// Sent via `proactive_tx`; main loop gates on autonomy mode before delivering.
+/// Set `urgent = true` to bypass the autonomy mode gate (e.g. OAuth re-auth link).
 struct ProactiveMessage {
     text: String,
     /// Human-readable source label for tracing (e.g. "goal_deadline", "reflection").
     source: &'static str,
+    /// When true the message is delivered even in Reactive mode.
+    urgent: bool,
 }
+
+// ---------------------------------------------------------------------------
+// OAuth re-auth state — shared between the main loop and the callback handler
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct PendingOAuth {
+    code_verifier: String,
+    csrf_state: String,
+}
+type PendingOAuthState = Arc<parking_lot::Mutex<Option<PendingOAuth>>>;
 
 enum CommandResult {
     Continue,

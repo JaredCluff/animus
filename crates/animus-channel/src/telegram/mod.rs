@@ -250,6 +250,14 @@ impl ChannelPlugin for TelegramChannel {
                     .send_message(chat_id, &msg.text[split_at..], reply_to)
                     .await?;
             }
+        } else if let (Some(btn_text), Some(btn_url)) = (
+            msg.metadata["url_button"]["text"].as_str(),
+            msg.metadata["url_button"]["url"].as_str(),
+        ) {
+            // Inline keyboard button — URL is embedded in JSON, no HTML encoding needed.
+            self.client
+                .send_message_with_url_button(chat_id, &msg.text, btn_text, btn_url)
+                .await?;
         } else {
             self.client.send_message(chat_id, &msg.text, reply_to).await?;
         }

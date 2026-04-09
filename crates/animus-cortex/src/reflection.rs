@@ -39,9 +39,29 @@ pub struct Synthesis {
     #[serde(default, deserialize_with = "deserialize_segment_ids")]
     pub source_segment_ids: Vec<SegmentId>,
     /// What kind of knowledge is this?
+    /// The Ollama model sometimes outputs unknown variants like "Conceptual" or "N/A" — map them to General.
+    #[serde(default, deserialize_with = "deserialize_decay_class_lenient")]
     pub decay_class: DecayClass,
     /// Why this confidence level?
+    #[serde(default)]
     pub confidence_rationale: String,
+}
+
+/// Leniently deserialize DecayClass — unknown variants (e.g. "Conceptual", "N/A") default to General.
+fn deserialize_decay_class_lenient<'de, D>(d: D) -> Result<DecayClass, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let s = String::deserialize(d).unwrap_or_default();
+    Ok(match s.as_str() {
+        "Factual" => DecayClass::Factual,
+        "Procedural" => DecayClass::Procedural,
+        "Episodic" => DecayClass::Episodic,
+        "Opinion" => DecayClass::Opinion,
+        "Ephemeral" => DecayClass::Ephemeral,
+        _ => DecayClass::General,
+    })
 }
 
 fn deserialize_segment_ids<'de, D>(d: D) -> Result<Vec<SegmentId>, D::Error>
@@ -147,10 +167,25 @@ where
 /// A signal Reflection wants to send to Reasoning.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReflectionSignal {
+    #[serde(deserialize_with = "deserialize_signal_priority")]
     pub priority: SignalPriority,
     pub insight: String,
     #[serde(default, deserialize_with = "deserialize_segment_ids")]
     pub relevant_segments: Vec<SegmentId>,
+}
+
+/// Leniently deserialize SignalPriority — maps unknown variants (e.g. "High", "Low") to Normal.
+fn deserialize_signal_priority<'de, D>(d: D) -> Result<SignalPriority, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let s = String::deserialize(d).unwrap_or_default();
+    Ok(match s.as_str() {
+        "Info" | "Low" | "low" => SignalPriority::Info,
+        "Urgent" | "High" | "high" | "Critical" | "critical" => SignalPriority::Urgent,
+        _ => SignalPriority::Normal,
+    })
 }
 
 const REFLECTION_SYSTEM_PROMPT: &str = r#"You are the Reflection subsystem of an AILF (AI Life Form). Your role is to examine recent knowledge and experiences and produce higher-order understanding.

@@ -793,17 +793,14 @@ fn tier_preference(
 
     // Normal budget: full tier access, class-specific preference
     match class_name {
-        // Chat/comms: speed > quality — Tier2 first, premium not worth the cost
-        "Conversational" => vec![Tier2, Tier3, Tier4],
-
-        // Analytical/Technical/ToolExecution: quality matters — start at Tier1
-        "Analytical" | "Technical" | "ToolExecution" => vec![Tier1, Tier2, Tier3],
+        // All reasoning classes start at Tier1 (Anthropic) — quality first, Ollama as fallback
+        "Conversational" | "Analytical" | "Technical" | "ToolExecution" => vec![Tier1, Tier2, Tier3, Tier4],
 
         // Voice: latency is paramount — fast cloud first, then local
-        "Voice" => vec![Tier2, Tier4],
+        "Voice" => vec![Tier1, Tier2, Tier4],
 
-        // Unknown class: default to quality-first
-        _ => vec![Tier2, Tier3, Tier4],
+        // Unknown class: quality-first
+        _ => vec![Tier1, Tier2, Tier3, Tier4],
     }
 }
 

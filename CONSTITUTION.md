@@ -140,6 +140,14 @@ Routine success → VectorFS log only. Meaningful change → one Signal → LLM 
 
 Animus self-configures its cognitive architecture. It builds its own model routing plan from available models, assesses its own capabilities honestly, and reports them accurately. Humans set the environment (API keys, Ollama URL, autonomy mode). Animus decides how to use it.
 
+### 10. Discovered, Never Declared
+
+No model name, provider URL, or configuration default is hardcoded into the system. Humans provide credentials and endpoints. Animus discovers what is available by connecting to each provider, querying its model catalog, validating accessibility, and building the routing engine from what actually works.
+
+If a model returns a 404, a key is invalid, or a provider is unreachable, that model is simply absent from the routing pool — it never becomes an error that blocks the system. The only models Animus knows about are the ones it has confirmed exist and respond.
+
+**Implication for development:** Never add a model name string, a default model constant, or a provider-specific fallback to the code or configuration. If a value could be discovered at runtime, it must be. The sole exceptions are protocol-level constants (API path formats like `/v1/models`) and the embedding model (which the human selects because it must match the VectorFS index). Everything else is discovered.
+
 ---
 
 ## The Autonomy Spectrum in Practice

@@ -548,6 +548,11 @@ pub struct CortexConfig {
     /// Env: `ANIMUS_FALLBACK_MODEL`.
     #[serde(default)]
     pub fallback_model: String,
+    /// If non-empty, only these Ollama model names are admitted into the model plan.
+    /// Comma-separated. Env: `ANIMUS_OLLAMA_ALLOWED_MODELS`.
+    /// Example: "gemma4:26b,gemma4:e4b"
+    #[serde(default)]
+    pub ollama_allowed_models: Vec<String>,
 }
 
 fn default_fallback_url() -> String { "http://localhost:11434".to_string() }
@@ -565,6 +570,7 @@ impl Default for CortexConfig {
             fallback_url: default_fallback_url(),
             fallback_provider: default_fallback_provider(),
             fallback_model: String::new(),
+            ollama_allowed_models: Vec::new(),
         }
     }
 }
@@ -855,8 +861,10 @@ impl AnimusConfig {
     /// Environment variables take precedence over file values so that
     /// container deployments can inject settings without modifying config files.
     pub fn apply_env_overrides(&mut self) {
-        // Embedding overrides
-        if let Ok(url) = std::env::var("ANIMUS_OLLAMA_URL") {
+        // Embedding overrides — ANIMUS_EMBED_URL takes precedence over ANIMUS_OLLAMA_URL
+        if let Ok(url) = std::env::var("ANIMUS_EMBED_URL") {
+            self.embedding.ollama_url = url;
+        } else if let Ok(url) = std::env::var("ANIMUS_OLLAMA_URL") {
             self.embedding.ollama_url = url;
         }
         if let Ok(model) = std::env::var("ANIMUS_EMBED_MODEL") {
@@ -907,6 +915,15 @@ impl AnimusConfig {
         if let Ok(model) = std::env::var("ANIMUS_FALLBACK_MODEL") {
             if !model.is_empty() {
                 self.cortex.fallback_model = model;
+            }
+        }
+        if let Ok(allowed) = std::env::var("ANIMUS_OLLAMA_ALLOWED_MODELS") {
+            let models: Vec<String> = allowed.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !models.is_empty() {
+                self.cortex.ollama_allowed_models = models;
             }
         }
 

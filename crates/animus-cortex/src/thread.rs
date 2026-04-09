@@ -351,7 +351,12 @@ impl<S: VectorStore> ReasoningThread<S> {
                         "Engine '{}' unavailable (retryable): {e} — trying next fallback",
                         engine.model_name()
                     );
-                    failed_engine_names.push(engine.model_name().to_string());
+                    // Auth failures cascade but do NOT mark the engine unhealthy — the engine
+                    // itself is fine, only the credentials are stale. It will recover once
+                    // credentials are refreshed without needing a health probe cycle.
+                    if !matches!(e, animus_core::AnimusError::NeedsOAuthReAuth) {
+                        failed_engine_names.push(engine.model_name().to_string());
+                    }
                     last_err = Some(e);
                 }
                 Err(e) => {
@@ -615,7 +620,9 @@ fn summarize_turns(turns: &[Turn]) -> String {
 pub fn is_retryable_error(err: &animus_core::AnimusError) -> bool {
     match err {
         animus_core::AnimusError::LlmRateLimited(_)
-        | animus_core::AnimusError::LlmServiceUnavailable(_) => true,
+        | animus_core::AnimusError::LlmServiceUnavailable(_)
+        // Dead OAuth refresh token — cascade to next engine, notifier already fired
+        | animus_core::AnimusError::NeedsOAuthReAuth => true,
         animus_core::AnimusError::Llm(msg) => {
             // Model not found, auth failures, and other provider-specific errors
             // should cascade to the next engine rather than killing the whole turn.

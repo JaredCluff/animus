@@ -61,6 +61,10 @@ pub enum AnimusError {
     #[error("federation error: {0}")]
     Federation(String),
 
+    /// OAuth access token expired AND refresh token rejected — user must re-authenticate via browser.
+    #[error("Anthropic authentication needs renewal — sending you a link now")]
+    NeedsOAuthReAuth,
+
     #[error("{0}")]
     Other(String),
 }

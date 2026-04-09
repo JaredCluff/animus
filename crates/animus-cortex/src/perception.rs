@@ -29,19 +29,82 @@ pub struct PerceivedEvent {
     #[serde(default)]
     pub summary: Option<String>,
     /// Decay class assignment. May be null when store=false.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_decay_class_opt")]
     pub decay_class: Option<DecayClass>,
     /// Tags for categorization.
     #[serde(default)]
     pub tags: HashMap<String, String>,
     /// Signal to send to Reasoning, if any.
+    /// The Ollama model sometimes emits a plain string like "Normal" instead of a proper object
+    /// or null — this custom deserializer handles all variants leniently.
+    #[serde(default, deserialize_with = "deserialize_perception_signal")]
     pub signal: Option<PerceptionSignal>,
+}
+
+/// Leniently deserialize an optional DecayClass — unknown variants map to None.
+fn deserialize_decay_class_opt<'de, D>(d: D) -> Result<Option<DecayClass>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v: Option<serde_json::Value> = Option::deserialize(d)?;
+    Ok(v.and_then(|val| {
+        val.as_str().and_then(|s| match s {
+            "Factual" => Some(DecayClass::Factual),
+            "Procedural" => Some(DecayClass::Procedural),
+            "Episodic" => Some(DecayClass::Episodic),
+            "Opinion" => Some(DecayClass::Opinion),
+            "Ephemeral" => Some(DecayClass::Ephemeral),
+            "General" => Some(DecayClass::General),
+            _ => Some(DecayClass::General),
+        })
+    }))
+}
+
+/// Leniently deserialize an optional PerceptionSignal. Handles:
+/// - null / absent → None
+/// - plain string (e.g. "Normal") → None (no reason text available)
+/// - object with priority + optional reason → Some(PerceptionSignal)
+fn deserialize_perception_signal<'de, D>(d: D) -> Result<Option<PerceptionSignal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v: Option<serde_json::Value> = Option::deserialize(d)?;
+    let Some(val) = v else { return Ok(None) };
+    match val {
+        serde_json::Value::Null => Ok(None),
+        // Model output "signal": "Normal" — discard, no reason text
+        serde_json::Value::String(_) => Ok(None),
+        serde_json::Value::Object(map) => {
+            let priority = map.get("priority").and_then(|p| {
+                p.as_str().and_then(|s| match s {
+                    "Info" => Some(SignalPriority::Info),
+                    "Normal" => Some(SignalPriority::Normal),
+                    "Urgent" => Some(SignalPriority::Urgent),
+                    _ => None,
+                })
+            });
+            match priority {
+                Some(p) => {
+                    let reason = map.get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Ok(Some(PerceptionSignal { priority: p, reason }))
+                }
+                None => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 /// A signal the Perception model wants to send to Reasoning.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PerceptionSignal {
     pub priority: SignalPriority,
+    #[serde(default)]
     pub reason: String,
 }
 

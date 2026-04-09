@@ -23,6 +23,7 @@ base64 = { workspace = true }
 async-nats = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
+rand = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true }
 glob = { workspace = true }

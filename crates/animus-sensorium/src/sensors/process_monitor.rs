@@ -40,9 +40,13 @@ impl ProcessMonitor {
                         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
                         let current_pids: HashSet<sysinfo::Pid> = sys.processes().keys().copied().collect();
 
-                        // Detect new processes
+                        // Detect new processes (skip internal runtime threads)
                         for &pid in current_pids.difference(&known_pids) {
                             if let Some(process) = sys.process(pid) {
+                                let name = process.name().to_string_lossy();
+                                if name.contains("tokio-rt-worker") || name.contains("tokio-rt") {
+                                    continue;
+                                }
                                 let event = SensorEvent {
                                     id: EventId::new(),
                                     timestamp: chrono::Utc::now(),
